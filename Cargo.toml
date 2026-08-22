@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vaultx-cli",
+    "crates/vaultx-tui",
+    "crates/vaultx-core",
+    "crates/vaultx-types",
+    "crates/vaultx-repository",
+    "crates/vaultx-crypto",
+    "crates/vaultx-keyring",
+    "crates/vaultx-policy",
+    "crates/vaultx-broker",
+    "crates/vaultx-broker-client",
+    "crates/vaultx-http",
+    "crates/vaultx-policy-packs",
+    "crates/vaultx-audit",
+    "crates/vaultx-sync-client",
+    "crates/vaultx-control-plane",
+    "crates/vaultx-mcp",
+    "crates/vaultx-testkit",
+]
+
+[workspace.dependencies]
+# Shared dependency versions are declared here; member crates reference
+# them with `{ workspace = true }`. Dependencies are added per crate in
+# later tasks.
