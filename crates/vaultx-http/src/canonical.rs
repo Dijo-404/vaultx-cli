@@ -1,0 +1,418 @@
+//! URL canonicalization: one canonical destination representation shared
+//! by authorization *and* transport.
+//!
+//! # Canonicalization contract
+//!
+//! The canonical form of a destination is the [`url::Url`] serialization
+//! produced by this module after the restrictions below are applied.
+//! Policy evaluation and the eventual broker transport **must** both use
+//! this same value (plan §20: "Policy evaluates the same canonical
+//! destination that transport uses"). Any drift between the two is a
+//! deny-evasion vector, so callers never re-parse raw strings after
+//! [`CanonicalUrl::parse`]; they pass the `CanonicalUrl` itself onward.
+//!
+//! Enforced on every parse:
+//!
+//! * scheme must be exactly `https` (cleartext and custom schemes are
+//!   rejected — see [`crate::error::HttpPolicyError::UnsupportedScheme`]);
+//! * no userinfo (`user[:password]@`) may appear;
+//! * the host must be present, ASCII-only, lowercase, and free of
+//!   underscores and empty labels. Non-ASCII hostnames are rejected in v1
+//!   (IDNA is not performed): callers must supply pre-encoded punycode
+//!   (`xn--…`) if they need internationalized names;
+//! * explicit ports are allowed when syntactically valid; the default
+//!   port (`443`) is normalized away by the `url` crate;
+//! * fragments are stripped silently — they are client-side only and are
+//!   never transmitted to a server;
+//! * dot segments (`.` / `..`) are resolved via `url`'s RFC 3986-style
+//!   serialization, and percent escapes are normalized to uppercase hex
+//!   (the `url` crate preserves the case of pre-existing escapes, so this
+//!   crate applies the final pass itself).
+
+use url::Url;
+
+use crate::error::HttpPolicyError;
+
+/// A validated, canonical HTTPS destination.
+///
+/// Construct only through [`CanonicalUrl::parse`] or
+/// [`CanonicalUrl::from_parts`]; both apply identical validation so the
+/// two constructors cannot diverge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalUrl {
+    inner: Url,
+}
+
+impl CanonicalUrl {
+    /// Parses and canonicalizes a raw URL string.
+    ///
+    /// # Errors
+    /// Returns:
+    /// * [`HttpPolicyError::UnsupportedScheme`] for any scheme other than
+    ///   `https` (including plain `http`);
+    /// * [`HttpPolicyError::UserInfoDisallowed`] when the authority
+    ///   carries userinfo;
+    /// * [`HttpPolicyError::InvalidPort`] when an embedded port is not a
+    ///   valid `u16`;
+    /// * [`HttpPolicyError::InvalidUrl`] for malformed input, missing or
+    ///   non-ASCII/percent-encoded hosts, underscored or empty hostname
+    ///   labels, or a missing path component.
+    pub fn parse(raw: &str) -> Result<Self, HttpPolicyError> {
+        // Reject anything in the raw authority that could smuggle a
+        // hostname past IDNA processing (unicode code points), hide
+        // structure via percent-encoding, or carry userinfo. Any `@` in
+        // the authority is userinfo by definition — including degenerate
+        // forms like `:@host`, which the `url` crate would silently
+        // normalize away.
+        let authority = raw.split_once("://").map(|(_, rest)| rest);
+        if let Some(authority) = authority {
+            let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+            let authority = &authority[..end];
+            if !authority.is_ascii() || authority.contains('%') {
+                return Err(HttpPolicyError::InvalidUrl(
+                    "hostnames must be pre-encoded ASCII (no unicode or percent escapes)"
+                        .to_owned(),
+                ));
+            }
+            if authority.contains('@') {
+                return Err(HttpPolicyError::UserInfoDisallowed);
+            }
+        }
+
+        let mut parsed = Url::parse(raw).map_err(|err| match err {
+            url::ParseError::InvalidPort => HttpPolicyError::InvalidPort(raw.to_owned()),
+            other => HttpPolicyError::InvalidUrl(other.to_string()),
+        })?;
+
+        let scheme = parsed.scheme().to_owned();
+        if scheme != "https" {
+            return Err(HttpPolicyError::UnsupportedScheme(scheme));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(HttpPolicyError::UserInfoDisallowed);
+        }
+
+        let Some(host) = parsed.host_str() else {
+            return Err(HttpPolicyError::InvalidUrl("missing host".to_owned()));
+        };
+        validate_host(host)?;
+
+        // Fragments are never sent to the server; drop them so the
+        // canonical form cannot differ from the wire form.
+        parsed.set_fragment(None);
+
+        // Normalize pre-existing percent-escapes to uppercase hex so two
+        // spellings of one resource share a single canonical string.
+        let normalized = normalize_percent_case(parsed.as_str());
+        let inner =
+            Url::parse(&normalized).map_err(|err| HttpPolicyError::InvalidUrl(err.to_string()))?;
+
+        Ok(Self { inner })
+    }
+
+    /// Builds a canonical URL from already-matched components.
+    ///
+    /// Intended for the broker, which matches policy against individual
+    /// components (host, optional explicit port, path+query) and needs to
+    /// hand transport a single canonical object afterwards. Runs the exact
+    /// same validation pipeline as [`CanonicalUrl::parse`].
+    ///
+    /// # Errors
+    /// Same variants as [`CanonicalUrl::parse`], plus
+    /// [`HttpPolicyError::InvalidPort`] when `port` is `0`, and
+    /// [`HttpPolicyError::InvalidUrl`] when `path_and_query` is neither
+    /// empty nor starts with `/`.
+    pub fn from_parts(
+        host: &str,
+        port: Option<u16>,
+        path_and_query: &str,
+    ) -> Result<Self, HttpPolicyError> {
+        if let Some(0) = port {
+            return Err(HttpPolicyError::InvalidPort("0".to_owned()));
+        }
+        if !path_and_query.is_empty() && !path_and_query.starts_with('/') {
+            return Err(HttpPolicyError::InvalidUrl(format!(
+                "path must start with `/`: {path_and_query}"
+            )));
+        }
+        let port_suffix = port.map_or_else(String::new, |p| format!(":{p}"));
+        let path = if path_and_query.is_empty() {
+            "/"
+        } else {
+            path_and_query
+        };
+        Self::parse(&format!("https://{host}{port_suffix}{path}"))
+    }
+
+    /// The lowercased host (IPv6 literals keep their brackets).
+    #[must_use]
+    pub fn host(&self) -> &str {
+        // `validate_host` guarantees presence at construction time.
+        self.inner.host_str().unwrap_or_default()
+    }
+
+    /// The effective port: the explicit port when present, otherwise the
+    /// HTTPS default `443`.
+    #[must_use]
+    pub fn port_or_default(&self) -> u16 {
+        // The scheme is always `https`, so the known-default lookup can
+        // only miss on non-special URLs, which cannot occur here.
+        self.inner.port_or_known_default().unwrap_or(443)
+    }
+
+    /// The request path, always starting with `/`.
+    #[must_use]
+    pub fn path(&self) -> String {
+        self.inner.path().to_owned()
+    }
+
+    /// The query string decoded into ordered `(name, value)` pairs.
+    /// Repeated keys appear once per occurrence, preserving order.
+    #[must_use]
+    pub fn query_pairs(&self) -> Vec<(String, String)> {
+        self.inner
+            .query_pairs()
+            .into_iter()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    /// Read access to the underlying canonical `url::Url` (the canonical
+    /// form per the module contract).
+    #[must_use]
+    pub const fn as_url(&self) -> &Url {
+        &self.inner
+    }
+}
+
+/// Hostname grammar enforced post-canonicalization.
+fn validate_host(host: &str) -> Result<(), HttpPolicyError> {
+    // IPv6 literals arrive bracketed; validate the inner address instead.
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+            Ok(())
+        } else {
+            Err(HttpPolicyError::InvalidUrl(format!(
+                "invalid ipv6 literal `{inner}`"
+            )))
+        };
+    }
+    if !host.is_ascii() {
+        return Err(HttpPolicyError::InvalidUrl(format!(
+            "hostname must be ASCII: `{host}`"
+        )));
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            // Catches both interior empty labels (`a..b`) and a trailing
+            // root dot (`example.com.`), which are rejected to keep the
+            // canonical host unambiguous.
+            return Err(HttpPolicyError::InvalidUrl(format!(
+                "hostname contains an empty label: `{host}`"
+            )));
+        }
+        if label.contains('_') {
+            return Err(HttpPolicyError::InvalidUrl(format!(
+                "hostname labels may not contain `_`: `{host}`"
+            )));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(HttpPolicyError::InvalidUrl(format!(
+                "hostname contains characters outside [a-z0-9-]: `{host}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Uppercases the hex digits of every percent-escape in a URL string.
+///
+/// The `url` crate emits uppercase hex for escapes it adds itself but
+/// preserves the case of escapes already present in the input; this pass
+/// closes that gap so `%2f` and `%2F` collapse to one canonical spelling.
+/// Case changes never alter semantics, and the serialization is ASCII
+/// (the `url` crate percent-encodes all non-ASCII), so byte-wise handling
+/// is safe.
+fn normalize_percent_case(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push('%');
+            out.push((bytes[i + 1] as char).to_ascii_uppercase());
+            out.push((bytes[i + 2] as char).to_ascii_uppercase());
+            i += 3;
+        } else {
+            // The serialization is ASCII (`url` percent-encodes all
+            // non-ASCII), so byte-to-char promotion is lossless.
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_ok(raw: &str) -> CanonicalUrl {
+        CanonicalUrl::parse(raw).unwrap_or_else(|e| panic!("expected Ok for {raw}: {e:?}"))
+    }
+
+    #[test]
+    fn https_only_is_enforced() {
+        for raw in [
+            "http://example.com/",
+            "ftp://example.com/file",
+            "file:///etc/passwd",
+            "unix:/run/socket",
+            "ws://example.com/",
+            "data:text/plain,hi",
+        ] {
+            let err = CanonicalUrl::parse(raw).expect_err(raw);
+            assert!(
+                matches!(err, HttpPolicyError::UnsupportedScheme(_)),
+                "{raw} -> {err:?}"
+            );
+        }
+        parse_ok("https://example.com/");
+    }
+
+    #[test]
+    fn userinfo_is_rejected_in_every_shape() {
+        for raw in [
+            "https://user:pass@example.com/",
+            "https://user@example.com/",
+            "https://:pass@example.com/",
+            "https://:@example.com/",
+        ] {
+            let err = CanonicalUrl::parse(raw).expect_err(raw);
+            assert!(matches!(err, HttpPolicyError::UserInfoDisallowed), "{raw}");
+        }
+    }
+
+    #[test]
+    fn dot_segments_are_resolved() {
+        let u = parse_ok("https://x.com/a/../b?q=1");
+        assert_eq!(u.path(), "/b");
+        assert_eq!(u.query_pairs(), vec![("q".to_owned(), "1".to_owned())]);
+
+        let u = parse_ok("https://x.com/a/b/../../c");
+        assert_eq!(u.path(), "/c");
+
+        let u = parse_ok("https://x.com");
+        assert_eq!(u.path(), "/");
+    }
+
+    #[test]
+    fn percent_encoding_normalizes_to_uppercase_hex() {
+        let u = parse_ok("https://x.com/a%2fb%3fc?k=%aa");
+        assert_eq!(u.path(), "/a%2Fb%3Fc");
+        assert_eq!(u.as_url().as_str(), "https://x.com/a%2Fb%3Fc?k=%AA");
+    }
+
+    #[test]
+    fn fragments_are_stripped_silently() {
+        let u = parse_ok("https://x.com/page#section-2");
+        assert_eq!(u.path(), "/page");
+        assert!(u.as_url().fragment().is_none());
+        assert_eq!(u.as_url().as_str(), "https://x.com/page");
+    }
+
+    #[test]
+    fn idna_unicode_hosts_are_rejected_but_punycode_passes() {
+        let err = CanonicalUrl::parse("https://münchen.example/").expect_err("unicode host");
+        assert!(matches!(err, HttpPolicyError::InvalidUrl(msg) if msg.contains("pre-encoded")));
+        let err = CanonicalUrl::parse("https://ex%41mple.com/").expect_err("percent escape");
+        assert!(matches!(err, HttpPolicyError::InvalidUrl(_)));
+        // Pre-encoded punycode is the supported v1 spelling.
+        let u = parse_ok("https://xn--mnchen-3ya.example/");
+        assert_eq!(u.host(), "xn--mnchen-3ya.example");
+    }
+
+    #[test]
+    fn underscore_and_empty_labels_are_rejected() {
+        for raw in [
+            "https://ex_ample.com/",
+            "https://a..b.com/",
+            "https://.example.com/",
+            "https://example.com./", // trailing root dot -> empty final label
+            "https://ex ample.com/",
+            "https://exam ple.com/",
+        ] {
+            assert!(
+                CanonicalUrl::parse(raw).is_err(),
+                "expected rejection of `{raw}`"
+            );
+        }
+        parse_ok("https://sub-domain-1.example.co/");
+    }
+
+    #[test]
+    fn ports_are_validated_and_default_normalized() {
+        let u = parse_ok("https://example.com:8443/p");
+        assert_eq!(u.port_or_default(), 8443);
+        assert_eq!(u.as_url().as_str(), "https://example.com:8443/p");
+
+        // Default port 443 is normalized away by `url`.
+        let u = parse_ok("https://example.com:443/p");
+        assert_eq!(u.port_or_default(), 443);
+        assert_eq!(u.as_url().as_str(), "https://example.com/p");
+
+        let err = CanonicalUrl::parse("https://example.com:99999/").expect_err("port overflow");
+        assert!(matches!(err, HttpPolicyError::InvalidPort(_)));
+
+        let err = CanonicalUrl::from_parts("example.com", Some(0), "/").expect_err("port zero");
+        assert!(matches!(err, HttpPolicyError::InvalidPort(_)));
+    }
+
+    #[test]
+    fn trailing_query_preserved_with_order_and_duplicates() {
+        let u = parse_ok("https://x.com/search?a=1&b=two+words&a=3&flag");
+        assert_eq!(
+            u.query_pairs(),
+            vec![
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "two words".to_owned()),
+                ("a".to_owned(), "3".to_owned()),
+                ("flag".to_owned(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_urls_report_invalid_url() {
+        for raw in ["https://", "not a url at all", ""] {
+            let err = CanonicalUrl::parse(raw).expect_err(raw);
+            assert!(matches!(err, HttpPolicyError::InvalidUrl(_)), "{raw}");
+        }
+    }
+
+    #[test]
+    fn from_parts_matches_parse_pipeline() {
+        let built = CanonicalUrl::from_parts("Example.COM", Some(9443), "/v1/x?y=1").unwrap();
+        let direct = CanonicalUrl::parse("https://example.com:9443/v1/x?y=1").unwrap();
+        assert_eq!(built, direct);
+        assert_eq!(built.host(), "example.com");
+
+        let built = CanonicalUrl::from_parts("example.com", None, "").unwrap();
+        assert_eq!(built.port_or_default(), 443);
+        assert_eq!(built.path(), "/");
+
+        let err = CanonicalUrl::from_parts("example.com", None, "v1/no-slash").unwrap_err();
+        assert!(matches!(err, HttpPolicyError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn ipv6_literal_hosts_are_accepted_and_guarded() {
+        let u = parse_ok("https://[2001:db8::1]/x");
+        assert_eq!(u.host(), "[2001:db8::1]");
+        assert!(CanonicalUrl::parse("https://[not-an-ip]/").is_err());
+    }
+}
