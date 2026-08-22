@@ -845,6 +845,18 @@ version = "0.1.0"
 [[package]]
 name = "vaultx-core"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "vaultx-audit",
+ "vaultx-crypto",
+ "vaultx-policy",
+ "vaultx-repository",
+ "vaultx-types",
+]
 
 [[package]]
 name = "vaultx-crypto"

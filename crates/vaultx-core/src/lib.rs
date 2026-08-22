@@ -1,10 +1,88 @@
-//! Application services shared by CLI and TUI.
+//! Application services shared by the vaultx CLI and TUI (plan §5).
+//!
+//! This crate wires the repository, crypto, policy, and audit layers into
+//! coherent service objects with a clean API surface:
+//!
+//! - [`error`]: [`CoreError`], the single error type every service
+//!   returns (via [`CoreResult`]).
+//! - [`project`]: [`ProjectContext`] — init/open a project and reach its
+//!   paths and underlying [`Repository`](vaultx_repository::Repository).
+//! - [`config`]: set/get/unset/list non-secret config values plus the
+//!   conservative `.env` import classifier.
+//! - [`staging`]: idempotent add/confirm, restore, and status reporting.
+//! - [`history`]: commits, log/show, staged and commit diffs, branch
+//!   operations, head-signature verification.
+//! - [`envs`]: environment creation, protection, promotion (with local
+//!   audit events), and listing.
+//! - [`agents`]: agent identity files — create, enable/disable, policy
+//!   attachment, inspection.
+//! - [`policies`]: YAML persistence, engine building, per-file validation,
+//!   dry-run authorization checks.
+//! - [`services`]: [`VaultxServices`], the facade CLI/TUI construct.
+//!
+//! # Synchronous v1 (async deferred)
+//!
+//! All services are **synchronous**. The plan's `VaultService` async
+//! trait surface is intentionally not defined here: it arrives together
+//! with the IPC/server tasks as a thin tokio wrapper over these same
+//! structs. Signatures map 1:1; no service logic will move.
+//!
+//! # Deferred: secret value storage / encryption
+//!
+//! Secret *values* are never handled by this crate. Manifest entries of
+//! kind `Secret`/`Brokered` reference [`SecretRevisionId`]s that a later
+//! vault layer will materialize through envelope encryption. Until then:
+//!
+//! - config operations only ever write plain `ConfigValue` objects;
+//! - `import_env_pairs` reports likely secrets instead of storing them;
+//! - no API accepts or returns plaintext secret material.
+//!
+//! # Deferred: broker wiring
+//!
+//! Agent identities and policy engines are managed locally here, but
+//! nothing dispatches to the broker: session issuance, token minting, and
+//! engine binding are part of the IPC/server tasks.
+//!
+//! # Deferred: sync
+//!
+//! Remote sync (`vaultx-sync-client` / control plane) has no integration
+//! point yet; history and refs remain purely local.
+
+mod agents;
+mod config;
+mod envs;
+mod error;
+mod history;
+mod policies;
+mod project;
+mod services;
+mod staging;
+
+pub use agents::{AgentIdentityFile, AgentLifecycleService, AgentSummary};
+pub use config::{ConfigService, ImportReport};
+pub use envs::{EnvironmentService, EnvironmentSummary};
+pub use error::{CoreError, CoreResult};
+pub use history::{CommitDetail, CommitSummary, EntrySummary, HistoryService};
+pub use policies::PolicyOpsService;
+pub use project::ProjectContext;
+pub use services::{version, VaultxServices};
+pub use staging::{StagedChangeKind, StagingService, StatusReport};
+
+/// Re-exported so consumers can name diff entries without depending on
+/// `vaultx-repository` directly.
+pub use vaultx_repository::DiffEntry;
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn placeholder() {
-        let ok = true;
-        assert!(ok);
+    fn public_api_surface_smoke() {
+        // The facade plus one representative type from each module stay
+        // importable as documented.
+        assert!(!crate::version().is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let services = crate::VaultxServices::init(dir.path()).unwrap();
+        services.config().set_config("SMOKE_VAR", "ok").unwrap();
+        assert_eq!(services.config().get_config("SMOKE_VAR").unwrap(), "ok");
     }
 }
