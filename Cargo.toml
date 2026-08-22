@@ -32,3 +32,14 @@ rust-version = "1.93"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+# Crypto primitives used by `vaultx-crypto`. RNG strategy is pinned to
+# `rand_core` 0.6 + `getrandom` (the version expected by aes-gcm 0.10 and
+# ed25519-dalek 2); the top-level `rand` crate is intentionally not used.
+aes-gcm = { version = "0.10", features = ["std"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+hmac = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+subtle = "2"
+zeroize = "1"

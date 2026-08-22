@@ -4,3 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aes-gcm = { workspace = true }
+ed25519-dalek = { workspace = true }
+hmac = { workspace = true }
+rand_core = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+vaultx-types = { path = "../vaultx-types" }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
