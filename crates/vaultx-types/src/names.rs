@@ -31,6 +31,10 @@ define_string_newtype!(
     IdentityRef
 );
 
+fn is_forbidden_control_char(c: char) -> bool {
+    (c as u32) < 0x20 || c as u32 == 0x7f
+}
+
 impl VariableName {
     pub const MAX_LEN: usize = 128;
 
@@ -94,18 +98,24 @@ impl PolicyName {
 }
 
 impl BranchRef {
-    pub const MAX_LEN: usize = 255;
+    /// Git refname length limits are byte-oriented, so the budget is
+    /// tracked in bytes while the charset stays ASCII-friendly.
+    pub const MAX_BYTES: usize = 255;
 
     pub fn parse(value: &str) -> Result<Self, TypeError> {
         if value.is_empty() {
             return Err(TypeError::Empty);
         }
-        if value.starts_with('/') || value.ends_with('/') {
+        if value.starts_with('/') || value.ends_with('/') || value.contains("//") {
             return Err(TypeError::InvalidCharacters);
         }
-        let len = value.chars().count();
-        if len > Self::MAX_LEN {
-            return Err(TypeError::TooLong { max: Self::MAX_LEN });
+        if value.contains("..") || value.chars().any(is_forbidden_control_char) {
+            return Err(TypeError::InvalidCharacters);
+        }
+        if value.len() > Self::MAX_BYTES {
+            return Err(TypeError::TooLong {
+                max: Self::MAX_BYTES,
+            });
         }
         Ok(Self(value.to_owned()))
     }
@@ -117,6 +127,9 @@ impl IdentityRef {
     pub fn parse(value: &str) -> Result<Self, TypeError> {
         if value.is_empty() {
             return Err(TypeError::Empty);
+        }
+        if value.chars().any(is_forbidden_control_char) {
+            return Err(TypeError::InvalidCharacters);
         }
         let len = value.chars().count();
         if len > Self::MAX_LEN {
@@ -213,6 +226,44 @@ mod tests {
             Err(TypeError::TooLong { max: 255 })
         );
         assert!(BranchRef::parse(&format!("feature/{}", "b".repeat(247))).is_ok());
+    }
+
+    #[test]
+    fn branch_ref_rejects_traversal_and_control_characters() {
+        assert_eq!(
+            BranchRef::parse("../escape"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert_eq!(
+            BranchRef::parse("feature/../main"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert_eq!(
+            BranchRef::parse("feature//foo"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert_eq!(
+            BranchRef::parse("main\nrm -rf"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert_eq!(
+            BranchRef::parse("\u{7f}deleted"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert!(BranchRef::parse("release/v1.2.3").is_ok());
+    }
+
+    #[test]
+    fn identity_ref_rejects_control_characters() {
+        assert_eq!(
+            IdentityRef::parse("user\u{1}alice"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert_eq!(
+            IdentityRef::parse("\u{7f}"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert!(IdentityRef::parse("user:alice").is_ok());
     }
 
     #[test]

@@ -98,9 +98,9 @@ mod tests {
     fn variable_source_round_trips() {
         assert_round_trip(
             VariableSource::Manifest {
-                object: ObjectId::parse("obj_env_prod").unwrap(),
+                object: ObjectId::parse("obj_manifest").unwrap(),
             },
-            "{\"manifest\":{\"object\":\"obj_env_prod\"}}",
+            "{\"manifest\":{\"object\":\"obj_manifest\"}}",
         );
         assert_round_trip(VariableSource::Inline, "\"inline\"");
     }
@@ -112,12 +112,12 @@ mod tests {
             kind: VariableKind::Secret,
             environment: EnvironmentId::parse("env_prod").unwrap(),
             source: VariableSource::Manifest {
-                object: ObjectId::parse("obj_env_prod").unwrap(),
+                object: ObjectId::parse("obj_manifest").unwrap(),
             },
         };
         assert_round_trip(
             definition,
-            "{\"name\":\"DB_PASSWORD\",\"kind\":\"secret\",\"environment\":\"env_prod\",\"source\":{\"manifest\":{\"object\":\"obj_env_prod\"}}}",
+            "{\"name\":\"DB_PASSWORD\",\"kind\":\"secret\",\"environment\":\"env_prod\",\"source\":{\"manifest\":{\"object\":\"obj_manifest\"}}}",
         );
     }
 

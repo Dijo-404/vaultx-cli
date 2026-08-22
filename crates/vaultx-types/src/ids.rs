@@ -8,11 +8,34 @@ use crate::error::TypeError;
 
 pub(crate) const MAX_ID_CONTENT_LEN: usize = 64;
 
+/// All registered prefixed-ID families, longest first so that more
+/// specific prefixes win discrimination (`sec_rev_` before `sec_`).
+#[rustfmt::skip]
+pub(crate) const ID_PREFIXES: [&str; 11] = [
+    "sec_rev_",
+    "ws_", "proj_", "env_", "cmt_", "obj_",
+    "sec_", "pol_", "agent_", "sess_", "aud_",
+];
+
 pub(crate) fn is_valid_id_content(value: &str) -> bool {
     !value.is_empty()
         && value
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// True when `value` begins with a registered prefix more specific than
+/// `own`, meaning the value belongs to another identifier family.
+pub(crate) fn claimed_by_longer_registered_prefix(value: &str, own: &str) -> bool {
+    ID_PREFIXES
+        .iter()
+        .any(|p| p.len() > own.len() && value.starts_with(*p))
+}
+
+/// True when the content after an ID prefix itself looks like another
+/// identifier (nested-family embedding).
+pub(crate) fn content_starts_with_registered_prefix(content: &str) -> bool {
+    ID_PREFIXES.iter().any(|p| content.starts_with(*p))
 }
 
 macro_rules! define_string_newtype {
@@ -65,12 +88,48 @@ macro_rules! define_string_newtype {
     };
 }
 
+macro_rules! define_conversion_traits {
+    ($name:ident) => {
+        impl ::std::str::FromStr for $name {
+            type Err = TypeError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::parse(s)
+            }
+        }
+
+        impl ::std::convert::TryFrom<&str> for $name {
+            type Error = TypeError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::parse(value)
+            }
+        }
+
+        impl ::std::convert::TryFrom<String> for $name {
+            type Error = TypeError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::parse(&value)?;
+                Ok(Self(value))
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+
 macro_rules! define_prefixed_id {
     ($(#[$doc:meta])+ $name:ident, $prefix:literal) => {
         define_string_newtype!($(#[$doc])+ $name);
 
         impl $name {
             pub const PREFIX: &'static str = $prefix;
+            pub const MAX_CONTENT_LEN: usize = crate::ids::MAX_ID_CONTENT_LEN;
 
             pub fn parse(value: &str) -> Result<Self, TypeError> {
                 if value.is_empty() {
@@ -84,18 +143,23 @@ macro_rules! define_prefixed_id {
                 if content.is_empty() {
                     return Err(TypeError::Empty);
                 }
-                if !crate::ids::is_valid_id_content(content) {
+                if !crate::ids::is_valid_id_content(content)
+                    || crate::ids::claimed_by_longer_registered_prefix(value, $prefix)
+                    || crate::ids::content_starts_with_registered_prefix(content)
+                {
                     return Err(TypeError::InvalidCharacters);
                 }
                 let len = content.chars().count();
-                if len > crate::ids::MAX_ID_CONTENT_LEN {
+                if len > Self::MAX_CONTENT_LEN {
                     return Err(TypeError::TooLong {
-                        max: crate::ids::MAX_ID_CONTENT_LEN,
+                        max: Self::MAX_CONTENT_LEN,
                     });
                 }
                 Ok(Self(value.to_owned()))
             }
         }
+
+        define_conversion_traits!($name);
     };
 }
 
@@ -104,6 +168,8 @@ macro_rules! define_plain_id {
         define_string_newtype!($(#[$doc])+ $name);
 
         impl $name {
+            pub const MAX_CONTENT_LEN: usize = $max;
+
             pub fn parse(value: &str) -> Result<Self, TypeError> {
                 if value.is_empty() {
                     return Err(TypeError::Empty);
@@ -112,12 +178,16 @@ macro_rules! define_plain_id {
                     return Err(TypeError::InvalidCharacters);
                 }
                 let len = value.chars().count();
-                if len > $max {
-                    return Err(TypeError::TooLong { max: $max });
+                if len > Self::MAX_CONTENT_LEN {
+                    return Err(TypeError::TooLong {
+                        max: Self::MAX_CONTENT_LEN,
+                    });
                 }
                 Ok(Self(value.to_owned()))
             }
         }
+
+        define_conversion_traits!($name);
     };
 }
 
@@ -187,6 +257,7 @@ define_prefixed_id!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     fn assert_round_trip<T>(value: T, json: &str)
     where
@@ -311,6 +382,73 @@ mod tests {
             Err(TypeError::TooLong { max: 128 })
         );
         assert!(CredentialRef::parse(&"a".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn rejects_nested_identifier_families() {
+        assert_eq!(
+            SecretId::parse("sec_rev_x"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert_eq!(
+            WorkspaceId::parse("ws_ws_a"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert_eq!(
+            SecretRevisionId::parse("sec_rev_sec_a"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert!(SecretId::parse("sec_db_password").is_ok());
+        assert!(SecretRevisionId::parse("sec_rev_000042").is_ok());
+    }
+
+    #[test]
+    fn id_conversion_traits_delegate_to_parse() {
+        assert!(WorkspaceId::from_str("ws_ok").is_ok());
+        assert!(WorkspaceId::try_from("ws_ok").is_ok());
+        assert!(WorkspaceId::try_from(String::from("ws_ok")).is_ok());
+        assert!(matches!(
+            WorkspaceId::try_from("nope"),
+            Err(TypeError::InvalidPrefix { .. })
+        ));
+        let moved: String = CredentialRef::try_from(String::from("deploy_token-1"))
+            .unwrap()
+            .into();
+        assert_eq!(moved, "deploy_token-1");
+        let copied: String = WorkspaceId::parse("ws_ok").unwrap().into();
+        assert_eq!(copied, "ws_ok");
+    }
+
+    #[test]
+    fn exposes_max_content_lengths() {
+        for (actual, expected) in [
+            (WorkspaceId::MAX_CONTENT_LEN, 64),
+            (ProjectId::MAX_CONTENT_LEN, 64),
+            (EnvironmentId::MAX_CONTENT_LEN, 64),
+            (CommitId::MAX_CONTENT_LEN, 64),
+            (ObjectId::MAX_CONTENT_LEN, 64),
+            (SecretId::MAX_CONTENT_LEN, 64),
+            (SecretRevisionId::MAX_CONTENT_LEN, 64),
+            (CredentialRef::MAX_CONTENT_LEN, 128),
+            (PolicyId::MAX_CONTENT_LEN, 64),
+            (AgentId::MAX_CONTENT_LEN, 64),
+            (SessionId::MAX_CONTENT_LEN, 64),
+            (AuditEventId::MAX_CONTENT_LEN, 64),
+        ] {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unicode_in_id_content() {
+        assert_eq!(
+            WorkspaceId::parse("ws_café"),
+            Err(TypeError::InvalidCharacters)
+        );
+        assert_eq!(
+            CredentialRef::parse("déploy_token"),
+            Err(TypeError::InvalidCharacters)
+        );
     }
 
     #[test]
