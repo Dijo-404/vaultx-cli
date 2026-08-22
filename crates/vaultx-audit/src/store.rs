@@ -66,13 +66,21 @@ pub trait AppendStore: Send + Sync {
     /// over the head hash — plan §27 "where configured" — close this gap.
     ///
     /// # Errors
-    /// Returns [`AuditError::ChainBroken`] naming the first event whose
-    /// sequence number or linkage does not hold, and
-    /// [`AuditError::CorruptRecord`] when any record cannot be parsed.
+    /// Returns [`AuditError::ChainBroken`] naming the earliest event
+    /// implicated in the first failure: an event whose stored sequence is
+    /// wrong, or — when a successor's `prev_hash` no longer matches a
+    /// recomputed predecessor hash — the earlier of the two events
+    /// involved (the predecessor whose content changed, or the successor
+    /// whose link was rewritten). Returns [`AuditError::CorruptRecord`]
+    /// when any record cannot be parsed.
     fn verify_chain(&self) -> Result<(), AuditError>;
 
     /// Streams stored events applying `filter`, stopping once the filter's
     /// limit is reached.
+    ///
+    /// Reading short-circuits as soon as `limit` matches are collected:
+    /// records beyond the cutoff — including any corruption there — are
+    /// invisible to that call.
     ///
     /// # Errors
     /// Returns [`AuditError`] when the store cannot be read or contains

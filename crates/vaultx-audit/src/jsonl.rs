@@ -10,13 +10,22 @@
 //!
 //! # Crash semantics
 //!
-//! Each append writes one compact JSON object followed by `\n` and then
-//! flushes. A crash may therefore truncate the final line. Readers never
-//! silently skip such damage: every read path ([`JsonlAppendStore::append`],
-//! `latest_hash`, `verify_chain`, `query`) surfaces a partial or malformed
-//! line as [`AuditError::CorruptRecord`] naming its 1-based line number.
-//! The chain is fail-closed — appending is refused while any record is
-//! unreadable, so operator intervention precedes further writes.
+//! Each append serializes one compact JSON object and writes body and
+//! terminating `\n` in a **single** `write_all`, then calls
+//! [`File::sync_data`] so the record reaches stable storage before
+//! success is reported. A crash can therefore leave either nothing or a
+//! truncated final line — never two records spliced onto one physical
+//! line.
+//!
+//! Readers never silently skip damage of any kind. Every read path
+//! ([`JsonlAppendStore::append`], `latest_hash`, `verify_chain`,
+//! `query`) surfaces a partial or malformed line as
+//! [`AuditError::CorruptRecord`] naming its 1-based line number —
+//! including a final segment whose JSON would otherwise parse but lacks
+//! its terminating newline, which is treated as evidence of a crashed
+//! write rather than accepted as a record. The chain is fail-closed —
+//! appending is refused while any record is unreadable, so operator
+//! intervention precedes further writes.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
@@ -54,16 +63,14 @@ impl JsonlAppendStore {
     }
 
     fn load_events(&self) -> Result<Vec<AuditEvent>, AuditError> {
-        let file = match open_store_file(&self.path)? {
-            Some(file) => file,
-            None => return Ok(Vec::new()),
+        let Some(file) = open_store_file(&self.path)? else {
+            return Ok(Vec::new());
         };
-        let reader = BufReader::new(file);
         let mut events = Vec::new();
-        for (index, line) in reader.lines().enumerate() {
-            let line = line?;
-            events.push(parse_event_line(&line, index + 1)?);
-        }
+        walk_records(file, |number, body| {
+            events.push(parse_event_line(body, number)?);
+            Ok(true)
+        })?;
         Ok(events)
     }
 }
@@ -73,6 +80,38 @@ fn open_store_file(path: &std::path::Path) -> Result<Option<File>, AuditError> {
         Ok(file) => Ok(Some(file)),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Walks physical records of a JSONL file, invoking `visit(number, body)`
+/// with 1-based line numbers and newline-stripped bodies; returning
+/// `Ok(false)` from `visit` stops the walk (filter short-circuit).
+///
+/// A final segment without its terminating `\n` is rejected outright —
+/// even when its JSON would parse — because an unterminated tail is
+/// evidence of a crashed write, not a record.
+fn walk_records<F>(file: File, mut visit: F) -> Result<(), AuditError>
+where
+    F: FnMut(usize, &str) -> Result<bool, AuditError>,
+{
+    let mut reader = BufReader::new(file);
+    let mut raw = String::new();
+    let mut number = 0;
+    loop {
+        raw.clear();
+        if reader.read_line(&mut raw)? == 0 {
+            return Ok(());
+        }
+        number += 1;
+        let Some(body) = raw.strip_suffix('\n') else {
+            return Err(AuditError::CorruptRecord {
+                line: number,
+                reason: "final record is missing its terminating newline".to_owned(),
+            });
+        };
+        if !visit(number, body)? {
+            return Ok(());
+        }
     }
 }
 
@@ -139,14 +178,23 @@ impl AppendStore for JsonlAppendStore {
             policy_ids: event.policy_ids,
             metadata: event.metadata,
         };
-        let line = serialize_line(&stored)?;
+        // Write-boundary validation: an oversized denial reason built by
+        // bypassing the validated constructor must not persist into an
+        // unreadable store.
+        stored.decision.validate()?;
+        let mut record = serialize_line(&stored)?;
+        record.push('\n');
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
+        // Single write: body and terminator share one call so a crash
+        // can never splice two records onto one physical line.
+        file.write_all(record.as_bytes())?;
         file.flush()?;
+        // Durability: the record reaches stable storage before success
+        // is reported to the caller.
+        file.sync_data()?;
         Ok(stored)
     }
 
@@ -169,9 +217,18 @@ impl AppendStore for JsonlAppendStore {
                 });
             }
             if event.prev_hash != expected_prev {
+                // Attribute the break to the earliest implicated event:
+                // with no predecessor the offending event is this one
+                // (genesis/link rewrite); otherwise either the
+                // predecessor's content no longer hashes to the digest
+                // recorded about it, or this event's own link was
+                // rewritten — report the earlier of the two.
+                let at_sequence = index
+                    .checked_sub(1)
+                    .map_or(event.sequence, |prev| events[prev].sequence);
                 return Err(AuditError::ChainBroken {
-                    at_sequence: event.sequence,
-                    reason: "prev_hash does not match the recomputed predecessor hash".to_owned(),
+                    at_sequence,
+                    reason: "recomputed hash does not match the recorded linkage".to_owned(),
                 });
             }
             expected_prev = Some(event.hash()?);
@@ -188,17 +245,16 @@ impl AppendStore for JsonlAppendStore {
         let Some(file) = open_store_file(&self.path)? else {
             return Ok(matched);
         };
-        let reader = BufReader::new(file);
-        for (index, line) in reader.lines().enumerate() {
-            let line = line?;
-            let event = parse_event_line(&line, index + 1)?;
+        walk_records(file, |number, body| {
+            let event = parse_event_line(body, number)?;
             if matches_filter(filter, &event) {
                 matched.push(event);
                 if matched.len() >= limit {
-                    break;
+                    return Ok(false);
                 }
             }
-        }
+            Ok(true)
+        })?;
         Ok(matched)
     }
 }
@@ -467,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_chain_detects_tampered_content_at_right_sequence() {
+    fn verify_chain_reports_earliest_offending_sequence_for_tampered_content() {
         let (_dir, store) = temp_store("audit.jsonl");
         for index in 0..3 {
             store
@@ -489,9 +545,12 @@ mod tests {
         lines[1] = lines[1].replace("\"alpha\"", "\"beta\"");
         std::fs::write(&store.path, lines.join("\n") + "\n").unwrap();
 
+        // The tampered event itself is blamed (its recomputed hash no
+        // longer matches the digest its successor recorded), not the
+        // successor where the mismatch is observed.
         let err = store.verify_chain().unwrap_err();
         match err {
-            AuditError::ChainBroken { at_sequence, .. } => assert_eq!(at_sequence, 2),
+            AuditError::ChainBroken { at_sequence, .. } => assert_eq!(at_sequence, 1),
             other => panic!("expected ChainBroken, got {other:?}"),
         }
     }
@@ -549,12 +608,63 @@ mod tests {
 
         let mut lines = read_lines(&store);
         lines[0] = lines[0].replace("\"prev_hash\":null", "\"prev_hash\":\"deadbeef\"");
-        std::fs::write(&store.path, lines.join("\n")).unwrap();
+        std::fs::write(&store.path, lines.join("\n") + "\n").unwrap();
 
+        // With no predecessor, the offending event itself is reported.
         assert!(matches!(
             store.verify_chain().unwrap_err(),
             AuditError::ChainBroken { at_sequence: 0, .. }
         ));
+    }
+
+    #[test]
+    fn unterminated_final_record_fails_closed_even_when_json_is_valid() {
+        let (_dir, store) = temp_store("audit.jsonl");
+        store.append(sample_new_event()).unwrap();
+        store.append(sample_new_event()).unwrap();
+
+        // Drop only the final newline: every remaining byte is valid
+        // JSONL, simulating a death between body and terminator.
+        let body = std::fs::read_to_string(&store.path).unwrap();
+        let trimmed = body.trim_end_matches('\n');
+        std::fs::write(&store.path, trimmed).unwrap();
+
+        for outcome in [
+            store.verify_chain().expect_err("verify fails"),
+            store.latest_hash().expect_err("latest_hash fails"),
+            store
+                .query(&AuditFilter::default())
+                .expect_err("query fails"),
+            store.append(sample_new_event()).expect_err("append fails"),
+        ] {
+            assert!(
+                matches!(outcome, AuditError::CorruptRecord { line: 2, .. }),
+                "expected CorruptRecord at line 2, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_deny_reason_is_refused_at_write_boundary() {
+        let (_dir, store) = temp_store("audit.jsonl");
+        store.append(sample_new_event()).unwrap();
+
+        // A literal Deny bypassing the validated constructor must not be
+        // persisted: the write path re-validates before serializing.
+        let decision = AuditDecision::Deny {
+            reason: "x".repeat(AuditDecision::MAX_DENY_REASON_BYTES + 1),
+        };
+        let err = store
+            .append(NewAuditEvent {
+                decision,
+                ..sample_new_event()
+            })
+            .unwrap_err();
+        assert!(matches!(err, AuditError::InvalidMetadata { .. }));
+
+        // The store stays healthy: nothing was written.
+        store.verify_chain().unwrap();
+        assert_eq!(store.query(&AuditFilter::default()).unwrap().len(), 1);
     }
 
     #[test]

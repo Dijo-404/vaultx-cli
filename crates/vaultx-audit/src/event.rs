@@ -250,8 +250,14 @@ pub enum AuditAction {
 ///
 /// Externally tagged kebab-case serialization: `Allow` renders as
 /// `"allow"` and `Deny { reason }` as `{"deny":{"reason":"..."}}`.
+///
+/// Denial reasons are policy-authored denial categories, never request
+/// content, and are bounded: [`Self::MAX_DENY_REASON_BYTES`] applies on
+/// the validated [`Self::deny`] constructor and again whenever a decision
+/// is deserialized (so an oversized literal cannot persist into an
+/// unreadable store).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", try_from = "RawAuditDecision")]
 pub enum AuditDecision {
     /// The operation was permitted.
     Allow,
@@ -263,6 +269,61 @@ pub enum AuditDecision {
     },
 }
 
+impl AuditDecision {
+    /// Maximum byte length of a denial reason.
+    pub const MAX_DENY_REASON_BYTES: usize = 256;
+
+    /// Validated constructor for a denial outcome.
+    ///
+    /// # Errors
+    /// Returns [`AuditError::InvalidMetadata`] when `reason` exceeds
+    /// [`Self::MAX_DENY_REASON_BYTES`] bytes.
+    pub fn deny(reason: impl Into<String>) -> Result<Self, AuditError> {
+        let decision = Self::Deny {
+            reason: reason.into(),
+        };
+        decision.validate()?;
+        Ok(decision)
+    }
+
+    /// Checks the boundedness invariants of this decision. Called by
+    /// validated construction, deserialization, and the store's write
+    /// path (so a literal bypassing [`Self::deny`] cannot persist an
+    /// unreadable record).
+    pub(crate) fn validate(&self) -> Result<(), AuditError> {
+        let Self::Deny { reason } = self else {
+            return Ok(());
+        };
+        if reason.len() > Self::MAX_DENY_REASON_BYTES {
+            return Err(AuditError::InvalidMetadata {
+                key: "decision.deny.reason".to_owned(),
+                reason: format!("must be at most {} bytes", Self::MAX_DENY_REASON_BYTES),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Deserialization mirror of [`AuditDecision`]; conversion into the
+/// public type re-applies the denial-reason bound.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawAuditDecision {
+    Allow,
+    Deny { reason: String },
+}
+
+impl TryFrom<RawAuditDecision> for AuditDecision {
+    type Error = AuditError;
+
+    fn try_from(raw: RawAuditDecision) -> Result<Self, Self::Error> {
+        match raw {
+            RawAuditDecision::Allow => Ok(Self::Allow),
+            RawAuditDecision::Deny { reason } => Self::deny(reason),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SafeDestinationSummary
 // ---------------------------------------------------------------------------
@@ -272,8 +333,11 @@ pub enum AuditDecision {
 ///
 /// Query components are deliberately excluded by construction because
 /// they routinely carry credential material (`?token=...`,
-/// `?api_key=...`, OAuth codes). Since no field exists to hold them, they
-/// cannot leak into audit storage through any API this crate offers.
+/// `?api_key=...`, OAuth codes). The constructor refuses any path
+/// containing `?` or `#` rather than stripping it, so credential-bearing
+/// URLs cannot slip through in disguise; since no field exists to hold
+/// query strings, they cannot leak into audit storage through any API
+/// this crate offers. Paths are additionally bounded to 512 bytes.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize)]
 pub struct SafeDestinationSummary {
     host: String,
@@ -285,12 +349,16 @@ impl SafeDestinationSummary {
     /// Maximum accepted host length (DNS name limit).
     pub const HOST_MAX_LEN: usize = 253;
 
+    /// Maximum accepted path length in bytes.
+    pub const PATH_MAX_LEN: usize = 512;
+
     /// Validates and constructs a destination summary.
     ///
     /// # Errors
     /// Returns [`AuditError::InvalidMetadata`] when `host` is empty or
     /// not lowercase hostname-shaped, or when `path` does not start with
-    /// `/`.
+    /// `/`, contains query (`?`) or fragment (`#`) components, control
+    /// characters, or exceeds [`Self::PATH_MAX_LEN`] bytes.
     pub fn new(host: &str, port: u16, path: &str) -> Result<Self, AuditError> {
         validate_destination_host(host)?;
         validate_destination_path(path)?;
@@ -363,8 +431,22 @@ fn validate_destination_path(path: &str) -> Result<(), AuditError> {
     if !path.starts_with('/') {
         return Err(reject("must start with `/`".to_owned()));
     }
+    // Query and fragment components are refused outright, not stripped:
+    // they routinely carry credential material (`?token=...`), so a path
+    // containing them is invalid input, never silently redacted content.
+    if path.contains('?') || path.contains('#') {
+        return Err(reject(
+            "must not contain query (`?`) or fragment (`#`) components".to_owned(),
+        ));
+    }
     if path.chars().any(char::is_control) {
         return Err(reject("must not contain control characters".to_owned()));
+    }
+    if path.len() > SafeDestinationSummary::PATH_MAX_LEN {
+        return Err(reject(format!(
+            "must be at most {} bytes",
+            SafeDestinationSummary::PATH_MAX_LEN
+        )));
     }
     Ok(())
 }
@@ -393,8 +475,9 @@ pub const MAX_METADATA_ENTRIES: usize = 64;
 pub const MAX_METADATA_VALUE_BYTES: usize = 512;
 
 /// Key terms that mark a metadata key as sensitive. Matching is
-/// case-insensitive substring containment so variants like
-/// `X-Custom-Token` are also rejected (fail-closed).
+/// case-insensitive substring containment after normalizing underscores
+/// to hyphens, so variants like `X-Custom-Token`, `x_api_key`, or
+/// `session_token_current` are also rejected (fail-closed).
 #[rustfmt::skip]
 const SENSITIVE_KEY_TERMS: [&str; 11] = [
     "authorization", "proxy-authorization", "cookie", "set-cookie",
@@ -480,8 +563,10 @@ fn validate_metadata_pair(key: &str, value: &str) -> Result<(), AuditError> {
         reason,
     };
     // Redaction check first: even a mixed-case sensitive key gets the
-    // precise diagnostic instead of the charset one.
-    let lowered = key.to_ascii_lowercase();
+    // precise diagnostic instead of the charset one. Underscores are
+    // normalized to hyphens so `api_key` cannot slip past the hyphenated
+    // deny terms.
+    let lowered = key.to_ascii_lowercase().replace('_', "-");
     if SENSITIVE_KEY_TERMS
         .iter()
         .any(|term| lowered.contains(term))
@@ -626,7 +711,7 @@ impl AuditEvent {
 pub fn generate_audit_event_id() -> Result<AuditEventId, AuditError> {
     let suffix = random_hex(RANDOM_ID_BYTES)?;
     AuditEventId::parse(&format!("aud_{suffix}"))
-        .map_err(|e| AuditError::Serialization(format!("generated id rejected: {e}")))
+        .map_err(|e| AuditError::IdGeneration(e.to_string()))
 }
 
 #[cfg(test)]
@@ -942,6 +1027,79 @@ mod tests {
             from_pairs_err,
             Err(AuditError::InvalidMetadata { .. })
         ));
+    }
+
+    #[test]
+    fn metadata_rejects_underscore_variants_of_sensitive_keys() {
+        // The charset allows `_`, so underscore spellings of sensitive
+        // terms must not slip past the hyphenated deny list.
+        for key in [
+            "api_key",
+            "private_key_pem",
+            "session_token_current",
+            "X_API_KEY",
+        ] {
+            let mut metadata = SafeAuditMetadata::default();
+            assert!(
+                matches!(
+                    metadata.try_insert(key, "irrelevant"),
+                    Err(AuditError::InvalidMetadata { .. })
+                ),
+                "{key} should be rejected"
+            );
+            assert!(metadata.is_empty());
+        }
+        // Benign keys using underscores stay accepted.
+        let mut metadata = SafeAuditMetadata::default();
+        metadata.try_insert("request_bytes", "1024").unwrap();
+        assert_eq!(metadata.get("request_bytes"), Some("1024"));
+    }
+
+    #[test]
+    fn destination_summary_rejects_query_and_fragment_in_path() {
+        // A credential-bearing query must fail loudly, never persist.
+        let leaked = SafeDestinationSummary::new("api.github.com", 443, "/user/repos?token=SECRET");
+        assert!(matches!(leaked, Err(AuditError::InvalidMetadata { .. })));
+        assert!(
+            matches!(
+                SafeDestinationSummary::new("api.github.com", 443, "/user/repos#access-token"),
+                Err(AuditError::InvalidMetadata { .. })
+            ),
+            "fragment components should be rejected too"
+        );
+    }
+
+    #[test]
+    fn destination_path_is_length_bounded() {
+        let at_cap = format!("/{}", "a".repeat(SafeDestinationSummary::PATH_MAX_LEN - 1));
+        assert!(SafeDestinationSummary::new("example.com", 443, &at_cap).is_ok());
+        let over_cap = format!("/{}", "a".repeat(SafeDestinationSummary::PATH_MAX_LEN));
+        assert!(matches!(
+            SafeDestinationSummary::new("example.com", 443, &over_cap),
+            Err(AuditError::InvalidMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn deny_reason_is_bounded_on_construction_and_deserialization() {
+        assert!(AuditDecision::deny("no matching policy").is_ok());
+
+        let at_cap = "x".repeat(AuditDecision::MAX_DENY_REASON_BYTES);
+        assert!(AuditDecision::deny(at_cap).is_ok());
+
+        let over_cap = "x".repeat(AuditDecision::MAX_DENY_REASON_BYTES + 1);
+        assert!(matches!(
+            AuditDecision::deny(over_cap),
+            Err(AuditError::InvalidMetadata { .. })
+        ));
+
+        // A literal that bypasses the constructor still cannot round trip
+        // into storage: deserialization re-applies the bound.
+        let hostile = format!(
+            "{{\"deny\":{{\"reason\":\"{}\"}}}}",
+            "x".repeat(AuditDecision::MAX_DENY_REASON_BYTES + 1)
+        );
+        assert!(serde_json::from_str::<AuditDecision>(&hostile).is_err());
     }
 
     #[test]

@@ -60,4 +60,10 @@ pub enum AuditError {
     /// Secure randomness was unavailable while generating identifiers.
     #[error("secure random generation failed: {0}")]
     Entropy(String),
+
+    /// A generated identifier failed validation — an internal invariant
+    /// breach, surfaced honestly instead of being misreported as a
+    /// serialization fault.
+    #[error("audit identifier generation failed: {0}")]
+    IdGeneration(String),
 }
