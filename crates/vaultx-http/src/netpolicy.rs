@@ -22,6 +22,28 @@
 //!
 //! Cloud metadata-service endpoints are never permitted, even when
 //! private destinations are explicitly allowed via configuration.
+//!
+//! # Tunneling forms: handled vs. accepted residual risk
+//!
+//! * **Handled** — mapped (`::ffff:0:0/96`) and NAT64 (`64:ff9b::/96`)
+//!   addresses are fully unwrapped and classified by their embedded IPv4
+//!   target, so a private or metadata destination cannot hide inside
+//!   either prefix.
+//! * **Accepted residual risk** — Teredo (`2001::/32`) and 6to4
+//!   (`2002::/16`) embed a routable endpoint behind an obfuscated port /
+//!   public relay address; both classify as [`Classification::Global`].
+//!   Connecting to such an address routes through the corresponding
+//!   relay toward the embedded target. Relays are deprecated and largely
+//!   defunct on the modern internet, so this is treated as documented,
+//!   accepted risk rather than blocked: classifying them `Private`
+//!   would deny legitimate dual-stack clients for negligible protection.
+//!   Revisit if the broker ever runs in an environment where these
+//!   tunnels are live.
+//! * **Pseudo-wrapped spellings** (`::ffff:0:127.0.0.1`, i.e. a mapped
+//!   prefix that does not match `::ffff:0:0/96`) are *not* loopback per
+//!   RFC 4291: stacks route them as ordinary global unicast, so they
+//!   correctly classify [`Classification::Global`] and cannot reach
+//!   internal services through the low-order bytes.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -144,6 +166,16 @@ fn classify_v4(v4: Ipv4Addr) -> Classification {
     // 192.0.0.0/24 (IETF protocol assignments) and 198.18.0.0/15
     // (benchmarking): conservative "private" treatment keeps them out of
     // default-deny bypasses while remaining honest about scope.
+    //
+    // Note the *documentation* ranges (TEST-NET-1/2/3: 192.0.2.0/24,
+    // 198.51.100.0/24, 203.0.113.0/24), reserved class E (240.0.0.0/4),
+    // and broadcast (255.255.255.255) are NOT enumerated here — they
+    // fall through to Global. They are non-routable on the public
+    // internet and cannot reach RFC 1918-style internal services, so
+    // blocking them would add policy surface without closing a real
+    // SSRF path; deployments that address internal infrastructure from
+    // reserved space must set `allow_private_destinations` accordingly
+    // or front this guard with an explicit allowlist.
     if o[0] == 192 && o[1] == 0 && o[2] == 0 {
         return Classification::Private;
     }
@@ -334,6 +366,16 @@ mod tests {
         assert_eq!(c("64:ff9b::7f00:1"), Classification::Loopback);
         assert_eq!(c("64:ff9b::a00:1"), Classification::Private); // 10.0.0.1
         assert_eq!(c("64:ff9b::808:808"), Classification::Global); // 8.8.8.8
+
+        // Pseudo-wrapped spelling (`::ffff:0:…` does not match
+        // `::ffff:0:0/96`): RFC 4291 routes these as ordinary global
+        // unicast, so they must NOT unwrap to loopback.
+        assert_eq!(c("::ffff:0:127.0.0.1"), Classification::Global);
+
+        // Documented residual risk (see module docs): Teredo and 6to4
+        // embed endpoints behind deprecated relays and classify Global.
+        assert_eq!(c("2001:0:1:2:3:4:5:6"), Classification::Global);
+        assert_eq!(c("2002:c000:201::1"), Classification::Global);
     }
 
     #[test]

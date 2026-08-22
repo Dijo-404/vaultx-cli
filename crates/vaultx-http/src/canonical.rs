@@ -28,6 +28,20 @@
 //!   serialization, and percent escapes are normalized to uppercase hex
 //!   (the `url` crate preserves the case of pre-existing escapes, so this
 //!   crate applies the final pass itself).
+//!
+//! # Numeric host spellings
+//!
+//! Hosts that end in a number are normalized by the `url` crate's WHATWG
+//! IPv4 parser *before* validation, with full radix detection: `2130706433`,
+//! `0x7f000001`, `127.1`, and octal `010.0.0.1` all become `127.0.0.1` /
+//! `8.0.0.1`. This closes the classic `inet_aton` SSRF gap at the
+//! canonicalization boundary: policy never sees an ambiguous numeric
+//! hostname that a resolver could reinterpret into different bytes than
+//! [`crate::netpolicy::EgressGuard::check_host`] classified. Spellings
+//! that cannot be parsed as IPv4 (`example.1`, `4294967296`) fail
+//! outright rather than passing through as opaque names. The regression
+//! tests below pin this behavior; if a `url` upgrade changes it, treat
+//! that as a security-relevant change.
 
 use url::Url;
 
@@ -79,8 +93,11 @@ impl CanonicalUrl {
             }
         }
 
+        // The error may never echo the raw URL: query strings and paths
+        // routinely carry credential material (`?token=…`), and the
+        // crate-level contract keeps errors secret-blind.
         let mut parsed = Url::parse(raw).map_err(|err| match err {
-            url::ParseError::InvalidPort => HttpPolicyError::InvalidPort(raw.to_owned()),
+            url::ParseError::InvalidPort => HttpPolicyError::InvalidPort(offending_port_token(raw)),
             other => HttpPolicyError::InvalidUrl(other.to_string()),
         })?;
 
@@ -262,6 +279,34 @@ fn normalize_percent_case(input: &str) -> String {
     out
 }
 
+/// Extracts just the malformed port token for [`HttpPolicyError::InvalidPort`].
+///
+/// Only the port substring inside the raw authority is surfaced; when it
+/// cannot be isolated (no `://`, empty token) a fixed placeholder is used
+/// instead. The authority window is cut at `/ ? # \` so paths, queries,
+/// and fragments can never leak into an error message.
+fn offending_port_token(raw: &str) -> String {
+    let Some((_, rest)) = raw.split_once("://") else {
+        return "*".to_owned();
+    };
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    // For bracketed hosts (`[::1]:8443`) the relevant separator is the
+    // colon *after* the closing bracket.
+    let host_end = if authority.starts_with('[') {
+        authority.find(']').map_or(0, |i| i + 1)
+    } else {
+        0
+    };
+    match authority[host_end..].rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() => {
+            // Cap length defensively: a hostile token must not bloat logs.
+            port.chars().take(16).collect()
+        }
+        _ => "*".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +428,26 @@ mod tests {
     }
 
     #[test]
+    fn invalid_port_errors_never_echo_url_secrets() {
+        // Query strings routinely carry credential material; the error
+        // must surface the port token only (crate secret-blindness
+        // contract).
+        let err = CanonicalUrl::parse("https://example.com:99999/?token=sk-hunter2").unwrap_err();
+        assert_eq!(err.to_string(), "invalid port `99999`");
+        let rendered = err.to_string();
+        assert!(!rendered.contains("sk-hunter2"));
+        assert!(!rendered.contains("example.com"));
+
+        // Bracketed IPv6 with a bad port isolates the token after `]`.
+        let err = CanonicalUrl::parse("https://[2001:db8::1]:abc/x?secret=1").unwrap_err();
+        assert_eq!(err.to_string(), "invalid port `abc`");
+
+        // No isolatable token falls back to a placeholder.
+        let err = CanonicalUrl::parse("https://example.com:x/").unwrap_err();
+        assert_eq!(err.to_string(), "invalid port `x`");
+    }
+
+    #[test]
     fn trailing_query_preserved_with_order_and_duplicates() {
         let u = parse_ok("https://x.com/search?a=1&b=two+words&a=3&flag");
         assert_eq!(
@@ -424,5 +489,51 @@ mod tests {
         let u = parse_ok("https://[2001:db8::1]/x");
         assert_eq!(u.host(), "[2001:db8::1]");
         assert!(CanonicalUrl::parse("https://[not-an-ip]/").is_err());
+    }
+
+    /// Pins the WHATWG IPv4 normalization contract: numeric host
+    /// spellings must resolve to exact dotted quads *inside the parser*
+    /// so that `EgressGuard::check_host` classifies the same bytes a
+    /// resolver would use. If a `url` upgrade starts passing these
+    /// through as opaque names, this test fails and the change is
+    /// security-relevant (see module docs).
+    #[test]
+    fn numeric_host_spellings_normalize_before_validation() {
+        let loopback = |h: &str| {
+            let u = parse_ok(h);
+            assert_eq!(u.host(), "127.0.0.1", "{h} must normalize to 127.0.0.1");
+        };
+        loopback("https://2130706433/"); // decimal integer form
+        loopback("https://0x7f000001/"); // hex integer form
+        loopback("https://127.1/"); // partial quad
+        loopback("https://0177.0.0.1/"); // dotted octal
+
+        // Octal leading-zero quad: 010 == 8 decimal.
+        assert_eq!(parse_ok("https://010.0.0.1/").host(), "8.0.0.1");
+
+        // Hex-labeled quad normalizes to the metadata endpoint — which
+        // downstream classification then denies; canonicalization itself
+        // only guarantees byte-exactness.
+        assert_eq!(
+            parse_ok("https://0xA9.0xFE.0xA9.0xFE/").host(),
+            "169.254.169.254"
+        );
+
+        // Spellings that cannot be IPv4 fail rather than passing through
+        // as resolver-reinterpretable opaque names.
+        for raw in [
+            "https://example.1/",
+            "https://a.b.1/",
+            "https://99999999999/",
+            "https://256.1.1.1/",
+        ] {
+            assert!(
+                CanonicalUrl::parse(raw).is_err(),
+                "expected rejection of `{raw}`"
+            );
+        }
+
+        // Exact dotted-quad literals remain valid input for classification.
+        assert_eq!(parse_ok("https://8.8.8.8/x").host(), "8.8.8.8");
     }
 }
