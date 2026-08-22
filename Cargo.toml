@@ -49,6 +49,9 @@ hmac = "0.12"
 # force-soft*, oid, std), so its internal block buffers cannot be scrubbed;
 # fingerprint inputs must therefore be treated as secret-safe types upstream.
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Used directly by `vaultx-audit` for audit event id / correlation id
+# generation; same 0.2 line already pulled transitively by rand_core 0.6.
+getrandom = "0.2"
 sha2 = "0.10"
 subtle = "2"
 zeroize = "1"
