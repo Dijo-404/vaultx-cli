@@ -1,11 +1,13 @@
 //! AES-256-GCM authenticated encryption.
 //!
 //! Nonce strategy: every call to [`encrypt`] draws a **fresh random 96-bit
-//! nonce** from the OS RNG. Random nonces are safe as long as the number of
-//! encryptions under a single key stays far below 2^32 (NIST SP 800-38D
-//! collision bound); vaultx respects this because secret-revision DEKs are
+//! nonce** from the OS RNG. With random nonces the NIST SP 800-38D collision
+//! bound applies **per key**: a given key must stay far below ~2^32
+//! encryptions. Vaultx respects this because secret-revision DEKs are
 //! effectively single-use — each revision gets its own DEK wrapped under the
-//! project key, so per-key message counts stay tiny.
+//! project key, so DEK message counts are tiny. A `ProjectKey` accumulates
+//! wraps over the project lifetime, but realistic volumes remain many orders
+//! of magnitude below the bound.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce as AesGcmNonce};
@@ -27,6 +29,11 @@ impl AeadKey {
     }
 
     /// Adopts caller-provided key material.
+    ///
+    /// # Warning
+    /// The bytes are copied into a zeroizing buffer, but the caller-supplied
+    /// source buffer itself is **not** scrubbed by this constructor; zeroize
+    /// it separately if it held secret material.
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         Self(Zeroizing::new(*bytes))
     }
@@ -104,7 +111,15 @@ pub fn encrypt(key: &AeadKey, plaintext: &[u8], aad: &[u8]) -> CryptoResult<Ciph
 ///
 /// Returns [`CryptoError::DecryptionFailed`] if the key, nonce, ciphertext,
 /// or associated data does not match what was used at encryption time.
-pub fn decrypt(key: &AeadKey, bundle: &CiphertextBundle, aad: &[u8]) -> CryptoResult<Vec<u8>> {
+///
+/// The recovered plaintext is wrapped in [`Zeroizing`] so it is scrubbed on
+/// drop; keep it inside this regime (or convert it into a
+/// [`crate::secret::SecretBytes`]) rather than unwrapping to a bare buffer.
+pub fn decrypt(
+    key: &AeadKey,
+    bundle: &CiphertextBundle,
+    aad: &[u8],
+) -> CryptoResult<Zeroizing<Vec<u8>>> {
     let cipher = build_cipher(key)?;
     let gcm_nonce = AesGcmNonce::from_slice(bundle.nonce.as_bytes());
     cipher
@@ -115,6 +130,7 @@ pub fn decrypt(key: &AeadKey, bundle: &CiphertextBundle, aad: &[u8]) -> CryptoRe
                 aad,
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| CryptoError::DecryptionFailed)
 }
 
@@ -135,7 +151,7 @@ mod tests {
         let bundle = encrypt(&key, plaintext, aad).expect("encrypt");
         assert_ne!(bundle.ciphertext, plaintext.to_vec());
         let recovered = decrypt(&key, &bundle, aad).expect("decrypt");
-        assert_eq!(recovered, plaintext.to_vec());
+        assert_eq!(recovered.as_slice(), plaintext.as_slice());
     }
 
     #[test]
@@ -192,9 +208,7 @@ mod tests {
         let json = serde_json::to_string(&bundle).expect("serialize");
         let parsed: CiphertextBundle = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, bundle);
-        assert_eq!(
-            decrypt(&key, &parsed, b"aad").expect("decrypt after round-trip"),
-            b"round trip".to_vec()
-        );
+        let recovered = decrypt(&key, &parsed, b"aad").expect("decrypt after round-trip");
+        assert_eq!(recovered.as_slice(), b"round trip".as_slice());
     }
 }

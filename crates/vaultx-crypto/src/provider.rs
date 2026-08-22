@@ -82,9 +82,14 @@ impl Default for InMemoryKeyProvider {
 
 impl std::fmt::Debug for InMemoryKeyProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Snapshot the project count while holding the lock, then release it
+        // before formatting: formatting must never re-enter the lock (the
+        // caller may already hold the guard, e.g. inside a Debug of a value
+        // borrowed from the map).
+        let project_count = self.projects.lock().ok().map(|projects| projects.len());
         f.debug_struct("InMemoryKeyProvider")
             .field("root", &"<redacted>")
-            .field("projects", &self.projects.lock().map(|g| g.len()))
+            .field("project_count", &project_count)
             .finish()
     }
 }

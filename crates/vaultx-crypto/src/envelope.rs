@@ -28,6 +28,9 @@ const DEK_WRAP_AAD: &[u8] = b"vaultx:wrap:v1:dek";
 /// project key.
 const FINGERPRINT_WRAP_AAD: &[u8] = b"vaultx:wrap:v1:fingerprint";
 
+/// Length in bytes of every key type wrapped by this module.
+const KEY_LEN: usize = 32;
+
 /// The root wrapping key of a workspace. In production this lives in native
 /// secure credential storage; here it is an in-process zeroized buffer.
 pub struct RootKey(Zeroizing<[u8; 32]>);
@@ -42,6 +45,11 @@ impl RootKey {
 
     /// Adopts caller-provided root key material (e.g. loaded from secure
     /// storage).
+    ///
+    /// # Warning
+    /// The bytes are copied into a zeroizing buffer, but the caller-supplied
+    /// source buffer itself is **not** scrubbed by this constructor; zeroize
+    /// it separately if it held secret material.
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         Self(Zeroizing::new(*bytes))
     }
@@ -74,6 +82,11 @@ impl Dek {
     }
 
     /// Adopts caller-provided DEK material.
+    ///
+    /// # Warning
+    /// The bytes are copied into a zeroizing buffer, but the caller-supplied
+    /// source buffer itself is **not** scrubbed by this constructor; zeroize
+    /// it separately if it held secret material.
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         Self(Zeroizing::new(*bytes))
     }
@@ -103,6 +116,11 @@ impl FingerprintKey {
     }
 
     /// Adopts caller-provided key material.
+    ///
+    /// # Warning
+    /// The bytes are copied into a zeroizing buffer, but the caller-supplied
+    /// source buffer itself is **not** scrubbed by this constructor; zeroize
+    /// it separately if it held secret material.
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         Self(Zeroizing::new(*bytes))
     }
@@ -143,8 +161,14 @@ pub fn wrap_project_key(root: &RootKey, project_key: &ProjectKey) -> CryptoResul
 /// Any authentication failure — wrong root key, tampered blob, or a blob
 /// produced by a different wrap purpose — yields [`CryptoError::UnwrapFailed`].
 pub fn unwrap_project_key(root: &RootKey, wrapped: &WrappedKey) -> CryptoResult<ProjectKey> {
-    let bytes = root.expose(|root_bytes| unwrap_child(root_bytes, wrapped, PROJECT_WRAP_AAD))?;
-    Ok(ProjectKey::from_bytes(&bytes))
+    root.expose(|root_bytes| {
+        unwrap_child(
+            root_bytes,
+            wrapped,
+            PROJECT_WRAP_AAD,
+            ProjectKey::from_bytes,
+        )
+    })
 }
 
 /// Wraps a secret-revision DEK under a project key.
@@ -154,8 +178,7 @@ pub fn wrap_dek(project_key: &ProjectKey, dek: &Dek) -> CryptoResult<WrappedKey>
 
 /// Unwraps a DEK previously wrapped by [`wrap_dek`].
 pub fn unwrap_dek(project_key: &ProjectKey, wrapped: &WrappedKey) -> CryptoResult<Dek> {
-    let bytes = project_key.expose(|kek| unwrap_child(kek, wrapped, DEK_WRAP_AAD))?;
-    Ok(Dek::from_bytes(&bytes))
+    project_key.expose(|kek| unwrap_child(kek, wrapped, DEK_WRAP_AAD, Dek::from_bytes))
 }
 
 /// Wraps a fingerprint key under a project key.
@@ -173,8 +196,14 @@ pub fn unwrap_fingerprint_key(
     project_key: &ProjectKey,
     wrapped: &WrappedKey,
 ) -> CryptoResult<FingerprintKey> {
-    let bytes = project_key.expose(|kek| unwrap_child(kek, wrapped, FINGERPRINT_WRAP_AAD))?;
-    Ok(FingerprintKey::from_bytes(&bytes))
+    project_key.expose(|kek| {
+        unwrap_child(
+            kek,
+            wrapped,
+            FINGERPRINT_WRAP_AAD,
+            FingerprintKey::from_bytes,
+        )
+    })
 }
 
 fn wrap_child(
@@ -190,11 +219,12 @@ fn wrap_child(
     })
 }
 
-fn unwrap_child(
+fn unwrap_child<R>(
     kek: &[u8; 32],
     wrapped: &WrappedKey,
     purpose_aad: &'static [u8],
-) -> CryptoResult<[u8; 32]> {
+    materialize: impl FnOnce(&[u8; 32]) -> R,
+) -> CryptoResult<R> {
     let bundle = CiphertextBundle {
         nonce: wrapped.nonce,
         ciphertext: wrapped.ciphertext.clone(),
@@ -202,10 +232,17 @@ fn unwrap_child(
     let kek = AeadKey::from_bytes(kek);
     let plaintext =
         crate::aead::decrypt(&kek, &bundle, purpose_aad).map_err(|_| CryptoError::UnwrapFailed)?;
-    let child: [u8; 32] = plaintext
+    if plaintext.len() != KEY_LEN {
+        return Err(CryptoError::UnwrapFailed);
+    }
+    // Borrow straight into the zeroized plaintext buffer and hand the slice
+    // to `materialize`, which adopts the bytes into its own `Zeroizing`
+    // storage: raw key bytes are never copied into an unscrubbed intermediate.
+    let child: &[u8; 32] = plaintext
+        .as_slice()
         .try_into()
-        .map_err(|_| CryptoError::UnwrapFailed)?;
-    Ok(child)
+        .expect("length checked above");
+    Ok(materialize(child))
 }
 
 #[cfg(test)]

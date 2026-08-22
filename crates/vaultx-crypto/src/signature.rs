@@ -7,7 +7,7 @@
 //! material never silently duplicates. Public keys are freely copyable and
 //! serializable.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
@@ -75,13 +75,18 @@ impl VerifyingPublicKey {
 
 /// Verifies that `sig` is a valid signature of `msg` under `public`.
 ///
+/// Uses Ed25519ph-style **strict verification** (`verify_strict`), which in
+/// addition to the standard equation check rejects non-canonical signatures
+/// with small-order or non-canonical `R`/`S` components, preventing
+/// signature malleability.
+///
 /// Returns [`CryptoError::SignatureInvalid`] if the signature bytes are
 /// malformed or verification fails.
 pub fn verify(public: &VerifyingPublicKey, msg: &[u8], sig: &SignatureBytes) -> CryptoResult<()> {
     let signature = Signature::from_slice(&sig.0).map_err(|_| CryptoError::SignatureInvalid)?;
     public
         .0
-        .verify(msg, &signature)
+        .verify_strict(msg, &signature)
         .map_err(|_| CryptoError::SignatureInvalid)
 }
 

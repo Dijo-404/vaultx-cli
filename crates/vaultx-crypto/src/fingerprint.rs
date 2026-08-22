@@ -115,6 +115,19 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_uppercase_hex() {
+        // Comparison is case-sensitive: the canonical form is lowercase hex,
+        // so an uppercase rendering of the same digest must not verify.
+        let key = FingerprintKey::generate();
+        let secret = b"case-sensitive compare";
+        let fp = keyed_fingerprint(&key, secret);
+        let upper = fp.to_uppercase();
+        assert_ne!(upper, fp);
+        assert!(!verify_fingerprint(&key, secret, &upper));
+        assert!(verify_fingerprint(&key, secret, &fp));
+    }
+
+    #[test]
     fn verify_is_length_safe() {
         let key = FingerprintKey::generate();
         let fp = keyed_fingerprint(&key, b"x");

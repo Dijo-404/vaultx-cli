@@ -12,8 +12,8 @@
 //! - [`signature`]: Ed25519 signing and verification.
 //! - [`secret`]: secret-safe wrapper types ([`secret::SecretBytes`],
 //!   [`secret::SecretString`]) that zeroize on drop, redact themselves from
-//!   debug/display output, and only release plaintext through narrow
-//!   closures.
+//!   debug output, implement no `Display`/serialization traits, and only
+//!   release plaintext through narrow closures.
 //! - [`provider`]: the [`provider::KeyProvider`] abstraction over wrapping-
 //!   key access, plus an in-memory implementation for tests and development.
 //! - [`error`]: the shared [`error::CryptoError`] type; no variant ever

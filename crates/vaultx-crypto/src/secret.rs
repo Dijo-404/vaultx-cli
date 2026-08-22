@@ -2,11 +2,12 @@
 //!
 //! Rules enforced by this module:
 //! - plaintext lives inside [`zeroize::Zeroizing`] so it is scrubbed on drop;
-//! - [`Debug`] and [`Display`] never reveal content (they write
-//!   `"<redacted>"`), so a canary value can never leak through logging;
-//! - there is intentionally **no** `Clone`, `Copy`, `PartialEq`, `Eq`,
-//!   `Hash`, `Serialize`, or `Deserialize` implementation — secret values do
-//!   not silently duplicate or cross serialization boundaries;
+//! - [`Debug`] never reveals content (it writes `"<redacted>"`), so a canary
+//!   value can never leak through logging;
+//! - per PLAN §8 there is intentionally **no** `Display` implementation, and
+//!   no `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`, `Serialize`, or
+//!   `Deserialize` — secret values do not silently render, duplicate, or
+//!   cross serialization boundaries;
 //! - the only way to read plaintext is through [`SecretBytes::expose`] or
 //!   [`SecretString::expose_str`], whose closures are narrowly scoped.
 
@@ -14,11 +15,11 @@ use std::fmt;
 use zeroize::Zeroizing;
 
 /// Owned heap-allocated secret bytes that are zeroized on drop and redacted
-/// from all formatting output.
+/// from debug output.
 ///
-/// The type deliberately implements neither `Clone` nor any comparison or
-/// serialization traits: moving is the only way to transfer ownership, and
-/// plaintext can only be observed via [`SecretBytes::expose`].
+/// The type deliberately implements neither `Clone`, `Display`, nor any
+/// comparison or serialization traits: moving is the only way to transfer
+/// ownership, and plaintext can only be observed via [`SecretBytes::expose`].
 pub struct SecretBytes(Zeroizing<Vec<u8>>);
 
 impl SecretBytes {
@@ -65,17 +66,12 @@ impl fmt::Debug for SecretBytes {
     }
 }
 
-impl fmt::Display for SecretBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<redacted>")
-    }
-}
-
 /// Owned heap-allocated secret string that is zeroized on drop and redacted
-/// from all formatting output.
+/// from debug output.
 ///
-/// Same rules as [`SecretBytes`]: no `Clone`/comparison/serialization impls,
-/// plaintext only reachable via [`SecretString::expose_str`].
+/// Same rules as [`SecretBytes`]: no `Display`, `Clone`, comparison, or
+/// serialization impls; plaintext only reachable via
+/// [`SecretString::expose_str`].
 pub struct SecretString(Zeroizing<String>);
 
 impl SecretString {
@@ -115,12 +111,6 @@ impl fmt::Debug for SecretString {
     }
 }
 
-impl fmt::Display for SecretString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<redacted>")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,9 +126,9 @@ mod tests {
     }
 
     #[test]
-    fn display_of_secret_bytes_is_redacted() {
+    fn debug_of_secret_bytes_from_vec_is_redacted() {
         let secret = SecretBytes::from_vec(CANARY.as_bytes().to_vec());
-        let rendered = format!("{secret}");
+        let rendered = format!("{secret:?}");
         assert_eq!(rendered, "<redacted>");
         assert!(!rendered.contains(CANARY));
     }
@@ -147,14 +137,6 @@ mod tests {
     fn debug_of_secret_string_is_redacted() {
         let secret = SecretString::copy_from(CANARY);
         let rendered = format!("{secret:?}");
-        assert_eq!(rendered, "<redacted>");
-        assert!(!rendered.contains(CANARY));
-    }
-
-    #[test]
-    fn display_of_secret_string_is_redacted() {
-        let secret = SecretString::new(CANARY.to_owned());
-        let rendered = format!("{secret}");
         assert_eq!(rendered, "<redacted>");
         assert!(!rendered.contains(CANARY));
     }
