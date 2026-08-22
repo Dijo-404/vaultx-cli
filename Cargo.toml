@@ -29,3 +29,5 @@ rust-version = "1.93"
 # Shared dependency versions are declared here; member crates reference
 # them with `{ workspace = true }`. Dependencies are added per crate in
 # later tasks.
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
