@@ -20,6 +20,11 @@ members = [
     "crates/vaultx-testkit",
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+
 [workspace.dependencies]
 # Shared dependency versions are declared here; member crates reference
 # them with `{ workspace = true }`. Dependencies are added per crate in
