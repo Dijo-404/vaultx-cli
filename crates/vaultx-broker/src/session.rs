@@ -1,0 +1,397 @@
+//! Agent session authentication (plan §25).
+//!
+//! A session binds an agent identity to an environment and is exercised
+//! with a bearer-style token. Only the SHA-256 **verifier hash** of the
+//! token is ever stored — the raw token exists exactly twice: returned
+//! once by [`SessionStore::create`], and held in the caller's hands
+//! afterwards. Validation compares verifier hashes in constant time
+//! ([`subtle`]) so token guessing cannot be timed.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use vaultx_types::{AgentId, EnvironmentId, SessionId};
+
+use crate::error::BrokerError;
+
+/// Random bytes behind generated session ids (rendered as 32 hex chars).
+const SESSION_ID_BYTES: usize = 16;
+/// Random bytes behind generated raw session tokens.
+const SESSION_TOKEN_BYTES: usize = 32;
+
+fn random_hex(bytes: usize) -> Result<String, BrokerError> {
+    let mut buffer = vec![0u8; bytes];
+    getrandom::getrandom(&mut buffer).map_err(|e| BrokerError::Entropy(e.to_string()))?;
+    Ok(hex::encode(buffer))
+}
+
+// ---------------------------------------------------------------------------
+// TokenHash
+// ---------------------------------------------------------------------------
+
+/// SHA-256 verifier of a raw session bearer token. The plaintext token is
+/// never persisted; only this digest is (plan §25: "Store only a
+/// verifier/hash for bearer-style local session tokens").
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TokenHash([u8; 32]);
+
+impl TokenHash {
+    /// Computes the verifier of a raw token string.
+    #[must_use]
+    pub fn from_token(token: &str) -> Self {
+        Self(hash_token(token))
+    }
+
+    /// Constant-time equality against another verifier. Timing of this
+    /// comparison does not depend on matching prefix length.
+    #[must_use]
+    pub fn ct_eq(&self, other: &Self) -> bool {
+        bool::from(self.0.as_slice().ct_eq(other.0.as_slice()))
+    }
+
+    /// Raw digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Hashes the bytes of a raw session token with SHA-256.
+#[must_use]
+pub fn hash_token(token: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hasher.finalize().into()
+}
+
+impl Serialize for TokenHash {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for TokenHash {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&raw)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .ok_or_else(|| D::Error::custom("token hash must be 64 hex characters"))?;
+        Ok(Self(bytes))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session record + store seam
+// ---------------------------------------------------------------------------
+
+/// Stored state of one agent session (plan §25). Mirrors the plan's
+/// `AgentSession` shape: identity binding plus the token *verifier* and a
+/// revocation flag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionRecord {
+    /// Identifier of the session (`sess_...`).
+    pub session_id: SessionId,
+    /// Agent that owns the session.
+    pub agent: AgentId,
+    /// Environment the session operates in.
+    pub environment: EnvironmentId,
+    /// Verifier hash of the raw bearer token; the token itself is never
+    /// retained.
+    pub token_hash: TokenHash,
+    /// Revocation flag; revoked sessions fail validation forever.
+    pub revoked: bool,
+}
+
+/// Session authentication boundary used by the broker engine.
+///
+/// Implementations must be safe to share across threads. Raw tokens are
+/// handed out exactly once at creation; afterwards only verifiers live in
+/// storage.
+pub trait SessionStore: Send + Sync {
+    /// Creates a session for `agent` in `environment`, returning the new
+    /// session id together with the **raw** bearer token. The token can
+    /// never be recovered later.
+    ///
+    /// # Errors
+    /// Implementation-defined (entropy failure, persistence failure).
+    fn create(
+        &self,
+        agent: &AgentId,
+        environment: &EnvironmentId,
+    ) -> Result<(SessionId, String), BrokerError>;
+
+    /// Validates a presented raw token and returns the live session
+    /// record it belongs to.
+    ///
+    /// # Errors
+    /// Returns [`BrokerError::InvalidSession`] when no session matches or
+    /// the verifier differs, and [`BrokerError::SessionRevoked`] when the
+    /// matched session was revoked.
+    fn validate(&self, raw_token: &str) -> Result<AgentSessionRecord, BrokerError>;
+
+    /// Revokes a session by id. Revoked sessions stay stored (audit trail
+    /// of the id binding) but validate as revoked forever.
+    ///
+    /// # Errors
+    /// Returns [`BrokerError::InvalidSession`] when the id is unknown.
+    fn revoke(&self, session_id: &SessionId) -> Result<(), BrokerError>;
+}
+
+// ---------------------------------------------------------------------------
+// In-memory implementation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct InMemoryState {
+    sessions: HashMap<SessionId, AgentSessionRecord>,
+    /// Verifier → session id index so validation needs no secret-bearing
+    /// scan over records.
+    by_hash: HashMap<TokenHash, SessionId>,
+}
+
+/// Thread-safe in-memory [`SessionStore`] for tests and development until
+/// the persistent vault integration lands.
+///
+/// Storage holds session ids, identity bindings, revocation flags, and
+/// token *verifier hashes* only — never raw tokens.
+#[derive(Debug, Default)]
+pub struct InMemorySessionStore {
+    state: Mutex<InMemoryState>,
+}
+
+impl InMemorySessionStore {
+    /// Creates an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, InMemoryState> {
+        // Poisoning carries no recoverable invariant here (plain maps);
+        // mirror the workspace convention of unwrapping poisons.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl SessionStore for InMemorySessionStore {
+    fn create(
+        &self,
+        agent: &AgentId,
+        environment: &EnvironmentId,
+    ) -> Result<(SessionId, String), BrokerError> {
+        // Session id: `sess_` + 16 random bytes hex (fits the SessionId
+        // grammar: lowercase hex content, well under the 64-char cap).
+        let session_id = SessionId::parse(&format!("sess_{}", random_hex(SESSION_ID_BYTES)?))
+            .map_err(|_| {
+                BrokerError::Entropy("generated session id failed validation".to_owned())
+            })?;
+        // Raw token: 32 random bytes hex, independent of the id. Only its
+        // SHA-256 verifier is stored.
+        let raw_token = random_hex(SESSION_TOKEN_BYTES)?;
+        let token_hash = TokenHash::from_token(&raw_token);
+
+        let mut state = self.lock();
+        if state.by_hash.contains_key(&token_hash) {
+            // Astronomically unlikely collision; refuse rather than
+            // silently shadowing an existing session.
+            return Err(BrokerError::Entropy(
+                "session token verifier collision".to_owned(),
+            ));
+        }
+        state.sessions.insert(
+            session_id.clone(),
+            AgentSessionRecord {
+                session_id: session_id.clone(),
+                agent: agent.clone(),
+                environment: environment.clone(),
+                token_hash,
+                revoked: false,
+            },
+        );
+        state.by_hash.insert(token_hash, session_id.clone());
+        Ok((session_id, raw_token))
+    }
+
+    fn validate(&self, raw_token: &str) -> Result<AgentSessionRecord, BrokerError> {
+        let computed = TokenHash::from_token(raw_token);
+        let state = self.lock();
+        let session_id = state
+            .by_hash
+            .get(&computed)
+            .cloned()
+            .ok_or(BrokerError::InvalidSession)?;
+        let record = state
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(BrokerError::InvalidSession)?;
+
+        // Constant-time verification even though the index already
+        // matched: the compare itself must not leak match length.
+        if !record.token_hash.ct_eq(&computed) {
+            return Err(BrokerError::InvalidSession);
+        }
+        if record.revoked {
+            return Err(BrokerError::SessionRevoked);
+        }
+        Ok(record)
+    }
+
+    fn revoke(&self, session_id: &SessionId) -> Result<(), BrokerError> {
+        let mut state = self.lock();
+        let record = state
+            .sessions
+            .get_mut(session_id)
+            .ok_or(BrokerError::InvalidSession)?;
+        record.revoked = true;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent() -> AgentId {
+        AgentId::parse("agent_coding").unwrap()
+    }
+
+    fn environment() -> EnvironmentId {
+        EnvironmentId::parse("env_development").unwrap()
+    }
+
+    #[test]
+    fn create_then_validate_round_trips() {
+        let store = InMemorySessionStore::new();
+        let (session_id, raw_token) = store.create(&agent(), &environment()).unwrap();
+
+        assert!(session_id.as_str().starts_with("sess_"));
+        assert_eq!(session_id.as_str().len(), "sess_".len() + 32);
+        assert!(session_id.as_str()["sess_".len()..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        // Raw token is 32 bytes of hex — distinct material from the id.
+        assert_ne!(raw_token, session_id.as_str());
+        assert_eq!(raw_token.len(), 64);
+
+        let record = store.validate(&raw_token).unwrap();
+        assert_eq!(record.session_id, session_id);
+        assert_eq!(record.agent, agent());
+        assert_eq!(record.environment, environment());
+        assert!(!record.revoked);
+    }
+
+    #[test]
+    fn wrong_token_is_rejected() {
+        let store = InMemorySessionStore::new();
+        store.create(&agent(), &environment()).unwrap();
+        let (_id, real_token) = store.create(&agent(), &environment()).unwrap();
+
+        let mut wrong = real_token.as_bytes().to_vec();
+        wrong[0] ^= b'a' ^ b'b';
+        let mutated = String::from_utf8(wrong).unwrap();
+        assert!(mutated != real_token);
+        assert!(matches!(
+            store.validate(&mutated),
+            Err(BrokerError::InvalidSession)
+        ));
+        // And a syntactically unrelated garbage token too.
+        assert!(matches!(
+            store.validate("not-a-token-at-all"),
+            Err(BrokerError::InvalidSession)
+        ));
+    }
+
+    #[test]
+    fn revoked_session_is_rejected_with_dedicated_error() {
+        let store = InMemorySessionStore::new();
+        let (session_id, raw_token) = store.create(&agent(), &environment()).unwrap();
+        assert!(store.validate(&raw_token).is_ok());
+
+        store.revoke(&session_id).unwrap();
+        assert!(matches!(
+            store.validate(&raw_token),
+            Err(BrokerError::SessionRevoked)
+        ));
+
+        // Revocation is permanent.
+        assert!(matches!(
+            store.validate(&raw_token),
+            Err(BrokerError::SessionRevoked)
+        ));
+    }
+
+    #[test]
+    fn unknown_session_revoke_and_validation_fail() {
+        let store = InMemorySessionStore::new();
+        assert!(matches!(
+            store.revoke(&SessionId::parse("sess_does_not_exist").unwrap()),
+            Err(BrokerError::InvalidSession)
+        ));
+        assert!(matches!(
+            store.validate("deadbeef"),
+            Err(BrokerError::InvalidSession)
+        ));
+    }
+
+    #[test]
+    fn raw_tokens_are_distinct_across_sessions_and_only_hashes_stored() {
+        let store = InMemorySessionStore::new();
+        let (_, first) = store.create(&agent(), &environment()).unwrap();
+        let (_, second) = store.create(&agent(), &environment()).unwrap();
+        assert_ne!(first, second);
+
+        // The store keeps no field shaped like a raw token: every stored
+        // record's token field is the 32-byte digest.
+        let state = store.lock();
+        for record in state.sessions.values() {
+            assert_ne!(hex::encode(record.token_hash.as_bytes()), first);
+            assert_ne!(hex::encode(record.token_hash.as_bytes()), second);
+            assert_eq!(record.token_hash.as_bytes().len(), 32);
+        }
+    }
+
+    #[test]
+    fn token_hash_verifies_in_constant_time_api() {
+        let a = TokenHash::from_token("token-one");
+        let b = TokenHash::from_token("token-one");
+        let c = TokenHash::from_token("token-two");
+        assert!(a.ct_eq(&b));
+        assert!(!a.ct_eq(&c));
+        assert_ne!(
+            a.as_bytes(),
+            &[0u8; 32],
+            "hash of a non-empty token is never all zeros"
+        );
+    }
+
+    #[test]
+    fn token_hash_serde_round_trips_and_validates_length() {
+        let hash = TokenHash::from_token("some-session-token");
+        let encoded = serde_json::to_string(&hash).unwrap();
+        assert_eq!(encoded.len(), 64 + 2); // quoted 64 hex chars
+        let decoded: TokenHash = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, hash);
+        assert!(serde_json::from_str::<TokenHash>("\"zz\"").is_err());
+        assert!(serde_json::from_str::<TokenHash>("\"00\"").is_err());
+    }
+
+    #[test]
+    fn session_record_serde_round_trips() {
+        let store = InMemorySessionStore::new();
+        let (session_id, _) = store.create(&agent(), &environment()).unwrap();
+        let state = store.lock();
+        let record = state.sessions.get(&session_id).unwrap().clone();
+        drop(state);
+
+        let encoded = serde_json::to_string(&record).unwrap();
+        let decoded: AgentSessionRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, record);
+        assert!(!encoded.contains("\"revoked\":true"));
+    }
+}
