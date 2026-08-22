@@ -32,6 +32,10 @@ rust-version = "1.93"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+hex = "0.4"
+
+# Test-only utilities shared across member crates.
+tempfile = "3"
 
 # Crypto primitives used by `vaultx-crypto`. RNG strategy is pinned to
 # `rand_core` 0.6 + `getrandom` (the version expected by aes-gcm 0.10 and
