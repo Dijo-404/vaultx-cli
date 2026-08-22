@@ -25,7 +25,6 @@ use sha2::{Digest, Sha256};
 use vaultx_types::ObjectId;
 
 use crate::error::RepoError;
-use crate::store::FileSystemObjectStore;
 
 /// Version of the canonical object envelope format written by this crate.
 pub const OBJECT_FORMAT_VERSION: u16 = 1;
@@ -135,30 +134,6 @@ pub fn object_id(canonical: &[u8]) -> Result<ObjectId, RepoError> {
         hex::encode(hash_canonical(canonical))
     ))
     .map_err(Into::into)
-}
-
-/// Stores `envelope` content-addressed, returning its [`ObjectId`].
-///
-/// # Errors
-/// Propagates store errors (I/O, corruption on existing mismatched
-/// content).
-pub fn store_object(
-    store: &FileSystemObjectStore,
-    envelope: &ObjectEnvelope,
-) -> Result<ObjectId, RepoError> {
-    store.put(envelope)
-}
-
-/// Loads and hash-verifies the object identified by `id`.
-///
-/// # Errors
-/// [`RepoError::ObjectNotFound`] / [`RepoError::CorruptObject`] /
-/// [`RepoError::Io`].
-pub fn load_object(
-    store: &FileSystemObjectStore,
-    id: &ObjectId,
-) -> Result<ObjectEnvelope, RepoError> {
-    store.get(id)
 }
 
 #[cfg(test)]

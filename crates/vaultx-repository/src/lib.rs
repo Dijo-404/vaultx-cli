@@ -1,6 +1,14 @@
 //! Canonical object encoding, object store, refs, staging, commits,
 //! branches, diff, merge, integrity verification.
 //!
+//! # Concurrency model (v1)
+//!
+//! The repository assumes **single-process, single-writer access**: there
+//! is no locking, so two concurrent writers can resolve the same head and
+//! race on the final ref write (last write wins). Concurrent readers are
+//! safe — every file is published atomically (temp file + rename) and
+//! reads verify integrity. See the [`repo::Repository`] docs for details.
+//!
 //! # Layout
 //!
 //! - [`object`]: canonical v1 encoding ([`ObjectEnvelope`]) and content

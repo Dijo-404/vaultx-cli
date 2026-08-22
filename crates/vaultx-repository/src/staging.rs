@@ -76,7 +76,14 @@ impl StagingIndex {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
-        std::fs::write(&temp_path, serde_json::to_string_pretty(self.entries())?)?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temp_path)?;
+            file.write_all(serde_json::to_string_pretty(self.entries())?.as_bytes())?;
+            // Durability matches the object store: bytes reach disk before
+            // the rename publishes them.
+            file.sync_all()?;
+        }
         std::fs::rename(&temp_path, &path)?;
         Ok(())
     }

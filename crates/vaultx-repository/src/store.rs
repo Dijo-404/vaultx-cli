@@ -113,6 +113,11 @@ impl FileSystemObjectStore {
     /// * [`RepoError::ObjectNotFound`] when no object exists under `id`.
     /// * [`RepoError::CorruptObject`] when stored bytes fail hash or decode
     ///   verification.
+    ///
+    /// # Concurrency note (TOCTOU)
+    /// If a concurrent process removes the object after the existence
+    /// check, the read fails with `Io(NotFound)`; under content addressing
+    /// this is benign (the content is gone, not damaged).
     pub fn get(&self, id: &ObjectId) -> Result<ObjectEnvelope, RepoError> {
         let path = self.path_for(id)?;
         if !path.exists() {
@@ -141,6 +146,12 @@ impl FileSystemObjectStore {
     }
 
     /// True when an object with this ID exists on disk.
+    ///
+    /// # Concurrency note (TOCTOU)
+    /// Under a concurrent writer a checked path may vanish between this
+    /// probe and a subsequent [`FileSystemObjectStore::get`]; that read
+    /// then fails with a benign `Io(NotFound)` — content addressing makes
+    /// such objects unrecoverable-by-design, never partially readable.
     #[must_use]
     pub fn exists(&self, id: &ObjectId) -> bool {
         self.path_for(id).is_ok_and(|p| p.exists())
@@ -148,6 +159,11 @@ impl FileSystemObjectStore {
 
     /// Verifies every object in the store: each stored file's SHA-256 must
     /// match its content-addressed location and decode as an envelope.
+    ///
+    /// Only genuine object entries are considered: shard directories hold
+    /// exactly `<2-hex>/<62-hex>` files, so dot-prefixed leftovers (e.g.
+    /// `.tmp-<pid>-<nanos>` from a crashed writer) and any non-hex names
+    /// are skipped rather than misparsed.
     ///
     /// Traversal order is deterministic (sorted paths) so repeated runs
     /// report the same first failure.
@@ -163,16 +179,32 @@ impl FileSystemObjectStore {
         shards.sort_by_key(|entry| entry.file_name());
         for shard in shards {
             let shard_name = shard.file_name().to_string_lossy().into_owned();
+            if !is_hex_of_len(&shard_name, 2) {
+                continue; // Stray directory, not a shard.
+            }
             let mut objects: Vec<_> = fs::read_dir(shard.path())?.filter_map(|e| e.ok()).collect();
             objects.sort_by_key(|entry| entry.file_name());
             for object in objects {
                 let name = object.file_name().to_string_lossy().into_owned();
+                // Skip crash leftovers (.tmp-...) and anything that is not
+                // a real <hex-62> object file.
+                if name.starts_with('.') || !is_hex_of_len(&name, 62) {
+                    continue;
+                }
                 let id = ObjectId::parse(&format!("{}{shard_name}{name}", ObjectId::PREFIX))?;
                 self.get(&id)?;
             }
         }
         Ok(())
     }
+}
+
+/// True when `value` is exactly `len` lowercase hex characters.
+fn is_hex_of_len(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 #[cfg(test)]
@@ -312,6 +344,29 @@ mod tests {
     fn verify_all_tolerates_empty_store() {
         let (_guard, store) = temp_store();
         store.verify_all().expect("empty store verifies");
+    }
+
+    #[test]
+    fn verify_all_ignores_leftover_temp_files_and_strays() {
+        let (_guard, store) = temp_store();
+        let id = store.put(&sample_envelope(b"real object")).unwrap();
+        store.verify_all().expect("clean store verifies");
+
+        // Simulate a crashed writer: temp file left inside a shard dir.
+        let digest = &id.as_str()[4..];
+        let shard_dir = store.root().join("sha256").join(&digest[..2]);
+        std::fs::write(shard_dir.join(".tmp-123-456"), b"partial bytes").unwrap();
+
+        // And a couple of unrelated strays at other levels.
+        std::fs::write(store.root().join("sha256").join("zz"), b"not a shard").unwrap();
+        let other_shard = store.root().join("sha256").join(&digest[..2]);
+        std::fs::write(other_shard.join("NOTHEX"), b"garbage").unwrap();
+
+        // The sweep must succeed: only genuine <hex62> objects are checked.
+        store
+            .verify_all()
+            .expect("temp leftovers must not break verify_all");
+        assert!(store.get(&id).is_ok(), "real object still readable");
     }
 
     #[test]

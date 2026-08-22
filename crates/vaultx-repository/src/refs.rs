@@ -155,7 +155,14 @@ impl RefStore {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
-        std::fs::write(&temp_path, contents)?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temp_path)?;
+            file.write_all(contents.as_bytes())?;
+            // Durability matches the object store: bytes reach disk before
+            // the rename publishes them.
+            file.sync_all()?;
+        }
         std::fs::rename(&temp_path, path)?;
         Ok(())
     }
@@ -185,14 +192,33 @@ impl RefStore {
         })
     }
 
-    /// Creates or moves `namespace/name` to `commit`. Use
-    /// [`RefStore::write_env_ref`] for environment refs carrying
-    /// protection.
+    /// Creates or moves a **branch** ref (`heads/<name>`) to `commit`.
+    ///
+    /// Environment refs are deliberately rejected here: they carry
+    /// protection metadata that only [`RefStore::write_env_ref`] enforces,
+    /// so routing them through this generic API would bypass that check.
     ///
     /// # Errors
-    /// [`RepoError::InvalidRef`] for malformed names;
-    /// [`RepoError::Io`] on filesystem failures.
+    /// * [`RepoError::InvalidRef`] for malformed names and for any attempt
+    ///   to target the [`RefNamespace::Environments`] namespace.
+    /// * [`RepoError::Io`] on filesystem failures.
     pub fn write_ref(
+        &self,
+        namespace: RefNamespace,
+        name: &str,
+        commit: &CommitId,
+    ) -> Result<(), RepoError> {
+        if namespace == RefNamespace::Environments {
+            return Err(RepoError::InvalidRef(
+                "environment refs must go through write_env_ref (protection-aware)".to_owned(),
+            ));
+        }
+        self.write_ref_at(namespace, name, commit)
+    }
+
+    /// Raw, protection-agnostic ref write shared by [`RefStore::write_ref`]
+    /// and [`RefStore::write_env_ref`] so both produce byte-identical files.
+    fn write_ref_at(
         &self,
         namespace: RefNamespace,
         name: &str,
@@ -202,12 +228,9 @@ impl RefStore {
         Self::write_atomically(&path, &format!("{commit}\n"))
     }
 
-    /// Removes a branch ref. Protected environment refs must be deleted via
+    /// Raw ref removal shared by [`RefStore::delete_ref`] and
     /// [`RefStore::delete_env_ref`].
-    ///
-    /// # Errors
-    /// [`RepoError::RefNotFound`] when the ref is absent.
-    pub fn delete_ref(&self, namespace: RefNamespace, name: &str) -> Result<(), RepoError> {
+    fn remove_ref_file(&self, namespace: RefNamespace, name: &str) -> Result<(), RepoError> {
         let path = self.ref_path(namespace, name)?;
         if !path.exists() {
             return Err(RepoError::RefNotFound(format!(
@@ -217,6 +240,45 @@ impl RefStore {
         }
         std::fs::remove_file(&path)?;
         Ok(())
+    }
+
+    /// Removes a branch ref.
+    ///
+    /// Deleting the branch `HEAD` currently symbolically references is
+    /// refused unless `force` is set — otherwise a successful delete would
+    /// leave HEAD dangling on a missing ref. Environment refs must be
+    /// deleted via [`RefStore::delete_env_ref`].
+    ///
+    /// # Errors
+    /// * [`RepoError::RefNotFound`] when the ref is absent.
+    /// * [`RepoError::ProtectedRef`] when deleting the checked-out branch
+    ///   without force.
+    /// * [`RepoError::InvalidRef`] when targeting environment refs.
+    pub fn delete_ref(
+        &self,
+        namespace: RefNamespace,
+        name: &str,
+        force: bool,
+    ) -> Result<(), RepoError> {
+        match namespace {
+            RefNamespace::Environments => {
+                return Err(RepoError::InvalidRef(
+                    "environment refs must be deleted via delete_env_ref".to_owned(),
+                ));
+            }
+            RefNamespace::Heads => {
+                let checked_out = match self.read_head()? {
+                    Some(HeadTarget::Branch { name: current }) => current == name,
+                    _ => false,
+                };
+                if checked_out && !force {
+                    return Err(RepoError::ProtectedRef(format!(
+                        "branch heads/{name} is checked out by HEAD; pass force"
+                    )));
+                }
+            }
+        }
+        self.remove_ref_file(namespace, name)
     }
 
     /// Lists all refs in a namespace as `(name, commit)` pairs sorted by
@@ -321,7 +383,7 @@ impl RefStore {
                 return Err(RepoError::ProtectedRef(name.to_owned()));
             }
         }
-        self.write_ref(RefNamespace::Environments, name, commit)
+        self.write_ref_at(RefNamespace::Environments, name, commit)
     }
 
     /// Deletes an environment ref, honoring protection unless forced.
@@ -336,7 +398,7 @@ impl RefStore {
         {
             return Err(RepoError::ProtectedRef(name.to_owned()));
         }
-        self.delete_ref(RefNamespace::Environments, name)?;
+        self.remove_ref_file(RefNamespace::Environments, name)?;
         // Best-effort cleanup of now-stale protection metadata.
         let _ = std::fs::remove_file(self.protection_path(name)?);
         Ok(())
@@ -403,11 +465,96 @@ mod tests {
             "listing must be sorted"
         );
 
-        refs.delete_ref(RefNamespace::Heads, "feature/x").unwrap();
+        refs.delete_ref(RefNamespace::Heads, "feature/x", false)
+            .unwrap();
         assert!(matches!(
-            refs.delete_ref(RefNamespace::Heads, "feature/x"),
+            refs.delete_ref(RefNamespace::Heads, "feature/x", false),
             Err(RepoError::RefNotFound(_))
         ));
+    }
+
+    #[test]
+    fn generic_ref_api_refuses_environment_namespace() {
+        let (_guard, refs) = temp_refs();
+        let c = CommitId::parse("cmt_guarded").unwrap();
+
+        // Writing env refs through the generic API would bypass protection
+        // metadata, so it is rejected outright...
+        assert!(matches!(
+            refs.write_ref(RefNamespace::Environments, "production", &c),
+            Err(RepoError::InvalidRef(msg)) if msg.contains("write_env_ref"),
+        ));
+        assert!(refs
+            .read_ref(RefNamespace::Environments, "production")
+            .unwrap()
+            .is_none());
+
+        // ...and so is deleting through it.
+        refs.write_env_ref("production", &c, false).unwrap();
+        assert!(matches!(
+            refs.delete_ref(RefNamespace::Environments, "production", false),
+            Err(RepoError::InvalidRef(msg)) if msg.contains("delete_env_ref"),
+        ));
+        // The protection-aware path still works.
+        refs.delete_env_ref("production", false).unwrap();
+    }
+
+    #[test]
+    fn deleting_checked_out_branch_requires_force() {
+        let (_guard, refs) = temp_refs();
+        let c = CommitId::parse("cmt_on_main").unwrap();
+        refs.write_ref(RefNamespace::Heads, "main", &c).unwrap();
+
+        // HEAD points at main.
+        refs.write_head(&HeadTarget::Branch {
+            name: "main".to_owned(),
+        })
+        .unwrap();
+
+        // Refusal without force; HEAD and the ref both remain intact.
+        match refs.delete_ref(RefNamespace::Heads, "main", false) {
+            Err(RepoError::ProtectedRef(msg)) => {
+                assert!(msg.contains("checked out by HEAD"), "message was: {msg}");
+            }
+            other => panic!("expected protected-branch refusal, got {other:?}"),
+        }
+        assert_eq!(
+            refs.read_ref(RefNamespace::Heads, "main").unwrap(),
+            Some(c.clone())
+        );
+        assert_eq!(
+            refs.read_head().unwrap(),
+            Some(HeadTarget::Branch {
+                name: "main".to_owned()
+            })
+        );
+
+        // A non-checked-out branch deletes freely.
+        refs.write_head(&HeadTarget::Branch {
+            name: "other".to_owned(),
+        })
+        .unwrap();
+        refs.delete_ref(RefNamespace::Heads, "main", false).unwrap();
+        assert!(refs
+            .read_ref(RefNamespace::Heads, "main")
+            .unwrap()
+            .is_none());
+
+        // Force overrides the guard even when checked out.
+        refs.write_head(&HeadTarget::Detached { commit: c })
+            .unwrap();
+        let c2 = CommitId::parse("cmt_detached_target").unwrap();
+        refs.write_ref(RefNamespace::Heads, "pinned", &c2).unwrap();
+        refs.write_head(&HeadTarget::Branch {
+            name: "pinned".to_owned(),
+        })
+        .unwrap();
+        refs.delete_ref(RefNamespace::Heads, "pinned", true)
+            .unwrap();
+        assert!(refs
+            .read_ref(RefNamespace::Heads, "pinned")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

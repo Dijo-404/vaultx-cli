@@ -12,7 +12,7 @@ use vaultx_types::CommitId;
 
 use crate::commit::Commit;
 use crate::error::RepoError;
-use crate::object::{ObjectEnvelope, ObjectType};
+use crate::object::ObjectType;
 use crate::store::FileSystemObjectStore;
 
 /// Read-only helpers over the object store for commit history.
@@ -91,20 +91,11 @@ impl<'a> History<'a> {
     }
 }
 
-/// Wraps a commit into its typed storage envelope for persistence.
-///
-/// # Errors
-/// Propagates serialization failures.
-pub(crate) fn commit_envelope(commit: &Commit) -> Result<ObjectEnvelope, RepoError> {
-    Ok(ObjectEnvelope::new(
-        ObjectType::Commit,
-        serde_json::to_vec(commit)?,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commit::commit_envelope;
+    use crate::object::ObjectEnvelope;
     use vaultx_crypto::signature::SigningKeyPair;
     use vaultx_types::{IdentityRef, ObjectId};
 

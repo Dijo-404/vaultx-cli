@@ -169,8 +169,22 @@ pub fn commit_object_id(commit: &Commit) -> Result<ObjectId, RepoError> {
     ))?)
 }
 
+/// The single source of truth for wrapping a commit into its typed storage
+/// envelope. Both ID derivation ([`storage_bytes`]) and persistence
+/// (history/repo layers) go through here, so stored bytes and hashed bytes
+/// are identical by construction rather than by convention.
+///
+/// # Errors
+/// Propagates serialization failures.
+pub(crate) fn commit_envelope(commit: &Commit) -> Result<ObjectEnvelope, RepoError> {
+    Ok(ObjectEnvelope::new(
+        ObjectType::Commit,
+        serde_json::to_vec(commit)?,
+    ))
+}
+
 fn storage_bytes(commit: &Commit) -> Result<Vec<u8>, RepoError> {
-    ObjectEnvelope::new(ObjectType::Commit, serde_json::to_vec(commit)?).canonical_bytes()
+    commit_envelope(commit)?.canonical_bytes()
 }
 
 #[cfg(test)]

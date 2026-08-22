@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use vaultx_crypto::signature::SigningKeyPair;
 use vaultx_types::{CommitId, IdentityRef, ObjectId, VariableName};
 
+use crate::commit::commit_envelope;
 use crate::commit::Commit;
 use crate::diff;
 use crate::error::RepoError;
-use crate::history::{commit_envelope, History};
+use crate::history::History;
 use crate::manifest::Manifest;
 use crate::merge;
 use crate::object::{ObjectEnvelope, ObjectType};
@@ -39,6 +40,19 @@ pub struct StatusReport {
 }
 
 /// A content-addressed variable repository rooted at a directory.
+///
+/// # Concurrency model (v1)
+///
+/// This repository assumes **single-process, single-writer access**: one
+/// owner performs all mutations (`stage_change`, `create_commit`, branch
+/// and environment ref writes) at any given time. There is no locking.
+/// Two concurrent writers can both resolve the same head commit and race
+/// on the final ref write — last write wins, and the loser's commit
+/// becomes unreachable from the branch tip (its objects remain intact in
+/// the content-addressed store). Concurrent **readers** alongside one
+/// writer are safe: every file is published atomically and reads verify
+/// integrity. Multi-writer support (ref locks, CAS ref updates) is future
+/// work; do not run concurrent writers against the same `.vaultx`.
 #[derive(Clone, Debug)]
 pub struct Repository {
     root: PathBuf,
@@ -755,6 +769,141 @@ mod tests {
         let entries = Repository::diff_manifests(&old, &new);
         assert_eq!(entries.len(), 1);
         assert_eq!(diff::render_diff(&entries), "~ config A : obj_a1 -> obj_a2");
+    }
+
+    #[test]
+    fn merge_with_explicit_base_resolves_diverged_changes() {
+        let fx = temp_repo();
+
+        // Genuine three-way scenario:
+        //   base   : SHARED=v1, TUNED=v1
+        //   main   : TUNED -> v2 (+ MAIN_ONLY)   [ours]
+        //   feature: SHARED -> v2                [theirs]
+        // With the empty base used by merge(branch, None), both sides count
+        // as additions and conflict; the real common ancestor merges clean.
+        let mut base = Manifest::new();
+        base.set_config(var("SHARED"), ObjectId::parse("obj_shared_v1").unwrap());
+        base.set_config(var("TUNED"), ObjectId::parse("obj_tuned_v1").unwrap());
+
+        // Sanity: an unknown branch still errors before merging happens.
+        assert!(fx.repo.merge("nonexistent-branch", Some(&base)).is_err());
+        // And without a base the same divergence conflicts.
+        // (Setup first, re-asserted below once commits exist.)
+
+        fx.repo.add(var("SHARED"), cfg_obj("shared_v1")).unwrap();
+        fx.repo.add(var("TUNED"), cfg_obj("tuned_v1")).unwrap();
+        fx.repo
+            .create_commit(
+                "base state",
+                IdentityRef::parse("user:b").unwrap(),
+                &fx.pair,
+            )
+            .unwrap();
+        fx.repo.create_branch("feature", None).unwrap();
+
+        // Ours (main): change TUNED only.
+        fx.repo.add(var("TUNED"), cfg_obj("tuned_v2")).unwrap();
+        fx.repo.add(var("MAIN_ONLY"), cfg_obj("main_only")).unwrap();
+        fx.repo
+            .create_commit(
+                "main diverges",
+                IdentityRef::parse("user:m").unwrap(),
+                &fx.pair,
+            )
+            .unwrap();
+
+        // Theirs (feature): change SHARED only.
+        fx.repo.checkout_branch("feature").unwrap();
+        fx.repo.add(var("SHARED"), cfg_obj("shared_v2")).unwrap();
+        fx.repo
+            .create_commit(
+                "feature diverges",
+                IdentityRef::parse("user:f").unwrap(),
+                &fx.pair,
+            )
+            .unwrap();
+
+        fx.repo.checkout_branch("main").unwrap();
+
+        // Without base info both sides look like fresh additions -> clash.
+        let empty = Manifest::default();
+        match fx.repo.merge("feature", Some(&empty)) {
+            Err(RepoError::MergeConflict(conflicts)) => {
+                assert_eq!(conflicts.len(), 2, "SHARED + TUNED both clash");
+            }
+            other => panic!("expected conflicts without base, got {other:?}"),
+        }
+
+        let merged = fx
+            .repo
+            .merge("feature", Some(&base))
+            .expect("explicit base resolves");
+        assert_eq!(
+            merged.get(&var("TUNED")),
+            Some(&cfg_obj("tuned_v2")),
+            "ours kept"
+        );
+        assert_eq!(
+            merged.get(&var("SHARED")),
+            Some(&cfg_obj("shared_v2")),
+            "theirs taken (untouched on our side vs base)"
+        );
+        assert_eq!(merged.get(&var("MAIN_ONLY")), Some(&cfg_obj("main_only")));
+    }
+
+    #[test]
+    fn committing_from_detached_head_advances_detached_state() {
+        let fx = temp_repo();
+
+        fx.repo.add(var("FIRST"), cfg_obj("first_v1")).unwrap();
+        let c1 = fx
+            .repo
+            .create_commit("root", IdentityRef::parse("user:d").unwrap(), &fx.pair)
+            .unwrap();
+
+        // Detach onto c1.
+        fx.repo.checkout_commit(&c1).unwrap();
+        assert!(fx.repo.status().unwrap().branch.is_none(), "detached");
+
+        // Committing while detached must not touch any branch ref.
+        fx.repo.add(var("SECOND"), cfg_obj("second_v1")).unwrap();
+        let c2 = fx
+            .repo
+            .create_commit(
+                "on detached head",
+                IdentityRef::parse("user:d").unwrap(),
+                &fx.pair,
+            )
+            .unwrap();
+
+        assert_ne!(c1, c2);
+        assert_eq!(
+            fx.repo.current_head().unwrap(),
+            Some(c2.clone()),
+            "HEAD advanced"
+        );
+        assert_eq!(
+            fx.repo.head_target().unwrap(),
+            Some(HeadTarget::Detached { commit: c2.clone() }),
+            "HEAD remains detached at the new commit"
+        );
+
+        // Branch refs untouched: main still points at c1.
+        let branches = fx.repo.list_branches().unwrap();
+        assert_eq!(
+            branches
+                .iter()
+                .find(|(n, _)| n == "main")
+                .map(|(_, c)| c.clone()),
+            Some(c1.clone()),
+            "main must remain on its original tip"
+        );
+
+        // History chains detached commits correctly.
+        let log = fx.repo.log(10).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].0, c2);
+        assert_eq!(log[0].1.parents, vec![c1]);
     }
 
     #[test]
