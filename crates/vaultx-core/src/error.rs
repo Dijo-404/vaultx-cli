@@ -49,6 +49,12 @@ pub enum CoreError {
     /// A file or ref that was expected to be unique already exists.
     #[error("`{0}` already exists")]
     AlreadyExists(String),
+    /// The persisted device signing key (`.vaultx/device.key`) is
+    /// unreadable: not hex, wrong length, or not loadable key material.
+    /// The file is never overwritten automatically so the operator can
+    /// decide whether to rotate or restore it.
+    #[error("device signing key at .vaultx/device.key is unusable: {0}")]
+    DeviceKey(String),
     /// Underlying repository failure.
     #[error(transparent)]
     Repo(#[from] RepoError),
@@ -94,6 +100,7 @@ mod tests {
             CoreError::EnvironmentNotFound("production".to_owned()),
             CoreError::UnsupportedOperation("not yet".to_owned()),
             CoreError::AlreadyExists("agent `ci`".to_owned()),
+            CoreError::DeviceKey("not hex".to_owned()),
             CoreError::Repo(RepoError::StagingEmpty),
             CoreError::Id(TypeError::Empty),
         ];

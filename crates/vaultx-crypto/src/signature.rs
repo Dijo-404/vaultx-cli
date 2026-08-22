@@ -31,6 +31,17 @@ impl SigningKeyPair {
         Self(SigningKey::generate(&mut OsRng))
     }
 
+    /// Reconstructs a keypair deterministically from its 32-byte seed.
+    ///
+    /// Any 32 bytes form a valid Ed25519 seed, so construction cannot
+    /// fail today; the [`Result`] keeps the signature stable should key
+    /// derivation ever gain validation requirements. Same seed in, same
+    /// verifying key and signatures out — this is what makes persisted
+    /// signing identities possible without widening seed access.
+    pub fn from_seed(seed: &[u8; 32]) -> CryptoResult<Self> {
+        Ok(Self(SigningKey::from_bytes(seed)))
+    }
+
     /// Signs `msg`, returning the detached signature.
     pub fn sign(&self, msg: &[u8]) -> SignatureBytes {
         SignatureBytes(self.0.sign(msg).to_bytes().to_vec())
@@ -39,6 +50,15 @@ impl SigningKeyPair {
     /// Returns the matching public key.
     pub fn verifying_public_key(&self) -> VerifyingPublicKey {
         VerifyingPublicKey(self.0.verifying_key())
+    }
+
+    /// Releases the 32-byte signing seed to `f` and returns its result,
+    /// mirroring the crate's closure-only exposure pattern
+    /// ([`crate::secret::SecretBytes::expose`]). The seed never appears
+    /// in logs, debug output, or serialization; callers holding the bytes
+    /// own their protection.
+    pub fn expose_seed<R>(&self, f: impl FnOnce(&[u8; 32]) -> R) -> R {
+        f(&self.0.to_bytes())
     }
 }
 
@@ -145,6 +165,50 @@ mod tests {
         let original = VerifyingPublicKey::from_signing(&pair);
         let restored = VerifyingPublicKey::from_bytes(&original.to_bytes()).expect("rebuild");
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn from_seed_is_deterministic_across_instances() {
+        let seed = [7u8; 32];
+        let first = SigningKeyPair::from_seed(&seed).expect("seed is always valid");
+        let second = SigningKeyPair::from_seed(&seed).expect("seed is always valid");
+
+        assert_eq!(
+            first.verifying_public_key(),
+            second.verifying_public_key(),
+            "same seed must reconstruct the same verifying key"
+        );
+        let msg = b"deterministic message";
+        assert_eq!(
+            first.sign(msg),
+            second.sign(msg),
+            "same seed must produce identical signatures"
+        );
+
+        // A different seed yields a different identity.
+        let other = SigningKeyPair::from_seed(&[8u8; 32]).unwrap();
+        assert_ne!(first.verifying_public_key(), other.verifying_public_key());
+    }
+
+    #[test]
+    fn expose_seed_round_trips_through_from_seed() {
+        let original = SigningKeyPair::generate();
+        let mut captured: Option<[u8; 32]> = None;
+        original.expose_seed(|seed| captured = Some(*seed));
+        let seed = captured.expect("closure receives the seed");
+
+        let restored = SigningKeyPair::from_seed(&seed).expect("round trip");
+        assert_eq!(
+            original.verifying_public_key(),
+            restored.verifying_public_key()
+        );
+        let msg = b"round-trip message";
+        assert_eq!(original.sign(msg), restored.sign(msg));
+
+        // The closure-only pattern still supports scoped use and
+        // transformation without leaking the seed through Debug.
+        let len = original.expose_seed(|seed| seed.len());
+        assert_eq!(len, 32);
     }
 
     #[test]

@@ -1,28 +1,30 @@
 //! [`HistoryService`]: commits, history inspection, diffs, branches, and
 //! commit-signature verification.
 //!
-//! # Device signing identity (dev-mode contract)
+//! # Device signing identity
 //!
-//! Commits are Ed25519-signed. v1 uses a **process-local signing
-//! keypair**:
+//! Commits are Ed25519-signed with a **persistent device keypair**:
 //!
-//! * The first commit in a process generates a fresh keypair and persists
-//!   its *verifying half* to `.vaultx/device.pub` (hex-encoded compressed
-//!   Ed25519 public key). The pair is then reused for every commit in that
-//!   process.
-//! * [`HistoryService::verify_head_signature`] validates the head commit's
-//!   signature against `.vaultx/device.pub`.
+//! * On first use a fresh keypair is generated and its 32-byte seed is
+//!   persisted as lowercase hex (64 chars) at `.vaultx/device.key`; the
+//!   matching compressed public key is persisted as hex at
+//!   `.vaultx/device.pub`. Later sessions load the seed back through
+//!   [`SigningKeyPair::from_seed`], so every commit in the project is
+//!   signed by the same identity and remains verifiable across processes.
+//! * The private-key file is created with owner-only permissions (`0600`)
+//!   on unix and re-enforced on rewrite; other platforms currently rely
+//!   on default file permissions (Windows ACL hardening deferred).
+//! * A corrupt or non-hex `device.key` surfaces as
+//!   [`CoreError::DeviceKey`] instead of being silently overwritten:
+//!   rotation must be an explicit operator decision, since any 32 bytes
+//!   are a valid seed and tampering cannot be detected from the file
+//!   alone. `device.pub` is treated as derived data and self-heals to the
+//!   active pair's verifying key on each initialization.
 //!
-//! **Limitation (documented deferral):** the private seed cannot be
-//! persisted yet because `vaultx_crypto::signature::SigningKeyPair` v1
-//! exposes neither a seed constructor nor seed extraction. Consequently a
-//! new process session rotates the signing identity: older commits stop
-//! verifying against the refreshed `device.pub` until the platform-keyring
-//! integration task lands and honors a durable private key. The
-//! `device.pub` file format is final; only private-half storage is
-//! deferred.
+//! [`HistoryService::verify_head_signature`] validates the head commit's
+//! signature against `.vaultx/device.pub`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 
 use vaultx_crypto::signature::{SigningKeyPair, VerifyingPublicKey};
@@ -30,10 +32,14 @@ use vaultx_repository::{DiffEntry, ManifestEntry, StagingIndex};
 use vaultx_types::model::VariableKind;
 use vaultx_types::{CommitId, IdentityRef};
 
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult};
 use crate::project::ProjectContext;
 
-/// File holding the hex-encoded verifying key of the active device signer.
+/// File holding the hex-encoded 32-byte signing seed of the device
+/// identity (owner-only permissions on unix).
+pub(crate) const DEVICE_KEY_FILE: &str = "device.key";
+/// File holding the hex-encoded compressed verifying key of the device
+/// identity.
 pub(crate) const DEVICE_PUB_FILE: &str = "device.pub";
 
 /// One row of [`HistoryService::log`].
@@ -89,13 +95,19 @@ impl<'a> HistoryService<'a> {
         Self { ctx }
     }
 
-    fn device_pub_path(&self) -> PathBuf {
-        self.ctx.vault_dir().join(DEVICE_PUB_FILE)
+    fn device_path(&self, file: &str) -> PathBuf {
+        self.ctx.vault_dir().join(file)
     }
 
-    /// Returns the per-process signing identity, initializing it (and
-    /// persisting `device.pub`) on first use. See the module docs for the
-    /// rotation caveat.
+    fn device_pub_path(&self) -> PathBuf {
+        self.device_path(DEVICE_PUB_FILE)
+    }
+
+    /// Returns the project's signing identity: loaded from the persisted
+    /// seed when `.vaultx/device.key` exists, otherwise freshly generated
+    /// and persisted (seed + verifying key). Cached per process so every
+    /// commit in one session shares the identity. See module docs for the
+    /// file-permission and corruption contracts.
     fn signing_pair(&self) -> CoreResult<Arc<SigningKeyPair>> {
         let mut slot = self
             .ctx
@@ -105,24 +117,62 @@ impl<'a> HistoryService<'a> {
         if let Some(pair) = slot.as_ref() {
             return Ok(Arc::clone(pair));
         }
-        let pair = Arc::new(SigningKeyPair::generate());
-        let public_hex = hex::encode(pair.verifying_public_key().to_bytes());
-        // Publish atomically (temp file + rename) mirroring repository
-        // conventions so readers never observe partial content.
-        let path = self.device_pub_path();
-        let tmp = path.with_file_name(format!(".tmp-device-pub-{}", std::process::id()));
-        std::fs::write(&tmp, format!("{public_hex}\n"))?;
-        std::fs::rename(&tmp, &path)?;
+        let pair = match std::fs::read_to_string(self.device_path(DEVICE_KEY_FILE)) {
+            Ok(text) => self.load_persisted_pair(&text)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.generate_and_persist_pair()?
+            }
+            Err(err) => return Err(err.into()),
+        };
         *slot = Some(Arc::clone(&pair));
         Ok(pair)
+    }
+
+    fn load_persisted_pair(&self, text: &str) -> CoreResult<Arc<SigningKeyPair>> {
+        let corrupt = |reason: String| CoreError::DeviceKey(reason);
+        let trimmed = text.trim();
+        let bytes =
+            hex::decode(trimmed).map_err(|err| corrupt(format!("not valid hex ({err})")))?;
+        let seed: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            corrupt(format!("expected 32 bytes, found {}", bytes.len()))
+        })?;
+        let pair = SigningKeyPair::from_seed(&seed).map_err(|err| corrupt(err.to_string()))?;
+        // device.pub is derived data: keep it in lockstep with whatever
+        // identity the seed actually resolves to.
+        self.persist_device_pub(&pair);
+        // Defense in depth: re-assert owner-only mode in case an external
+        // process loosened it between sessions.
+        enforce_private_permissions(&self.device_path(DEVICE_KEY_FILE))?;
+        Ok(Arc::new(pair))
+    }
+
+    fn generate_and_persist_pair(&self) -> CoreResult<Arc<SigningKeyPair>> {
+        let pair = Arc::new(SigningKeyPair::generate());
+        let mut seed_hex = String::new();
+        pair.expose_seed(|seed| seed_hex = hex::encode(seed));
+        write_private_file(&self.device_path(DEVICE_KEY_FILE), &format!("{seed_hex}\n"))?;
+        self.persist_device_pub(&pair);
+        Ok(pair)
+    }
+
+    /// Publishes `device.pub` atomically; treated as derived data and
+    /// rewritten whenever the identity initializes.
+    fn persist_device_pub(&self, pair: &SigningKeyPair) {
+        let public_hex = hex::encode(pair.verifying_public_key().to_bytes());
+        let path = self.device_pub_path();
+        let tmp = path.with_file_name(format!(".tmp-device-pub-{}", std::process::id()));
+        if std::fs::write(&tmp, format!("{public_hex}\n")).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     /// Creates a signed commit from the staging index.
     ///
     /// The author string is validated as an [`IdentityRef`]; the signature
-    /// comes from the process device identity (see module docs).
+    /// comes from the persistent device identity (see module docs).
     ///
     /// # Errors
+    /// * [`CoreError::DeviceKey`] when a persisted device key is corrupt.
     /// * Propagates identifier-validation, staging-empty, and storage/ref
     ///   failures from the underlying repository.
     pub fn commit(&self, message: &str, author: &str) -> CoreResult<CommitId> {
@@ -256,6 +306,51 @@ fn kind_str(kind: VariableKind) -> &'static str {
     }
 }
 
+/// Writes owner-only-permission private material (the device seed).
+///
+/// On unix the file is created through [`std::fs::OpenOptions`] with mode
+/// `0600` and the mode is re-asserted on the final handle so a
+/// pre-existing loose file gets tightened too. Other platforms rely on
+/// default permissions; Windows ACL hardening is deferred.
+fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+/// Re-asserts owner-only mode on an existing private-key file (unix).
+///
+/// A no-op on other platforms where Windows ACL hardening remains
+/// deferred.
+fn enforce_private_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 fn reference_of(entry: &ManifestEntry) -> String {
     match entry {
         ManifestEntry::Config { object } => object.to_string(),
@@ -381,6 +476,108 @@ mod tests {
             !history.verify_head_signature(),
             "integrity check must fail verification after tampering"
         );
+    }
+
+    #[test]
+    fn device_identity_persists_and_verifies_across_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Session 1: first commit creates the persistent identity.
+        let c1 = {
+            let ctx = ProjectContext::init(root).unwrap();
+            ConfigService::new(&ctx).set_config("A", "1").unwrap();
+            let id = HistoryService::new(&ctx).commit("first", "user:s").unwrap();
+            assert!(HistoryService::new(&ctx).verify_head_signature());
+            assert!(ctx.vault_dir().join("device.key").is_file());
+            assert!(ctx.vault_dir().join("device.pub").is_file());
+            id
+        }; // ctx dropped: signing identity gone from memory.
+
+        // Session 2: the seed is reloaded, not regenerated.
+        let (c2, first_commit_still_verifies) = {
+            let ctx = ProjectContext::open(root).unwrap();
+            ConfigService::new(&ctx).set_config("B", "2").unwrap();
+            let history = HistoryService::new(&ctx);
+            let c2 = history.commit("second", "user:s").unwrap();
+
+            // The head must verify under the SAME persisted identity.
+            assert!(history.verify_head_signature());
+
+            // And the FIRST session's commit must still verify too: load
+            // the persisted verifying key and check its signature.
+            let text = std::fs::read_to_string(ctx.vault_dir().join("device.pub")).unwrap();
+            let bytes: [u8; 32] = hex::decode(text.trim()).unwrap().try_into().unwrap();
+            let public = VerifyingPublicKey::from_bytes(&bytes).unwrap();
+            let (commit, _) = ctx.repository().show(&c1).unwrap();
+            (c2, commit.verify(&public).is_ok())
+        };
+        assert_ne!(c1, c2);
+        assert!(
+            first_commit_still_verifies,
+            "cross-session commits must share one identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_key_file_gets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ProjectContext::init(dir.path()).unwrap();
+        ConfigService::new(&ctx).set_config("V", "1").unwrap();
+        HistoryService::new(&ctx)
+            .commit("seeded", "user:p")
+            .unwrap();
+
+        let key_path = ctx.vault_dir().join("device.key");
+        let mode = std::fs::metadata(key_path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "device.key must be readable/writable by the owner only"
+        );
+
+        // Rewrites keep the tightened mode even if something loosened it.
+        let loose = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(ctx.vault_dir().join("device.key"), loose).unwrap();
+        drop(ctx);
+
+        let ctx = ProjectContext::open(dir.path()).unwrap();
+        crate::config::ConfigService::new(&ctx)
+            .set_config("W", "2")
+            .unwrap();
+        HistoryService::new(&ctx)
+            .commit("reloaded", "user:p")
+            .unwrap();
+        let mode = std::fs::metadata(ctx.vault_dir().join("device.key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn corrupt_device_key_fails_loudly_without_being_overwritten() {
+        for garbage in ["definitely not hex!!", &"ab".repeat(31)] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = ProjectContext::init(dir.path()).unwrap();
+            let key_path = ctx.vault_dir().join("device.key");
+            std::fs::write(&key_path, garbage).unwrap();
+
+            crate::config::ConfigService::new(&ctx)
+                .set_config("X", "1")
+                .unwrap();
+            let outcome = HistoryService::new(&ctx).commit("blocked", "user:c");
+            assert!(
+                matches!(&outcome, Err(CoreError::DeviceKey(_))),
+                "`{garbage}` must surface a clear error, got {outcome:?}"
+            );
+
+            // The corrupt file is preserved for operator inspection.
+            assert_eq!(std::fs::read_to_string(&key_path).unwrap(), garbage);
+        }
     }
 
     #[test]
