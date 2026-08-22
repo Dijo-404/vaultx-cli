@@ -736,3 +736,80 @@ fn resolve_commit_prefix(prefix: &str, log: &[CommitSummary]) -> Result<CommitId
         }
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use vaultx_core::CommitSummary;
+
+    fn summary(hex: &str) -> CommitSummary {
+        CommitSummary {
+            id: CommitId::parse(&format!("cmt_{hex}")).unwrap(),
+            message: "m".to_owned(),
+            author: "user:t".to_owned(),
+            parents_len: 1,
+        }
+    }
+
+    #[test]
+    fn assignment_parsing_rejects_missing_or_empty_names() {
+        assert_eq!(parse_assignment("PORT=8080").unwrap(), ("PORT", "8080"));
+        assert_eq!(parse_assignment("EMPTY=").unwrap(), ("EMPTY", ""));
+        assert!(matches!(
+            parse_assignment("no-equals-sign"),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            parse_assignment("=value"),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn env_file_parsing_skips_comments_and_strips_quotes() {
+        let pairs = parse_env_file(
+            "\n# comment\nA=1\n  B = spaced value \nC=\"quoted\"\nD='single'\nE=\nno-equals\n=bad\n",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("A".to_owned(), "1".to_owned()),
+                ("B".to_owned(), "spaced value".to_owned()),
+                ("C".to_owned(), "quoted".to_owned()),
+                ("D".to_owned(), "single".to_owned()),
+                ("E".to_owned(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn prefix_resolution_unique_ambiguous_and_empty() {
+        let log = [summary("aaa111000000"), summary("aaa222000000")];
+
+        // Unique match ignores the optional `cmt_` prefix.
+        let id = resolve_commit_prefix("aaa111", &log).unwrap();
+        assert_eq!(id, log[0].id);
+        let id = resolve_commit_prefix("cmt_aaa111", &log).unwrap();
+        assert_eq!(id, log[0].id);
+
+        // Ambiguity lists both candidate short ids.
+        let err = resolve_commit_prefix("aaa", &log).unwrap_err();
+        assert!(
+            matches!(&err, CliError::Usage(text)
+                if text.contains("ambiguous prefix `aaa` matches 2 commits")
+                    && text.contains(&crate::output::short_commit_id(&log[0].id))
+                    && text.contains(&crate::output::short_commit_id(&log[1].id))),
+            "got: {err:?}"
+        );
+
+        // Zero matches and the empty prefix are usage errors.
+        assert!(matches!(
+            resolve_commit_prefix("ffffff", &log),
+            Err(CliError::Usage(text)) if text.contains("no commit matches")
+        ));
+        assert!(matches!(
+            resolve_commit_prefix("", &log),
+            Err(CliError::Usage(text)) if text.contains("must not be empty")
+        ));
+    }
+}
