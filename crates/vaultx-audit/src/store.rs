@@ -57,6 +57,14 @@ pub trait AppendStore: Send + Sync {
     /// Recomputes every stored event's hash and verifies contiguous
     /// sequencing plus predecessor linkage.
     ///
+    /// # Limitations
+    ///
+    /// Hash linkage covers every event through its *successor's*
+    /// `prev_hash`, so tampering with the most recent (chain-head) event
+    /// is not detectable by this method alone: its digest is derived from
+    /// the tampered bytes and no later event references it. Signatures
+    /// over the head hash — plan §27 "where configured" — close this gap.
+    ///
     /// # Errors
     /// Returns [`AuditError::ChainBroken`] naming the first event whose
     /// sequence number or linkage does not hold, and

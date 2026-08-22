@@ -603,7 +603,11 @@ impl AuditEvent {
     /// Canonicality follows the workspace convention: serde_json output
     /// with struct fields in declaration order and map keys sorted
     /// ([`SafeAuditMetadata`] is a `BTreeMap`). The digest itself is
-    /// derived, never stored.
+    /// derived, never stored — a consequence being that chain linkage can
+    /// only detect tampering of an event through a *later* event's
+    /// `prev_hash`, so the most recent event's bytes are not covered by
+    /// [`crate::store::AppendStore::verify_chain`] alone; head signatures
+    /// (plan §27 "where configured") close that gap.
     ///
     /// # Errors
     /// Returns [`AuditError::Serialization`] only if JSON encoding fails,
