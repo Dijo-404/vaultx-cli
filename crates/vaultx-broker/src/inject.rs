@@ -140,7 +140,7 @@ impl CredentialMetadata {
 ///
 /// This is the only structure into which secret material is written, and
 /// only via [`CredentialInjector::apply`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OutboundRequest {
     /// Canonical destination (shared object used by authorization).
     pub canonical_url: CanonicalUrl,
@@ -151,6 +151,49 @@ pub struct OutboundRequest {
     pub headers: Vec<(String, String)>,
     /// Request body.
     pub body: BrokerBody,
+}
+
+impl std::fmt::Debug for OutboundRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual implementation: after injection this struct carries
+        // credential material in auth header values *and* (for
+        // query_parameter templates) inside the URL query. Debug output
+        // therefore shows the destination without its query, redacts
+        // sensitive header values, and reduces the body to a byte count.
+        let sensitive = self
+            .headers
+            .iter()
+            .filter(|(name, _)| vaultx_http::SENSITIVE_REQUEST_HEADERS.contains(&name.as_str()))
+            .count();
+        f.debug_struct("OutboundRequest")
+            .field(
+                "canonical_url",
+                &format!(
+                    "https://{}:{}{}?<{} query pairs withheld>",
+                    self.canonical_url.host(),
+                    self.canonical_url.port_or_default(),
+                    self.canonical_url.path(),
+                    self.canonical_url.query_pairs().len(),
+                ),
+            )
+            .field("method", &self.method.as_str())
+            .field("headers", &RedactedHeaders(&self.headers))
+            .field("sensitive_header_count", &sensitive)
+            .field("body_wire_len_bytes", &self.body.wire_len_bytes())
+            .finish()
+    }
+}
+
+/// Debug wrapper rendering every header value as `[redacted]` while
+/// keeping names visible for triage.
+struct RedactedHeaders<'a>(&'a [(String, String)]);
+
+impl std::fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(name, _)| format!("{name}: [redacted]")))
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,12 +222,31 @@ pub trait CredentialInjector: Send + Sync {
 }
 
 /// Removes any existing header with `name` (case-insensitive), then
-/// appends `(name_lower, value)`. Guarantees exactly one authoritative
-/// occurrence of broker-owned headers (defense in depth for INV-004).
-fn replace_header(headers: &mut Vec<(String, String)>, name: &str, value: String) {
+/// appends `(name_lower, value)` — after validating the broker-produced
+/// value against the RFC 7230 field-value grammar.
+///
+/// Broker-injected values are built from resolved secrets and metadata
+/// strings, so they get the same control-character screening caller
+/// headers receive: any value containing CR/LF/NUL/DEL or other control
+/// characters (HTAB excepted) is rejected rather than transmitted. The
+/// error names the header and failure class only — never the value.
+///
+/// Guarantees exactly one authoritative occurrence of broker-owned
+/// headers on success (defense in depth for INV-004).
+fn replace_header(
+    headers: &mut Vec<(String, String)>,
+    name: &str,
+    value: String,
+) -> Result<(), BrokerError> {
     let lowered = name.to_ascii_lowercase();
+    // Same grammar gate applied to caller-supplied headers; a rejected
+    // injected value is a credential/metadata defect and must fail the
+    // injection instead of reaching the wire.
+    vaultx_http::validate_header_pair(&lowered, &value)
+        .map_err(|e| BrokerError::InjectionError(format!("injected header rejected: {e}")))?;
     headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&lowered));
     headers.push((lowered, value));
+    Ok(())
 }
 
 fn secret_as_string(secret: &SecretBytes) -> String {
@@ -211,7 +273,7 @@ impl CredentialInjector for BearerInjector {
         _meta: &CredentialMetadata,
     ) -> Result<(), BrokerError> {
         let value = format!("Bearer {}", secret_as_string(secret));
-        replace_header(&mut req.headers, "authorization", value);
+        replace_header(&mut req.headers, "authorization", value)?;
         Ok(())
     }
 }
@@ -233,7 +295,7 @@ impl CredentialInjector for GithubBearerInjector {
         _meta: &CredentialMetadata,
     ) -> Result<(), BrokerError> {
         let value = format!("token {}", secret_as_string(secret));
-        replace_header(&mut req.headers, "authorization", value);
+        replace_header(&mut req.headers, "authorization", value)?;
         Ok(())
     }
 }
@@ -258,7 +320,7 @@ impl CredentialInjector for ApiKeyHeaderInjector {
             BrokerError::InjectionError("api_key_header requires metadata.header_name".to_owned())
         })?;
         let value = secret_as_string(secret);
-        replace_header(&mut req.headers, &header, value);
+        replace_header(&mut req.headers, &header, value)?;
         Ok(())
     }
 }
@@ -293,7 +355,7 @@ impl CredentialInjector for BasicPasswordInjector {
             BASE64_STANDARD.encode(userpass)
         });
         let value = format!("Basic {encoded}");
-        replace_header(&mut req.headers, "authorization", value);
+        replace_header(&mut req.headers, "authorization", value)?;
         Ok(())
     }
 }
@@ -332,10 +394,17 @@ fn append_query_parameter(
 ) -> Result<CanonicalUrl, BrokerError> {
     let inner = url.as_url();
     // Rebuild path + query from parts (query kept as its raw serialized
-    // form so pre-existing percent-encoding is preserved verbatim).
+    // form so pre-existing percent-encoding is preserved verbatim), after
+    // dropping any caller-supplied parameter of the same name: first-wins
+    // servers must honor the injected credential, not agent-planted junk.
     let appended = match inner.query() {
         Some(existing) => {
-            format!("{}?{existing}&{name}={encoded_value}", inner.path())
+            let kept = strip_query_param(existing, name);
+            if kept.is_empty() {
+                format!("{}?{name}={encoded_value}", inner.path())
+            } else {
+                format!("{}?{kept}&{name}={encoded_value}", inner.path())
+            }
         }
         None => format!("{}?{name}={encoded_value}", inner.path()),
     };
@@ -343,6 +412,45 @@ fn append_query_parameter(
     // normalization stays identical to the original serialization.
     CanonicalUrl::from_parts(url.host(), inner.port(), &appended)
         .map_err(|e| BrokerError::InjectionError(format!("rebuilt url rejected: {e}")))
+}
+
+/// Percent-decodes a query key for name comparison (lossy on invalid
+/// escapes). Only ever applied to the *key* substring, never to values,
+/// and its output never leaves this function.
+fn percent_decode_key(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+        {
+            let hex = |b: u8| (b as char).to_digit(16).unwrap_or(0) as u8;
+            out.push((hex(bytes[index + 1]) << 4) | hex(bytes[index + 2]));
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Removes `&`-separated query segments whose decoded key equals `name`,
+/// preserving the original encoding of every surviving segment.
+fn strip_query_param(raw_query: &str, name: &str) -> String {
+    raw_query
+        .split('&')
+        .filter(|segment| {
+            let key_raw = segment.split('=').next().unwrap_or_default();
+            // A trailing empty segment (`a=1&`) decodes to an empty key
+            // and can never equal a validated non-empty param name.
+            percent_decode_key(key_raw) != name
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 impl CredentialInjector for QueryParameterInjector {
@@ -396,7 +504,7 @@ impl CredentialInjector for CustomStaticHeaderPlusSecretInjector {
             )
         })?;
         let value = format!("{prefix}{}", secret_as_string(secret));
-        replace_header(&mut req.headers, &header, value);
+        replace_header(&mut req.headers, &header, value)?;
         Ok(())
     }
 }
@@ -842,5 +950,132 @@ mod tests {
             .headers
             .iter()
             .any(|(n, _)| n == "x-custom" && n.chars().all(|c| !c.is_ascii_uppercase())));
+    }
+
+    #[test]
+    fn credential_with_crlf_cannot_inject_extra_headers() {
+        // A hostile secret value must fail the injection rather than
+        // reach the wire as a smuggled second header.
+        for hostile in [
+            &b"tok\r\nEvil: x"[..],
+            &b"tok\nEvil: x"[..],
+            &b"to\0ken"[..],
+            &b"tok\x7fen"[..],
+        ] {
+            let mut req = outbound("https://api.example.com/x");
+            let hostile_secret = SecretBytes::from_bytes(hostile);
+            let err = BearerInjector
+                .apply(&mut req, &hostile_secret, &CredentialMetadata::default())
+                .unwrap_err();
+            assert!(
+                matches!(err, BrokerError::InjectionError(ref msg) if msg.contains("injected header rejected")),
+                "{hostile:?} -> {err:?}"
+            );
+            // Nothing was written, and the error never echoes the value.
+            assert!(req.headers.iter().all(|(name, _)| name != "authorization"));
+            assert!(!err.to_string().contains("Evil"));
+        }
+
+        // The same gate applies to api_key_header placement.
+        let mut req = outbound("https://vendor.example.com/v1");
+        let meta = CredentialMetadata {
+            header_name: Some("x-api-key".to_owned()),
+            ..CredentialMetadata::default()
+        };
+        let crlf = SecretBytes::from_bytes(b"k\r\nX-Smuggled: 1");
+        assert!(ApiKeyHeaderInjector.apply(&mut req, &crlf, &meta).is_err());
+        assert!(req.headers.iter().all(|(name, _)| name != "x-api-key"));
+    }
+
+    #[test]
+    fn static_prefix_with_control_characters_is_rejected_before_building_value() {
+        let mut req = outbound("https://vendor.example.com/api");
+        let meta = CredentialMetadata {
+            header_name: Some("x-vendor-auth".to_owned()),
+            static_prefix: Some("Bearer \r\nX-Evil: 1".to_owned()),
+            ..CredentialMetadata::default()
+        };
+        let err = CustomStaticHeaderPlusSecretInjector
+            .apply(&mut req, &secret(), &meta)
+            .unwrap_err();
+        assert!(
+            matches!(err, BrokerError::InjectionError(ref msg) if msg.contains("injected header rejected"))
+        );
+        assert!(req.headers.iter().all(|(name, _)| name != "x-vendor-auth"));
+        assert!(!err.to_string().contains("X-Evil"));
+    }
+
+    #[test]
+    fn query_injection_strips_caller_planted_same_name_params() {
+        let meta = CredentialMetadata {
+            query_param_name: Some("token".to_owned()),
+            ..CredentialMetadata::default()
+        };
+
+        // Junk parameter planted ahead of the injection must not survive:
+        // first-wins servers would otherwise honor it over the credential.
+        let mut req = outbound("https://collector.example.com/i?token=junk&x=1&y=2");
+        QueryParameterInjector
+            .apply(&mut req, &secret(), &meta)
+            .unwrap();
+        assert_eq!(
+            req.canonical_url.query_pairs(),
+            vec![
+                ("x".to_owned(), "1".to_owned()),
+                ("y".to_owned(), "2".to_owned()),
+                ("token".to_owned(), SECRET.to_owned()),
+            ]
+        );
+        assert!(!req.canonical_url.as_url().as_str().contains("junk"));
+
+        // Percent-encoded spelling of the planted name is decoded before
+        // comparison, so it is stripped too.
+        let mut encoded = outbound("https://collector.example.com/i?to%6Ben=junk&keep=1");
+        QueryParameterInjector
+            .apply(&mut encoded, &secret(), &meta)
+            .unwrap();
+        let pairs = encoded.canonical_url.query_pairs();
+        assert!(pairs.contains(&("keep".to_owned(), "1".to_owned())));
+        assert!(!pairs.contains(&("token".to_owned(), "junk".to_owned())));
+
+        // When the planted param was the only one, the rebuilt query
+        // starts fresh with the injected credential.
+        let mut solo = outbound("https://collector.example.com/i?token=junk");
+        QueryParameterInjector
+            .apply(&mut solo, &secret(), &meta)
+            .unwrap();
+        assert_eq!(
+            solo.canonical_url.as_url().as_str(),
+            format!("https://collector.example.com/i?token={SECRET}")
+        );
+    }
+
+    fn meta_query() -> CredentialMetadata {
+        CredentialMetadata {
+            query_param_name: Some("token".to_owned()),
+            ..CredentialMetadata::default()
+        }
+    }
+
+    #[test]
+    fn outbound_request_debug_never_shows_injected_material() {
+        let mut req = outbound("https://collector.example.com/i?public=1");
+        GithubBearerInjector
+            .apply(&mut req, &secret(), &CredentialMetadata::default())
+            .unwrap();
+        QueryParameterInjector
+            .apply(&mut req, &secret(), &meta_query())
+            .unwrap();
+
+        let debugged = format!("{req:?}");
+        // Header values (including the injected auth) are redacted...
+        assert!(debugged.contains("authorization: [redacted]"));
+        assert!(!debugged.contains(SECRET));
+        assert!(!debugged.contains("token s3cr3t-token-value"));
+        // ...the URL query (which now carries the secret) is withheld...
+        assert!(!debugged.contains("public=1"));
+        assert!(debugged.contains("query pairs withheld"));
+        // ...and headers never appear as a raw list.
+        assert!(!debugged.contains("\"authorization\""));
     }
 }

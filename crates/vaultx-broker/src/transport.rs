@@ -19,12 +19,25 @@
 //! hostnames; this re-check is what closes DNS rebinding. Redirects must
 //! be re-authorized per hop (`vaultx_http::RedirectAuthorizer`) and
 //! credentials must never travel to an unauthorized target.
+//!
+//! # Session-revocation window (documented TOCTOU)
+//!
+//! The engine validates the session once, before authorization and
+//! injection; it does **not** re-check revocation between validation and
+//! transport execution, and the executor has no session context to check.
+//! A session revoked mid-flight therefore completes its single in-flight
+//! request and is refused from the next one onward — a single-flight
+//! time-of-check/time-of-use window. This is accepted for v1 because the
+//! broker executes one synchronous pipeline per request locally; if
+//! long-lived streaming exchanges arrive with the IPC layer, they must
+//! either poll the [`SessionStore`](crate::session::SessionStore) for
+//! revocation or carry a cancellation channel wired to it.
 
 use crate::error::BrokerError;
 use crate::inject::OutboundRequest;
 
 /// Raw result of one outbound exchange, prior to response sanitization.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExecutedResponse {
     /// Upstream HTTP status code.
     pub status: u16,
@@ -32,6 +45,42 @@ pub struct ExecutedResponse {
     pub headers: Vec<(String, String)>,
     /// Upstream response body bytes.
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for ExecutedResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual implementation: upstream responses routinely carry
+        // session cookies and token-bearing payloads. Debug shows the
+        // status, header names with values redacted for known-sensitive
+        // names, and the body as a byte count only.
+        f.debug_struct("ExecutedResponse")
+            .field("status", &self.status)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        if is_sensitive_response_header(name) {
+                            format!("{name}: [redacted]")
+                        } else {
+                            format!("{name}: {value}")
+                        }
+                    })
+                    .collect::<Vec<String>>(),
+            )
+            .field("body_len_bytes", &self.body.len())
+            .finish()
+    }
+}
+
+/// Response headers whose values never belong in diagnostics.
+fn is_sensitive_response_header(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    matches!(
+        lowered.as_str(),
+        "set-cookie" | "cookie" | "authorization" | "proxy-authorization" | "www-authenticate"
+    )
 }
 
 /// Executes one authorized outbound request.

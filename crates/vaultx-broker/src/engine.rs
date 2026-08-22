@@ -34,7 +34,14 @@
 //!   credentials, and templates come from configuration/seams, never
 //!   from provider-specific code paths.
 //! * **INV-018** — credential plaintext is resolved and consumed strictly
-//!   between steps 6 and 7; it is dropped before transport execution.
+//!   between steps 6 and 7; the [`SecretBytes`] buffer itself is dropped
+//!   before transport execution. Scope caveat: *plaintext-derived*
+//!   strings (the `Authorization` header value, the encoded query
+//!   parameter for `query_parameter` templates) are ordinary heap data
+//!   and persist non-zeroized through transport execution. That residual
+//!   exposure is inherent to HTTP credential injection — every HTTP
+//!   client holds rendered header values in flight — and is bounded by
+//!   the broker process boundary, not by zeroization.
 //!
 //! # Shape
 //!
@@ -79,24 +86,70 @@ const ALWAYS_REDACTED_RESPONSE_HEADERS: [&str; 1] = ["set-cookie"];
 /// could bind a real identity.
 const UNAUTHENTICATED_ACTOR: &str = "agent:unknown";
 
+/// Denial reason carried by responses when the audit store rejects the
+/// event for an outcome. HTTP 500: the broker itself is degraded.
+pub const AUDIT_WRITE_FAILED_REASON: &str = "audit_write_failed";
+
+/// Truncates a denial reason to the audit schema's byte budget at a
+/// UTF-8 character boundary, so foreign [`Authorizer`] implementations
+/// cannot crash the pipeline with oversized categories.
+fn bounded_reason(reason: &str) -> String {
+    let max = vaultx_audit::AuditDecision::MAX_DENY_REASON_BYTES;
+    if reason.len() <= max {
+        return reason.to_owned();
+    }
+    let mut end = max;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
+}
+
+/// The response returned whenever an audit append fails, regardless of
+/// what the underlying decision was: denial of service is preferable to
+/// unauditable success or silently dropped deny records.
+fn audit_write_failed_response(request_id: RequestId) -> BrokerResponse {
+    BrokerResponse {
+        request_id,
+        status: 500,
+        headers: Vec::new(),
+        body: Vec::new(),
+        decision: Decision::Deny {
+            reason: AUDIT_WRITE_FAILED_REASON.to_owned(),
+            policy: None,
+        },
+    }
+}
+
 /// Secret-shaped token patterns scrubbed from response bodies as
 /// defense-in-depth (plan §20 "global secret-pattern redaction").
 ///
 /// Each entry is `(prefix, minimum alphanumeric run after prefix)`. A
-/// match replaces `prefix + run` with `[redacted]`. Best-effort by
+/// match replaces the matched span with `[redacted]`. Best-effort by
 /// design: it catches accidental echo in text payloads but cannot catch
 /// transformed encodings, and must never be treated as the primary
 /// protection mechanism (policy is).
+///
+/// Two prefixes get shape-aware matchers instead of a plain run:
+/// `AKIA…` keys are fixed-width with a restricted charset, and
+/// `github_pat_…` fine-grained tokens embed an internal `_` separator —
+/// matching only the leading alphanumeric run would redact the 22-char
+/// id while leaving the ~59-char secret tail in place.
 const BODY_SCRUB_RULES: [(&str, usize); 4] = [
     // GitHub classic personal access tokens (`ghp_` + 36 chars).
     ("ghp_", 36),
-    // GitHub fine-grained PATs (`github_pat_` + long alphanumeric tail).
-    ("github_pat_", 22),
+    // GitHub fine-grained PATs (`github_pat_<22+ alnum>_<59-char tail>`).
+    ("github_pat_", FINE_GRAINED_PAT_ID_MIN),
     // OpenAI-style API keys (`sk-` + 20+ chars).
     ("sk-", 20),
     // AWS access key ids (`AKIA` + exactly 16 uppercase/digit chars).
     ("AKIA", 16),
 ];
+
+/// Minimum length of the alphanumeric id segment of a fine-grained PAT.
+const FINE_GRAINED_PAT_ID_MIN: usize = 22;
+/// Minimum accepted length of the underscore-containing tail segment.
+const FINE_GRAINED_PAT_TAIL_MIN: usize = 20;
 
 fn ascii_alnum_run(bytes: &[u8]) -> usize {
     bytes
@@ -117,6 +170,37 @@ fn aws_key_id_run(bytes: &[u8]) -> Option<usize> {
         .then_some(16)
 }
 
+/// Total span following the `github_pat_` prefix that constitutes one
+/// fine-grained token: an alphanumeric id of [`FINE_GRAINED_PAT_ID_MIN`]+
+/// characters, then optionally `_` plus a `[A-Za-z0-9_]{`[`FINE_GRAINED_
+/// PAT_TAIL_MIN`]`,}` tail. Without the separator the plain-run rule
+/// applies (the whole alnum run is the match); with it, the tail — which
+/// contains underscores and would otherwise split the run — is consumed
+/// too. Returns `None` when even the id segment is too short.
+fn fine_grained_pat_span(bytes: &[u8]) -> Option<usize> {
+    let id_len = ascii_alnum_run(bytes);
+    if id_len < FINE_GRAINED_PAT_ID_MIN {
+        return None;
+    }
+    let after_id = &bytes[id_len..];
+    match after_id.first() {
+        Some(b'_') => {
+            let tail_len = after_id[1..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                .count();
+            if tail_len >= FINE_GRAINED_PAT_TAIL_MIN {
+                Some(id_len + 1 + tail_len)
+            } else {
+                // Separator present but the tail is short: still redact
+                // the qualifying id segment (over-redact, never under).
+                Some(id_len)
+            }
+        }
+        _ => Some(id_len),
+    }
+}
+
 /// Replaces recognized secret-shaped spans with `[redacted]`.
 ///
 /// Hand-rolled byte scanner (no regex dependency): linear scan, at each
@@ -134,10 +218,16 @@ pub fn scrub_secret_patterns(body: &[u8]) -> Vec<u8> {
             if !rest.starts_with(prefix_bytes) {
                 continue;
             }
-            // AKIA keys are fixed-width with a restricted charset; every
-            // other rule matches any sufficiently long alnum run.
+            // Shape-aware matchers for prefixes whose real-world tokens
+            // embed separators; every other rule matches a plain alnum
+            // run of the required minimum length.
             let run_len = if prefix == "AKIA" {
                 match aws_key_id_run(&rest[prefix_bytes.len()..]) {
+                    Some(len) => len,
+                    None => continue,
+                }
+            } else if prefix == "github_pat_" {
+                match fine_grained_pat_span(&rest[prefix_bytes.len()..]) {
                     Some(len) => len,
                     None => continue,
                 }
@@ -264,15 +354,26 @@ impl BrokerEngine {
             project: self.project.clone(),
             environment,
             action: AuditAction::HttpRequest,
-            decision: AuditDecision::deny(reason).expect("engine reasons are bounded"),
+            // Foreign `Authorizer` implementations may produce reasons of
+            // arbitrary length; degrade to a truncated category instead
+            // of failing the audit write (or panicking).
+            decision: AuditDecision::Deny {
+                reason: bounded_reason(reason),
+            },
             credential,
             destination,
             capability,
             policy_ids: Vec::new(),
             metadata,
         };
-        let _ = self.audit.append(event);
-        BrokerResponse::denied(request_id, reason, policy)
+        // Fail-closed on every outcome: an unwritable audit record is a
+        // broker failure, not a detail to swallow. For deny outcomes this
+        // *upgrades* the response severity (500) without leaking any new
+        // information; for allows it prevents undetected data delivery.
+        match self.audit.append(event) {
+            Ok(_) => BrokerResponse::denied(request_id, reason, policy),
+            Err(_) => audit_write_failed_response(request_id),
+        }
     }
 
     /// Builds the authorization query from canonical request parts.
@@ -581,7 +682,7 @@ impl BrokerEngine {
             metadata: audit_metadata,
         });
         if appended.is_err() {
-            return BrokerResponse::denied(request_id, "internal_error", None);
+            return audit_write_failed_response(request_id);
         }
 
         BrokerResponse {
@@ -675,6 +776,37 @@ mod tests {
                 ));
             }
             Ok(self.response.clone().expect("fixture response configured"))
+        }
+    }
+
+    /// Append store that rejects every write — simulates a degraded audit
+    /// sink so tests can pin the engine's fail-closed behavior.
+    struct FailingAuditStore;
+
+    impl AppendStore for FailingAuditStore {
+        fn append(
+            &self,
+            _event: NewAuditEvent,
+        ) -> Result<vaultx_audit::AuditEvent, vaultx_audit::AuditError> {
+            Err(vaultx_audit::AuditError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "forced failure",
+            )))
+        }
+
+        fn latest_hash(&self) -> Result<Option<String>, vaultx_audit::AuditError> {
+            Ok(None)
+        }
+
+        fn verify_chain(&self) -> Result<(), vaultx_audit::AuditError> {
+            Ok(())
+        }
+
+        fn query(
+            &self,
+            _filter: &vaultx_audit::AuditFilter,
+        ) -> Result<Vec<vaultx_audit::AuditEvent>, vaultx_audit::AuditError> {
+            Ok(Vec::new())
         }
     }
 
@@ -1403,6 +1535,206 @@ mod tests {
             .to_vec();
         let text = String::from_utf8(scrub_secret_patterns(&doubled)).unwrap();
         assert_eq!(text, "[redacted]_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ab");
+    }
+
+    #[test]
+    fn scrub_covers_full_fine_grained_pat_shape() {
+        // Realistic fine-grained PAT: `github_pat_<22 alnum>_<59 tail>`
+        // where the tail itself contains underscores. The entire token —
+        // including the secret-bearing tail — must vanish.
+        let token = format!(
+            "github_pat_{}_{}_{}",
+            "ABCDEFGHIJKLMNOPQRSTUV", // 22-char id
+            "ABCDEFGHIJKLMNOPQRSTUV", // separator-adjacent id part
+            format_args!("{}_{}", "a".repeat(30), "Z".repeat(28)), // 59-char tail with `_`
+        );
+        let body = format!("token={token};next=1");
+        let text = String::from_utf8(scrub_secret_patterns(body.as_bytes())).unwrap();
+        assert_eq!(text, "token=[redacted];next=1");
+        assert!(!text.contains("aaaa"), "no tail fragment survives");
+    }
+
+    #[test]
+    fn scrub_regression_underscore_split_bypass_is_closed() {
+        // Regression for the original defect: matching only the leading
+        // alnum run redacted the 22-char id while leaving the ~59-char
+        // secret tail in plain text. The tail must be consumed too.
+        let token = format!("github_pat_{}_{}", "B".repeat(30), "C".repeat(40),);
+        let body = format!("<{token}>");
+        let text = String::from_utf8(scrub_secret_patterns(body.as_bytes())).unwrap();
+        assert_eq!(text, "<[redacted]>");
+        assert!(!text.contains('C'), "secret tail must not survive");
+    }
+
+    #[test]
+    fn scrub_fine_grained_pat_edge_shapes() {
+        // Separator present but short tail: the qualifying id segment is
+        // still redacted (over-redaction is acceptable; under is not).
+        let body = b"github_pat_ABCDEFGHIJKLMNOPQRSTUVWX_short";
+        let text = String::from_utf8(scrub_secret_patterns(body)).unwrap();
+        assert_eq!(text, "[redacted]_short");
+
+        // No separator at all: a long classic-shaped run still matches
+        // through the fallback path.
+        let body = format!("github_pat_{}", "D".repeat(38));
+        let text = String::from_utf8(scrub_secret_patterns(body.as_bytes())).unwrap();
+        assert_eq!(text, "[redacted]");
+
+        // Below the id threshold entirely: not a PAT shape, untouched.
+        let body = b"github_pat_shortvalue_moretail";
+        assert_eq!(
+            scrub_secret_patterns(body),
+            body.to_vec(),
+            "short runs pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn bounded_reason_truncates_to_audit_budget_at_char_boundary() {
+        use vaultx_audit::AuditDecision;
+        assert_eq!(bounded_reason("short"), "short");
+
+        let exact = "x".repeat(AuditDecision::MAX_DENY_REASON_BYTES);
+        assert_eq!(bounded_reason(&exact), exact);
+
+        let over = format!("{exact}yyyy");
+        assert_eq!(bounded_reason(&over), exact);
+
+        // Multi-byte input truncates at a character boundary, never
+        // mid-codepoint, and always fits the budget afterwards.
+        let multi = "é".repeat(200); // 400 bytes
+        let truncated = bounded_reason(&multi);
+        assert!(truncated.len() <= AuditDecision::MAX_DENY_REASON_BYTES);
+        assert!(truncated.chars().all(|c| c == 'é'));
+        assert!(AuditDecision::deny(truncated).is_ok());
+    }
+
+    #[test]
+    fn audit_write_failure_fails_closed_before_delivery_on_allow_paths() {
+        // A store that rejects every append: the would-be-allow response
+        // must become a 500 denial and the transport must never execute.
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let credentials = Arc::new(InMemoryCredentialSource::new());
+        credentials.insert(
+            CredentialRef::parse("github-work-token").unwrap(),
+            SecretBytes::from_bytes(SECRET_CANARY.as_bytes()),
+            InjectionTemplateId::GithubBearer,
+            CredentialMetadata::default(),
+        );
+        let (session_id, raw_token) = sessions
+            .create(
+                &AgentId::parse("agent_coding").unwrap(),
+                &EnvironmentId::parse("env_development").unwrap(),
+            )
+            .unwrap();
+        let document = parse_policy_yaml(&policy_yaml(
+            "coding-agent-github",
+            &format!("session:{session_id}"),
+            "github-work-token",
+        ))
+        .unwrap();
+        let transport = happy_transport();
+        let engine = BrokerEngine::new(BrokerDependencies {
+            authorizer: Arc::new(RuleEngine::from_documents([document]).unwrap()),
+            sessions,
+            credentials,
+            injectors: Arc::new(InjectorRegistry::new()),
+            transport: Arc::new(transport.clone()),
+            audit: Arc::new(FailingAuditStore),
+            project: ProjectId::parse("proj_core").unwrap(),
+            egress_allow_private: false,
+        });
+
+        let request = BrokerRequest {
+            protocol: PROTOCOL_VERSION,
+            session_token: raw_token,
+            credential: CredentialRef::parse("github-work-token").unwrap(),
+            method: HttpMethod::GET,
+            url: "https://api.github.com/repos/acme/backend/issues".to_owned(),
+            headers: Vec::new(),
+            body: BrokerBody::None,
+            capability_hint: None,
+        };
+        let response = engine.execute_broker_request(request);
+
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response.decision,
+            Decision::Deny {
+                reason: AUDIT_WRITE_FAILED_REASON.to_owned(),
+                policy: None,
+            }
+        );
+        assert!(response.body.is_empty());
+        // The exchange itself happened (stage 8 precedes the audit write
+        // at stage 10) — fail-closed here means the *result* is withheld
+        // from the agent, not that the wire was never touched.
+        let captured = transport
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(captured.len(), 1);
+    }
+
+    #[test]
+    fn audit_write_failure_upgrades_deny_outcomes_rather_than_silently_dropping() {
+        // Deny records are the probing-detection layer: when the store is
+        // broken, the caller must see a broker-level 500 instead of a
+        // quietly-swallowed deny reason.
+        let sessions = Arc::new(InMemorySessionStore::new());
+        let credentials = Arc::new(InMemoryCredentialSource::new());
+        credentials.insert(
+            CredentialRef::parse("github-work-token").unwrap(),
+            SecretBytes::from_bytes(SECRET_CANARY.as_bytes()),
+            InjectionTemplateId::GithubBearer,
+            CredentialMetadata::default(),
+        );
+        let (session_id, raw_token) = sessions
+            .create(
+                &AgentId::parse("agent_coding").unwrap(),
+                &EnvironmentId::parse("env_development").unwrap(),
+            )
+            .unwrap();
+        let document = parse_policy_yaml(&policy_yaml(
+            "coding-agent-github",
+            &format!("session:{session_id}"),
+            "github-work-token",
+        ))
+        .unwrap();
+        let transport = CapturingTransport::failing();
+        let engine = BrokerEngine::new(BrokerDependencies {
+            authorizer: Arc::new(RuleEngine::from_documents([document]).unwrap()),
+            sessions,
+            credentials,
+            injectors: Arc::new(InjectorRegistry::new()),
+            transport: Arc::new(transport),
+            audit: Arc::new(FailingAuditStore),
+            project: ProjectId::parse("proj_core").unwrap(),
+            egress_allow_private: false,
+        });
+
+        // DELETE matches the explicit deny rule; with a healthy store this
+        // surfaces as `explicit_deny`, but the broken audit sink upgrades
+        // the response to the broker-level failure.
+        let request = BrokerRequest {
+            protocol: PROTOCOL_VERSION,
+            session_token: raw_token,
+            credential: CredentialRef::parse("github-work-token").unwrap(),
+            method: HttpMethod::DELETE,
+            url: "https://api.github.com/repos/acme/backend/issues".to_owned(),
+            headers: Vec::new(),
+            body: BrokerBody::None,
+            capability_hint: None,
+        };
+        let response = engine.execute_broker_request(request);
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response.decision,
+            Decision::Deny {
+                reason: AUDIT_WRITE_FAILED_REASON.to_owned(),
+                policy: None,
+            }
+        );
     }
 
     #[test]
