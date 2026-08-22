@@ -53,7 +53,7 @@ impl CanonicalUrl {
     /// * [`HttpPolicyError::UserInfoDisallowed`] when the authority
     ///   carries userinfo;
     /// * [`HttpPolicyError::InvalidPort`] when an embedded port is not a
-    ///   valid `u16`;
+    ///   valid `u16` or is `0` (ports must be `1..=65535`);
     /// * [`HttpPolicyError::InvalidUrl`] for malformed input, missing or
     ///   non-ASCII/percent-encoded hosts, underscored or empty hostname
     ///   labels, or a missing path component.
@@ -87,6 +87,11 @@ impl CanonicalUrl {
         let scheme = parsed.scheme().to_owned();
         if scheme != "https" {
             return Err(HttpPolicyError::UnsupportedScheme(scheme));
+        }
+        // The WHATWG parser accepts port 0; policy requires `1..=65535`
+        // (mirroring `from_parts`), so the explicit-port guard lives here.
+        if parsed.port() == Some(0) {
+            return Err(HttpPolicyError::InvalidPort("0".to_owned()));
         }
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(HttpPolicyError::UserInfoDisallowed);
@@ -366,6 +371,11 @@ mod tests {
         assert_eq!(u.as_url().as_str(), "https://example.com/p");
 
         let err = CanonicalUrl::parse("https://example.com:99999/").expect_err("port overflow");
+        assert!(matches!(err, HttpPolicyError::InvalidPort(_)));
+
+        // Regression: the WHATWG parser accepts port 0, but the
+        // 1..=65535 contract must hold for `parse` too.
+        let err = CanonicalUrl::parse("https://example.com:0/").expect_err("port zero");
         assert!(matches!(err, HttpPolicyError::InvalidPort(_)));
 
         let err = CanonicalUrl::from_parts("example.com", Some(0), "/").expect_err("port zero");
