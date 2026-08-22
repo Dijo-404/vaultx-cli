@@ -193,6 +193,82 @@ fn commit_requires_message_then_log_and_prefix_show_work() {
     .unwrap();
     let staged = dispatch(&cli(root, Command::Diff { a: None, b: None })).unwrap();
     assert!(staged.contains("- config A"), "staged diff: {staged}");
+
+    // Exactly one commit id to diff is rejected.
+    let err = dispatch(&cli(
+        root,
+        Command::Diff {
+            a: Some(hex[..6].into()),
+            b: None,
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CliError::Usage(ref text) if text.contains("exactly two")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn import_bom_duplicates_and_missing_file_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    // UTF-8 BOM before the first key, plus an in-file duplicate whose
+    // last value wins and is reported once.
+    let env_file = root.join("bom.env");
+    std::fs::write(&env_file, "\u{feff}FIRST=1\nSECOND=x\nSECOND=y\n").unwrap();
+    let out = dispatch(&cli(
+        root,
+        Command::Import {
+            file: env_file.clone(),
+        },
+    ))
+    .unwrap();
+    assert!(
+        out.contains("imported 2 config value(s)") && out.contains("added: FIRST, SECOND"),
+        "got: {out}"
+    );
+    assert_eq!(
+        dispatch(&cli(
+            root,
+            Command::Get {
+                name: "FIRST".into()
+            }
+        ))
+        .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        dispatch(&cli(
+            root,
+            Command::Get {
+                name: "SECOND".into()
+            }
+        ))
+        .unwrap(),
+        "y"
+    );
+
+    // Read failures keep the filename so the operator knows which input
+    // was missing.
+    let missing = root.join("missing.env");
+    let err = dispatch(&cli(
+        root,
+        Command::Import {
+            file: missing.clone(),
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot read")
+            && err
+                .to_string()
+                .contains(missing.display().to_string().as_str()),
+        "error must carry the path, got: {err}"
+    );
+    assert_eq!(err.exit_code(), 1);
 }
 
 #[test]
@@ -388,6 +464,20 @@ fn add_restore_branch_env_agent_policy_flows() {
         err,
         CliError::Runtime(CoreError::VariableNotFound(_))
     ));
+
+    // NAME and --all together is a usage error.
+    let err = dispatch(&cli(
+        root,
+        Command::Add {
+            name: Some("DB_HOST".into()),
+            all: true,
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CliError::Usage(ref text) if text.contains("not both")),
+        "got: {err:?}"
+    );
 
     // restore drops staged intent and reports the outcome per name.
     let out = dispatch(&cli(

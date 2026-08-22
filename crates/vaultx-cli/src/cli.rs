@@ -441,8 +441,19 @@ fn cmd_list(services: &VaultxServices) -> Result<String, CliError> {
 }
 
 fn cmd_import(services: &VaultxServices, file: &Path) -> Result<String, CliError> {
-    let text = std::fs::read_to_string(file).map_err(CoreError::from)?;
-    let pairs = parse_env_file(&text);
+    // Read failures must name the file: bare OS messages ("No such file
+    // or directory") would leave the operator guessing which input was
+    // missing.
+    let text = std::fs::read_to_string(file).map_err(|err| {
+        CliError::Runtime(CoreError::Io(std::io::Error::new(
+            err.kind(),
+            format!("cannot read {}: {err}", file.display()),
+        )))
+    })?;
+    // Tolerate UTF-8 BOMs emitted by Windows editors; otherwise the
+    // marker glues onto the first variable's name and silently breaks it.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let pairs = parse_env_file(text);
     let borrowed: Vec<(&str, &str)> = pairs
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_str()))
@@ -669,24 +680,32 @@ fn parse_assignment(raw: &str) -> Result<(&str, &str), CliError> {
 ///
 /// Blank lines and `#` comments are skipped; surrounding single or
 /// double quotes are stripped from values; whitespace around names and
-/// values is trimmed. Malformed lines are dropped silently here — the
+/// values is trimmed. Duplicate keys within one file collapse to a
+/// single entry with the last value winning, so the import report lists
+/// each name once. Malformed lines are dropped silently here — the
 /// import classifier reports what it accepted, so callers wanting
 /// line-level errors should pre-validate the file themselves.
 fn parse_env_file(text: &str) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let (name, value) = line.split_once('=')?;
-            let name = name.trim();
-            if name.is_empty() {
-                return None;
-            }
-            Some((name.to_owned(), strip_quotes(value.trim())))
-        })
-        .collect()
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let value = strip_quotes(value.trim());
+        match pairs.iter_mut().find(|(existing, _)| existing == name) {
+            Some(slot) => slot.1 = value,
+            None => pairs.push((name.to_owned(), value)),
+        }
+    }
+    pairs
 }
 
 /// Removes one matching pair of surrounding single/double quotes.
@@ -703,13 +722,16 @@ fn strip_quotes(value: &str) -> String {
 
 /// Resolves a user-supplied commit-id prefix against the given log
 /// entries. Matching ignores the optional `cmt_` prefix and is
-/// case-sensitive. Zero matches and ambiguous prefixes are usage errors;
-/// ambiguity lists the candidate short ids.
+/// case-insensitive (canonical ids are lowercase hex, but operators
+/// habitually paste uppercase from various tools). Zero matches and
+/// ambiguous prefixes are usage errors; ambiguity lists the candidate
+/// short ids.
 fn resolve_commit_prefix(prefix: &str, log: &[CommitSummary]) -> Result<CommitId, CliError> {
-    let needle = prefix.strip_prefix(CommitId::PREFIX).unwrap_or(prefix);
-    if needle.is_empty() {
+    let raw = prefix.strip_prefix(CommitId::PREFIX).unwrap_or(prefix);
+    if raw.is_empty() {
         return Err(CliError::Usage("commit id prefix must not be empty".into()));
     }
+    let needle = raw.to_ascii_lowercase();
     let matches: Vec<&CommitSummary> = log
         .iter()
         .filter(|entry| {
@@ -717,7 +739,7 @@ fn resolve_commit_prefix(prefix: &str, log: &[CommitSummary]) -> Result<CommitId
                 .id
                 .as_str()
                 .strip_prefix(CommitId::PREFIX)
-                .is_some_and(|hex| hex.starts_with(needle))
+                .is_some_and(|hex| hex.starts_with(&needle))
         })
         .collect();
     match matches.as_slice() {
@@ -766,14 +788,14 @@ mod helper_tests {
     }
 
     #[test]
-    fn env_file_parsing_skips_comments_and_strips_quotes() {
+    fn env_file_parsing_skips_comments_strips_quotes_dedupes() {
         let pairs = parse_env_file(
-            "\n# comment\nA=1\n  B = spaced value \nC=\"quoted\"\nD='single'\nE=\nno-equals\n=bad\n",
+            "\n# comment\nA=1\n  B = spaced value \nC=\"quoted\"\nD='single'\nE=\nA=last-wins\nno-equals\n=bad\n",
         );
         assert_eq!(
             pairs,
             vec![
-                ("A".to_owned(), "1".to_owned()),
+                ("A".to_owned(), "last-wins".to_owned()),
                 ("B".to_owned(), "spaced value".to_owned()),
                 ("C".to_owned(), "quoted".to_owned()),
                 ("D".to_owned(), "single".to_owned()),
@@ -786,8 +808,11 @@ mod helper_tests {
     fn prefix_resolution_unique_ambiguous_and_empty() {
         let log = [summary("aaa111000000"), summary("aaa222000000")];
 
-        // Unique match ignores the optional `cmt_` prefix.
+        // Unique match ignores the optional `cmt_` prefix and accepts
+        // uppercase input (ids are stored lowercase).
         let id = resolve_commit_prefix("aaa111", &log).unwrap();
+        assert_eq!(id, log[0].id);
+        let id = resolve_commit_prefix("AAA111", &log).unwrap();
         assert_eq!(id, log[0].id);
         let id = resolve_commit_prefix("cmt_aaa111", &log).unwrap();
         assert_eq!(id, log[0].id);
