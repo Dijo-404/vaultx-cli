@@ -4,6 +4,7 @@
 //! handles identifiers, hostnames, header names, and path patterns.
 
 use thiserror::Error;
+use vaultx_types::PolicyName;
 
 /// Errors surfaced by the policy loader, validator, and rule engine.
 #[derive(Debug, Error)]
@@ -25,6 +26,10 @@ pub enum PolicyError {
     /// A request-path pattern violates the pattern grammar.
     #[error("invalid path pattern `{0}`")]
     InvalidPattern(String),
+    /// Two policies with the same name were added to one engine; names
+    /// must be unique so decisions and explanations stay attributable.
+    #[error("duplicate policy name `{0}`")]
+    DuplicatePolicyName(PolicyName),
     /// Filesystem failure while reading a policy file.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -54,6 +59,7 @@ mod tests {
                 reason: "must contain at least one entry".to_owned(),
             },
             PolicyError::InvalidPattern("/repos/../**".to_owned()),
+            PolicyError::DuplicatePolicyName(vaultx_types::PolicyName::parse("twice").unwrap()),
             PolicyError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
         ];
         for err in &cases {

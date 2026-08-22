@@ -130,36 +130,20 @@ fn validate_header_names(field: &str, names: &[String]) -> Result<(), PolicyErro
 }
 
 fn validate_hostname(host: &str) -> Result<(), PolicyError> {
-    let invalid = |reason: String| PolicyError::InvalidPolicy {
+    if crate::model::is_valid_hostname(host) {
+        return Ok(());
+    }
+    let reason = if host.contains(':') {
+        format!(
+            "`{host}` must be a plain hostname; ports are not allowed (use api.github.com, not api.github.com:8444)"
+        )
+    } else {
+        format!("`{host}` must be a lowercase hostname using only a-z, 0-9, '.', and '-'")
+    };
+    Err(PolicyError::InvalidPolicy {
         field: "http.hosts".to_owned(),
         reason,
-    };
-    if host.is_empty() {
-        return Err(invalid("must not be empty".to_owned()));
-    }
-    if !host
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
-    {
-        // Uppercase or any other character breaks canonical form.
-        return Err(invalid(format!(
-            "`{host}` must be a lowercase hostname using only a-z, 0-9, '.', and '-'"
-        )));
-    }
-    if host.starts_with('.') || host.ends_with('.') {
-        return Err(invalid(format!("`{host}` has a leading or trailing '.'")));
-    }
-    for label in host.split('.') {
-        if label.is_empty() {
-            return Err(invalid(format!("`{host}` contains an empty label")));
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(invalid(format!(
-                "`{host}` contains a label with a leading or trailing '-'"
-            )));
-        }
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -256,6 +240,27 @@ http:
       paths: ["/x"]
 "#;
         assert!(parse_policy_yaml(bad_name).is_err());
+    }
+
+    #[test]
+    fn host_entries_reject_ports_with_explicit_message() {
+        let yaml = r#"
+name: port-check
+principal: agent:a
+credential: token
+http:
+  hosts: [api.github.com:8444]
+  allow:
+    - methods: [GET]
+      paths: ["/x"]
+"#;
+        let err = parse_policy_yaml(yaml).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::InvalidPolicy { ref field, .. } if field == "http.hosts"),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("ports are not allowed"), "{message}");
     }
 
     #[test]

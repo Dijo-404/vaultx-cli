@@ -21,6 +21,16 @@
 //! | [`Action::HttpRequest`] | the proxied HTTP action |
 //! | [`Resource`] | credential logical ID |
 //! | [`AuthorizationContext`] | canonical host/method/path/query/body metadata and environment |
+//!
+//! # Canonicalization contract (caller obligations)
+//!
+//! Authorization sees **canonical values only**. The broker transport layer
+//! must hand the engine an [`AuthorizationContext`] whose `path` is already
+//! percent-decoded with dot segments (`.` / `..`) resolved and whose `host`
+//! is already lowercased without port. The matcher is literal and
+//! segment-based; non-canonical contexts are rejected outright (see
+//! [`DenyReason::InvalidContext`]) rather than normalized, so upstream
+//! normalization drift can never become a deny-evasion.
 
 mod engine;
 mod error;
@@ -36,7 +46,7 @@ pub use error::PolicyError;
 pub use loader::{load_policy_file, parse_policy_yaml, validate_policy};
 pub use matcher::{host_matches, path_matches, validate_pattern};
 pub use model::{
-    Action, AuthorizationContext, EnvironmentRules, HttpMethod, HttpRules, MethodPathRule,
-    PolicyDocument, Principal, RequestConstraints, Resource, ResponseConstraints,
+    Action, AuthorizationContext, ContextError, EnvironmentRules, HttpMethod, HttpRules,
+    MethodPathRule, PolicyDocument, Principal, RequestConstraints, Resource, ResponseConstraints,
     PRINCIPAL_AGENT_PREFIX, PRINCIPAL_MAX_LEN, PRINCIPAL_SESSION_PREFIX,
 };

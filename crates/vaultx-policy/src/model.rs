@@ -156,13 +156,21 @@ impl fmt::Display for HttpMethod {
 
 /// Request context evaluated against a policy document.
 ///
-/// `host` is expected to be a lowercase hostname and `path` an absolute
-/// request target starting with `/`; the engine validates both before
-/// matching. Query pairs are kept in a `BTreeMap` so ordering is
-/// deterministic across runs.
+/// # Canonicalization contract
+///
+/// The engine performs no normalization: matching is literal and
+/// segment-based. The caller (broker transport layer) MUST construct this
+/// struct from an already-canonicalized request —
+///
+/// * `path` percent-decoded with dot segments (`.` / `..`) resolved,
+/// * `host` lowercased and stripped of any port.
+///
+/// Non-canonical values are rejected by [`AuthorizationContext::validate`]
+/// before any policy rule runs; they are never normalized silently, because
+/// upstream normalization drift is a deny-evasion vector.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AuthorizationContext {
-    /// Lowercase hostname of the outbound request target.
+    /// Lowercase hostname of the outbound request target (no port).
     pub host: String,
     /// HTTP method of the outbound request.
     pub method: HttpMethod,
@@ -174,6 +182,74 @@ pub struct AuthorizationContext {
     pub body_len_bytes: u64,
     /// Deployed environment the agent/session operates in, when known.
     pub environment: Option<EnvironmentId>,
+}
+
+/// Error describing a non-canonical [`AuthorizationContext`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ContextError {
+    /// Host is empty, non-lowercase, or otherwise not a valid hostname
+    /// (ports are not allowed in host entries).
+    #[error("context host `{0}` is not a lowercase valid hostname (no ports)")]
+    InvalidHost(String),
+    /// Path is relative, contains empty segments (`//`, trailing `/`), or
+    /// retains `.` / `..` dot segments.
+    #[error(
+        "context path `{0}` is not canonical: must start with '/' and contain no empty, '.', or '..' segments"
+    )]
+    InvalidPath(String),
+}
+
+impl AuthorizationContext {
+    /// Validates the canonical-form contract documented on the struct.
+    ///
+    /// The rule engine runs this before any policy evaluation and denies
+    /// non-canonical contexts outright.
+    ///
+    /// # Errors
+    /// Returns [`ContextError::InvalidHost`] or
+    /// [`ContextError::InvalidPath`] describing the first violation.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        if !is_valid_hostname(&self.host) {
+            return Err(ContextError::InvalidHost(self.host.clone()));
+        }
+        if !is_canonical_path(&self.path) {
+            return Err(ContextError::InvalidPath(self.path.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// True when `host` is a lowercase hostname built from `a-z`, `0-9`, `.`,
+/// and `-`, with no empty labels and no leading/trailing `.` or `-`.
+///
+/// Ports are deliberately invalid: host entries are plain hostnames.
+pub(crate) fn is_valid_hostname(host: &str) -> bool {
+    if host.is_empty() || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+    {
+        return false;
+    }
+    host.split('.')
+        .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'))
+}
+
+/// True when `path` is an absolute path with no empty segments (`//`,
+/// trailing `/`) and no unresolved `.` / `..` segments. The bare root `/`
+/// is the one canonical zero-segment path.
+fn is_canonical_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    if path == "/" {
+        return true;
+    }
+    let rest = &path[1..];
+    rest.split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 /// Human-editable policy document compiled into rules (plan §23).
@@ -354,6 +430,65 @@ mod tests {
         assert_eq!(ctx.host, "");
         assert_eq!(ctx.path, "");
         assert!(ctx.query.is_empty());
+    }
+
+    #[test]
+    fn context_validation_enforces_canonical_form() {
+        let canonical = AuthorizationContext {
+            host: "api.github.com".to_owned(),
+            method: HttpMethod::GET,
+            path: "/repos/acme/backend/issues".to_owned(),
+            query: BTreeMap::new(),
+            body_len_bytes: 0,
+            environment: None,
+        };
+        assert_eq!(canonical.validate(), Ok(()));
+
+        // Bare root is the one canonical zero-segment path.
+        let root = AuthorizationContext {
+            path: "/".to_owned(),
+            ..canonical.clone()
+        };
+        assert_eq!(root.validate(), Ok(()));
+
+        for bad_path in [
+            "repos/acme",
+            "//acme",
+            "/a//b",
+            "/repos/acme/",
+            "/repos/../secrets",
+            "/./current",
+            "",
+        ] {
+            let bad = AuthorizationContext {
+                path: bad_path.to_owned(),
+                ..canonical.clone()
+            };
+            assert_eq!(
+                bad.validate(),
+                Err(ContextError::InvalidPath(bad_path.to_owned())),
+                "{bad_path}"
+            );
+        }
+
+        for bad_host in [
+            "",
+            "API.GitHub.com",
+            "api.github.com:8444",
+            "-lead.example",
+            "trail-.example",
+            "double..dot",
+        ] {
+            let bad = AuthorizationContext {
+                host: bad_host.to_owned(),
+                ..canonical.clone()
+            };
+            assert_eq!(
+                bad.validate(),
+                Err(ContextError::InvalidHost(bad_host.to_owned())),
+                "{bad_host}"
+            );
+        }
     }
 
     #[test]

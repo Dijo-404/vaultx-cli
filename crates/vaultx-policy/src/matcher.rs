@@ -3,6 +3,8 @@
 //! Path patterns are segment-oriented:
 //!
 //! * patterns must start with `/`;
+//! * empty segments are rejected (`//`, trailing `/`, bare `/`) — use `/**`
+//!   for the root;
 //! * `**` is only allowed as the trailing segment and matches zero or more
 //!   remaining segments;
 //! * `*` matches exactly one non-empty segment;
@@ -16,8 +18,9 @@ use crate::error::PolicyError;
 ///
 /// # Errors
 /// Returns [`PolicyError::InvalidPattern`] when the pattern is empty, does
-/// not start with `/`, contains a `..` segment, or uses `**` anywhere other
-/// than the final segment.
+/// not start with `/`, contains an empty segment (`//`, a trailing `/`, or
+/// the degenerate bare `/`), contains a `..` segment, or uses `**` anywhere
+/// other than the final segment. Root-only access is expressed with `/**`.
 pub fn validate_pattern(pattern: &str) -> Result<(), PolicyError> {
     let reject = || PolicyError::InvalidPattern(pattern.to_owned());
     if pattern.is_empty() || !pattern.starts_with('/') {
@@ -25,6 +28,9 @@ pub fn validate_pattern(pattern: &str) -> Result<(), PolicyError> {
     }
     let segments: Vec<&str> = split_segments(pattern).collect();
     for (index, segment) in segments.iter().enumerate() {
+        if segment.is_empty() {
+            return Err(reject());
+        }
         if *segment == ".." {
             return Err(reject());
         }
@@ -158,13 +164,17 @@ mod tests {
             "/a/../../b",
             "/repos/**/issues",
             "/**/tail",
+            "/a//b",
+            "/a/",
+            "///",
+            "/",
         ] {
             assert!(
                 matches!(validate_pattern(bad), Err(PolicyError::InvalidPattern(_))),
                 "{bad}"
             );
         }
-        for good in ["/repos/acme/backend/pulls", "/**", "/single", "/"] {
+        for good in ["/repos/acme/backend/pulls", "/**", "/single"] {
             assert!(validate_pattern(good).is_ok(), "{good}");
         }
     }
@@ -182,9 +192,13 @@ mod tests {
 
     #[test]
     fn root_path_edge_cases() {
-        assert!(path_matches("/", "/"));
-        assert!(!path_matches("/", "/x"));
+        // Bare "/" is no longer a valid pattern; root access is expressed
+        // with the zero-or-more wildcard.
+        assert!(validate_pattern("/").is_err());
         assert!(path_matches("/**", "/"));
         assert!(!path_matches("/*", "/"));
+        // The matcher itself stays literal: trailing-slash paths are
+        // rejected upstream by AuthorizationContext::validate, not here.
+        assert!(path_matches("/a/**", "/a/"));
     }
 }
