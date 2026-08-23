@@ -1,11 +1,17 @@
 //! Filesystem loading of policy packs.
 //!
 //! [`load_pack`] parses and fully validates one file; [`load_pack_dir`]
-//! walks a directory tree for `*.yaml`/`*.yml` files, returning packs
+//! walks a directory tree for `*.yaml`/`.yml` files, returning packs
 //! sorted by capability name and rejecting duplicate capabilities so a
 //! directory can never hold two definitions of the same thing.
+//!
+//! Directory walks recurse into real subdirectories only: symlinked
+//! directories are skipped (`DirEntry::file_type` does not follow
+//! symlinks), so a pack tree cannot escape its root via links.
 
 use std::path::{Path, PathBuf};
+
+use vaultx_types::PolicyName;
 
 use crate::error::PackError;
 use crate::schema::PolicyPack;
@@ -31,8 +37,9 @@ pub fn load_pack(path: &Path) -> Result<PolicyPack, PackError> {
 }
 
 /// Lists candidate pack files under `dir`, recursively, in sorted path
-/// order. Hidden files/directories are skipped; only `.yaml`/`.yml`
-/// extensions qualify.
+/// order. Hidden files/directories are skipped and only real directories
+/// are recursed into — symlinked directories are ignored, keeping the
+/// walk inside the given root. Only `.yaml`/`.yml` extensions qualify.
 ///
 /// # Errors
 /// Propagates directory-walk I/O errors.
@@ -46,16 +53,27 @@ pub fn pack_files(dir: &Path) -> Result<Vec<PathBuf>, PackError> {
 /// Loads every pack under `dir`, sorted by capability name.
 ///
 /// # Errors
-/// Propagates per-file failures and returns
+/// Propagates per-file failures (wrapped in
+/// [`PackError::File`][crate::PackError::File]), returns
 /// [`PackError::DuplicateCapability`] when two files declare the same
-/// capability name.
+/// capability name, and returns
+/// [`PackError::AmbiguousCapabilityName`] when two distinct capability
+/// names derive to the same policy name (`a.b` vs `a_b`) — enforcing the
+/// dot/underscore collision rule here rather than deferring it to engine
+/// construction.
 pub fn load_pack_dir(dir: &Path) -> Result<Vec<PolicyPack>, PackError> {
     let mut loaded: Vec<(String, PolicyPack)> = Vec::new();
+    let mut policy_names: Vec<(PolicyName, String)> = Vec::new();
     for file in pack_files(dir)? {
         let pack = load_pack(&file).map_err(|err| annotate(file.as_path(), err))?;
         if loaded.iter().any(|(existing, _)| *existing == pack.name) {
             return Err(PackError::DuplicateCapability(pack.name));
         }
+        let derived = crate::CompiledPack::policy_name_for(&pack.name)?;
+        if policy_names.iter().any(|(name, _)| *name == derived) {
+            return Err(PackError::AmbiguousCapabilityName(pack.name.clone()));
+        }
+        policy_names.push((derived, pack.name.clone()));
         loaded.push((pack.name.clone(), pack));
     }
     let mut packs: Vec<PolicyPack> = loaded.into_iter().map(|(_, pack)| pack).collect();
@@ -63,14 +81,15 @@ pub fn load_pack_dir(dir: &Path) -> Result<Vec<PolicyPack>, PackError> {
     Ok(packs)
 }
 
-/// Names the offending file in per-file errors so directory scans point
-/// at the right input.
+/// Wraps per-file failures in [`PackError::File`] so directory scans
+/// point at the right input while preserving the underlying error as
+/// `source`.
 fn annotate(path: &Path, err: PackError) -> PackError {
     match err {
         PackError::Io(_) => err,
-        other => PackError::InvalidField {
-            field: format!("{}", path.display()),
-            reason: other.to_string(),
+        other => PackError::File {
+            path: path.to_path_buf(),
+            source: Box::new(other),
         },
     }
 }
@@ -182,9 +201,29 @@ credential:
             "format: 9\nname: broken.pack\nprovider: github\nrequest:\n  hosts: [api.github.com]\n  methods: [GET]\n  paths: [\"/x\"]\ncredential:\n  credential_ref: t\n  injection: bearer\n",
         );
         let err = load_pack_dir(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, PackError::File { path, .. } if path.ends_with("bad.yaml")),
+            "{err}"
+        );
         let rendered = err.to_string();
         assert!(rendered.contains("bad.yaml"), "{rendered}");
         assert!(rendered.contains("`format`"), "{rendered}");
+        // The underlying failure stays reachable as the error source.
+        let PackError::File { source, .. } = &err else {
+            panic!("expected File variant");
+        };
+        assert!(matches!(**source, PackError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn symlinked_directories_are_skipped_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_file(&outside.path().join("linked.yaml"), PACK_A);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+
+        assert!(load_pack_dir(dir.path()).unwrap().is_empty());
     }
 
     #[test]

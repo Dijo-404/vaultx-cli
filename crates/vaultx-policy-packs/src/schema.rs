@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use vaultx_policy::HttpMethod;
-use vaultx_types::model::{InjectionTemplateId as TemplateId, InjectionTemplateId};
+use vaultx_types::model::InjectionTemplateId;
 use vaultx_types::{CredentialRef, ProviderName};
 
 use crate::error::PackError;
@@ -120,8 +120,10 @@ pub struct PackResponseRules {
     /// Lowercase header names redacted from responses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redact_headers: Vec<String>,
-    /// JSON field selectors redacted from response bodies (dotted paths,
-    /// e.g. `items[].secret_note`); consumed by the response sanitizer.
+    /// Exact JSON object keys redacted from response bodies. Dotted or
+    /// array-style selectors are rejected at validation time because the
+    /// response sanitizer matches keys literally — a nested selector
+    /// would otherwise be a silent no-op.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redact_fields: Vec<String>,
 }
@@ -140,14 +142,14 @@ where
 /// Maps an injection-template string onto its enum value.
 fn parse_injection_template(raw: &str) -> Option<InjectionTemplateId> {
     match raw {
-        "bearer" => Some(TemplateId::Bearer),
-        "basic-password" | "basic_password" => Some(TemplateId::BasicPassword),
-        "api-key-header" | "api_key_header" => Some(TemplateId::ApiKeyHeader),
-        "github-bearer" | "github_bearer" => Some(TemplateId::GithubBearer),
-        "query-parameter" | "query_parameter" => Some(TemplateId::QueryParameter),
-        "aws-sigv4" | "aws_sigv4" => Some(TemplateId::AwsSigv4),
+        "bearer" => Some(InjectionTemplateId::Bearer),
+        "basic-password" | "basic_password" => Some(InjectionTemplateId::BasicPassword),
+        "api-key-header" | "api_key_header" => Some(InjectionTemplateId::ApiKeyHeader),
+        "github-bearer" | "github_bearer" => Some(InjectionTemplateId::GithubBearer),
+        "query-parameter" | "query_parameter" => Some(InjectionTemplateId::QueryParameter),
+        "aws-sigv4" | "aws_sigv4" => Some(InjectionTemplateId::AwsSigv4),
         "custom-static-header-plus-secret" | "custom_static_header_plus_secret" => {
-            Some(TemplateId::CustomStaticHeaderPlusSecret)
+            Some(InjectionTemplateId::CustomStaticHeaderPlusSecret)
         }
         _ => None,
     }
@@ -302,11 +304,19 @@ impl PolicyPack {
                 });
             }
         }
-        for field in &response.redact_fields {
-            if field.is_empty() || field.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        for key in &response.redact_fields {
+            if key.is_empty()
+                || key.contains('.')
+                || key.contains('[')
+                || key.contains(']')
+                || key.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
                 return Err(PackError::InvalidField {
                     field: "response.redact_fields".to_owned(),
-                    reason: format!("`{field}` is not a usable field selector"),
+                    reason: format!(
+                        "`{key}` must be a bare JSON object key: the response sanitizer \
+                         matches exact keys only, so dotted/array selectors would never fire"
+                    ),
                 });
             }
         }
@@ -424,15 +434,16 @@ fn validate_path_template(path: &str) -> Result<Vec<(String, String)>, PackError
 /// Validates a pack target hostname.
 ///
 /// Hosts must be registrable-looking public hostnames: two or more
-/// labels, lowercase, no ports, no wildcard characters, no literal IPs,
-/// no loopback/link-local/private-suffix names, and never a cloud
-/// metadata endpoint.
+/// labels, lowercase, no ports, no wildcard characters, no literal IPs
+/// (including hex-quad spellings), no loopback/link-local/private-suffix
+/// names, and never a cloud metadata endpoint. Trailing-dot absolute
+/// forms are rejected by the label grammar.
 pub(crate) fn validate_pack_host(host: &str) -> Result<(), PackError> {
     let reject = |reason: &str| PackError::ForbiddenHost {
         host: host.to_owned(),
         reason: reason.to_owned(),
     };
-    if host == METADATA_IPV4_HOST || host.eq_ignore_ascii_case(METADATA_IPV6_HOST) {
+    if host == METADATA_IPV4_HOST || host == METADATA_IPV6_HOST {
         return Err(reject("cloud metadata endpoints are never allowed"));
     }
     if host.is_empty() || host.len() > 253 {
@@ -472,6 +483,18 @@ pub(crate) fn validate_pack_host(host: &str) -> Result<(), PackError> {
     {
         return Err(reject("literal IP addresses are not allowed"));
     }
+    // Hex-quad IP spellings (`a9.fe.a9.fe`, `de.ad.be.ef`) are not
+    // registrable names; with at most four labels an all-hex host can
+    // only be a dotted address in disguise.
+    if labels.len() <= 4
+        && labels
+            .iter()
+            .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return Err(reject(
+            "dotted hex-quad spellings of IPv4 addresses are not allowed",
+        ));
+    }
     Ok(())
 }
 
@@ -498,25 +521,25 @@ credential:
     #[test]
     fn injection_accepts_kebab_and_snake_spellings() {
         for (raw, expected) in [
-            ("bearer", TemplateId::Bearer),
-            ("basic-password", TemplateId::BasicPassword),
-            ("basic_password", TemplateId::BasicPassword),
-            ("api-key-header", TemplateId::ApiKeyHeader),
-            ("api_key_header", TemplateId::ApiKeyHeader),
-            ("github-bearer", TemplateId::GithubBearer),
-            ("github_bearer", TemplateId::GithubBearer),
-            ("query-parameter", TemplateId::QueryParameter),
-            ("query_parameter", TemplateId::QueryParameter),
+            ("bearer", InjectionTemplateId::Bearer),
+            ("basic-password", InjectionTemplateId::BasicPassword),
+            ("basic_password", InjectionTemplateId::BasicPassword),
+            ("api-key-header", InjectionTemplateId::ApiKeyHeader),
+            ("api_key_header", InjectionTemplateId::ApiKeyHeader),
+            ("github-bearer", InjectionTemplateId::GithubBearer),
+            ("github_bearer", InjectionTemplateId::GithubBearer),
+            ("query-parameter", InjectionTemplateId::QueryParameter),
+            ("query_parameter", InjectionTemplateId::QueryParameter),
             (
                 "custom-static-header-plus-secret",
-                TemplateId::CustomStaticHeaderPlusSecret,
+                InjectionTemplateId::CustomStaticHeaderPlusSecret,
             ),
             (
                 "custom_static_header_plus_secret",
-                TemplateId::CustomStaticHeaderPlusSecret,
+                InjectionTemplateId::CustomStaticHeaderPlusSecret,
             ),
-            ("aws-sigv4", TemplateId::AwsSigv4),
-            ("aws_sigv4", TemplateId::AwsSigv4),
+            ("aws-sigv4", InjectionTemplateId::AwsSigv4),
+            ("aws_sigv4", InjectionTemplateId::AwsSigv4),
         ] {
             assert_eq!(parse_injection_template(raw), Some(expected), "{raw}");
         }
@@ -525,7 +548,7 @@ credential:
         // Serialization stays canonical kebab-case even when the value was
         // parsed from a snake_case alias.
         assert_eq!(
-            serde_yaml::to_string(&TemplateId::GithubBearer)
+            serde_yaml::to_string(&InjectionTemplateId::GithubBearer)
                 .unwrap()
                 .trim_end(),
             "github-bearer"
@@ -558,6 +581,76 @@ credential:
         for host in ["api.github.com", "api.example-corp.dev"] {
             assert!(validate_pack_host(host).is_ok(), "{host}");
         }
+    }
+
+    #[test]
+    fn hex_quad_and_trailing_dot_host_spellings_are_rejected() {
+        for host in ["a9.fe.a9.fe", "de.ad.be.ef", "0a.0b.0c.0d", "fe.ed.be.ef"] {
+            let err = validate_pack_host(host).unwrap_err();
+            assert!(
+                matches!(err, PackError::ForbiddenHost { .. }),
+                "{host}: {err}"
+            );
+            assert!(err.to_string().contains("hex-quad"), "{host}: {err}");
+        }
+        // Trailing-dot absolute forms fail the label grammar; a trailing
+        // dot on the metadata address must not dodge the blocklist either.
+        for host in ["api.github.com.", "169.254.169.254."] {
+            let err = validate_pack_host(host).unwrap_err();
+            assert!(
+                matches!(err, PackError::ForbiddenHost { .. }),
+                "{host}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_redaction_entries_are_validated_strictly() {
+        let mut pack = minimal_pack();
+        pack.response = Some(PackResponseRules {
+            max_body_bytes: None,
+            redact_headers: vec!["Set-Cookie".to_owned()],
+            redact_fields: vec![],
+        });
+        let err = pack.validate().unwrap_err();
+        assert!(
+            matches!(&err, PackError::InvalidField { field, reason }
+                if field == "response.redact_headers"
+                    && reason.contains("`Set-Cookie` is not a lowercase HTTP header token")),
+            "{err}"
+        );
+
+        // Field keys must be bare object keys: no dotted/array selectors
+        // (the sanitizer matches exact keys only) and no control chars.
+        for key in [
+            "items[].secret_note",
+            "nested.key",
+            "bad\nkey",
+            "key\twith-tab",
+        ] {
+            let mut pack = minimal_pack();
+            pack.response = Some(PackResponseRules {
+                max_body_bytes: None,
+                redact_headers: vec![],
+                redact_fields: vec![key.to_owned()],
+            });
+            let err = pack.validate().unwrap_err();
+            assert!(
+                matches!(&err, PackError::InvalidField { field, .. }
+                    if field == "response.redact_fields"),
+                "`{key}`: {err}"
+            );
+            assert!(err.to_string().contains("bare JSON object key"), "{err}");
+        }
+
+        // Plain lowercase object keys are accepted.
+        let mut pack = minimal_pack();
+        pack.response = Some(PackResponseRules {
+            max_body_bytes: None,
+            redact_headers: vec![],
+            redact_fields: vec!["secret_note".to_owned()],
+        });
+        assert!(pack.validate().is_ok());
     }
 
     #[test]

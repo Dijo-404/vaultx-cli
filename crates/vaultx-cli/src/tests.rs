@@ -1742,7 +1742,7 @@ fn pack_validate_reports_errors_per_file_and_exits_nonzero() {
     ))
     .unwrap_err();
     match &err {
-        CliError::Diagnostics(report) => {
+        CliError::Pack(report) => {
             assert!(
                 report.contains(": ok ("),
                 "good file still reported: {report}"
@@ -1753,7 +1753,7 @@ fn pack_validate_reports_errors_per_file_and_exits_nonzero() {
             assert!(report.contains("cannot be targeted"), "{report}");
             assert_eq!(report.matches(": ERROR").count(), 2, "{report}");
         }
-        other => panic!("expected Diagnostics, got {other:?}"),
+        other => panic!("expected Pack, got {other:?}"),
     }
     assert_eq!(err.exit_code(), 1);
 
@@ -1848,4 +1848,126 @@ fn pack_add_copies_into_provider_tree_and_respects_force() {
         "{err:?}"
     );
     assert!(!root.join("elsewhere").exists());
+}
+
+#[test]
+fn pack_inspect_survives_broken_sibling_packs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_pack(root, "policy-packs/github/target.yaml", PACK_YAML);
+    write_pack(
+        root,
+        "policy-packs/github/broken-sibling.yaml",
+        &PACK_YAML.replace("format: 1", "format: 9"),
+    );
+
+    // The broken sibling must not block inspecting the valid target.
+    let out = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Inspect {
+                name: "test.capability.call".into(),
+                dir: None,
+            },
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("test.capability.call"), "{out}");
+
+    // Validate still surfaces the sibling failure.
+    let err = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Validate { dir: None },
+        },
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("broken-sibling.yaml"), "{err:?}");
+
+    // Asking for the missing pack names the broken sibling instead of a
+    // bare not-found.
+    let err = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Inspect {
+                name: "absent.pack".into(),
+                dir: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Pack(text) if text.contains("broken-sibling.yaml")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn pack_add_force_never_swaps_capabilities_on_one_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // Two different capabilities sharing the derived filename `call.yaml`
+    // under the same provider directory.
+    let first = write_pack(root, "staging/first.yaml", PACK_YAML);
+    let second = write_pack(
+        root,
+        "staging/second.yaml",
+        &PACK_YAML.replace("test.capability.call", "test.capability_two.call"),
+    );
+
+    dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Add {
+                file: first,
+                dir: None,
+                force: false,
+            },
+        },
+    ))
+    .unwrap();
+
+    // Same-capability re-add under --force still works...
+    let same_capability = write_pack(root, "staging/same.yaml", PACK_YAML);
+    dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Add {
+                file: same_capability,
+                dir: None,
+                force: true,
+            },
+        },
+    ))
+    .unwrap();
+
+    // ...but a DIFFERENT capability is refused even under --force.
+    let err = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Add {
+                file: second,
+                dir: None,
+                force: true,
+            },
+        },
+    ))
+    .unwrap_err();
+    match &err {
+        CliError::Usage(text) => {
+            assert!(
+                text.contains("holds capability `test.capability.call`"),
+                "{text}"
+            );
+            assert!(text.contains("test.capability_two.call"), "{text}");
+        }
+        other => panic!("expected Usage refusal, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 1);
+
+    // The installed bytes were never replaced.
+    let installed =
+        vaultx_policy_packs::load_pack(&root.join("policy-packs/github/call.yaml")).unwrap();
+    assert_eq!(installed.name, "test.capability.call");
 }

@@ -17,7 +17,8 @@
 //! * `aws-sigv4` injection is rejected until the broker implements it;
 //! * sensitive hop/auth headers cannot be smuggled in as "required"
 //!   headers — no such schema field exists and unknown fields fail;
-//! * response `set-cookie` redaction is forced at compile time;
+//! * response `set-cookie` redaction and the `authorization` /
+//!   `proxy-authorization` request deny pair are forced at compile time;
 //! * body-size limits are capped at the global 256 KiB / 1 MiB ceilings;
 //! * hosts must be public registrable names: no IPs, ports, wildcards,
 //!   loopback/private suffixes, or cloud metadata endpoints.

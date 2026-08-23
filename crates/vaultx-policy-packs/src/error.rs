@@ -3,6 +3,8 @@
 //! No variant ever carries secret material: packs describe identifiers,
 //! hostnames, header names, and patterns only.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -59,6 +61,24 @@ pub enum PackError {
     /// Two files in one directory declare the same capability name.
     #[error("duplicate capability name `{0}`")]
     DuplicateCapability(String),
+    /// Two capability names differing only in their dot/underscore
+    /// layout (`a.b` vs `a_b`) derive to the same policy name; directory
+    /// loading rejects such collisions up front.
+    #[error(
+        "capability name `{0}` maps onto a policy name already claimed by another capability; \
+         rename one of them using either dots or underscores consistently"
+    )]
+    AmbiguousCapabilityName(String),
+    /// A per-file failure inside a directory scan; names the offending
+    /// file so aggregate operations point at the right input.
+    #[error("{path}: {source}")]
+    File {
+        /// File being processed.
+        path: PathBuf,
+        /// Underlying parse/validation failure.
+        #[source]
+        source: Box<PackError>,
+    },
     /// Filesystem failure while reading a pack file or directory.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -100,6 +120,14 @@ mod tests {
                 placeholder: "b".to_owned(),
             },
             PackError::DuplicateCapability("x.y".to_owned()),
+            PackError::AmbiguousCapabilityName("a.b_c".to_owned()),
+            PackError::File {
+                path: "dir/bad.yaml".into(),
+                source: Box::new(PackError::InvalidField {
+                    field: "format".to_owned(),
+                    reason: "must be 1".to_owned(),
+                }),
+            },
             PackError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
         ];
         for err in &cases {

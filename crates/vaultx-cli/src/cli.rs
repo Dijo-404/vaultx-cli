@@ -22,7 +22,6 @@ use vaultx_core::{
     BrokeredBinding, CommitSummary, CoreError, MergeOutcome, MergeStrategy, SecretString,
     VaultxServices,
 };
-use vaultx_policy_packs::PolicyPack;
 use vaultx_types::model::{InjectionTemplateId, VariableKind};
 use vaultx_types::{CommitId, CredentialRef, ProviderName, VariableName};
 
@@ -639,9 +638,10 @@ fn resolve_pack_dir(project: &Path, dir: &Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(|| project.join(DEFAULT_PACKS_DIR))
 }
 
-/// Loads packs from `dir` or maps a missing directory onto a pack error.
-fn load_packs(dir: &Path) -> Result<Vec<PolicyPack>, CliError> {
-    vaultx_policy_packs::load_pack_dir(dir).map_err(|err| match err {
+/// Maps a directory-scan failure onto a CLI error, giving a missing pack
+/// directory its own friendly message.
+fn map_dir_error(dir: &Path, err: vaultx_policy_packs::PackError) -> CliError {
+    match err {
         vaultx_policy_packs::PackError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
             CliError::Pack(format!(
                 "policy pack directory {} does not exist",
@@ -649,11 +649,11 @@ fn load_packs(dir: &Path) -> Result<Vec<PolicyPack>, CliError> {
             ))
         }
         other => CliError::Pack(other.to_string()),
-    })
+    }
 }
 
 fn cmd_pack_list(dir: &Path) -> Result<String, CliError> {
-    let packs = load_packs(dir)?;
+    let packs = vaultx_policy_packs::load_pack_dir(dir).map_err(|err| map_dir_error(dir, err))?;
     if packs.is_empty() {
         return Ok("no policy packs found".to_owned());
     }
@@ -674,33 +674,34 @@ fn cmd_pack_list(dir: &Path) -> Result<String, CliError> {
     ))
 }
 
+/// Renders one pack by capability name. Broken sibling packs are skipped,
+/// never fatal: only the target file's own failure (or its absence)
+/// produces an error.
 fn cmd_pack_inspect(dir: &Path, name: &str) -> Result<String, CliError> {
-    let packs = load_packs(dir)?;
-    let pack = packs
-        .into_iter()
-        .find(|pack| pack.name == name)
-        .ok_or_else(|| {
-            CliError::Pack(format!(
-                "no policy pack named `{name}` in {}",
-                dir.display()
-            ))
-        })?;
-    Ok(crate::output::render_pack_inspect(&pack))
+    let files = vaultx_policy_packs::pack_files(dir).map_err(|err| map_dir_error(dir, err))?;
+    let mut first_broken: Option<(PathBuf, vaultx_policy_packs::PackError)> = None;
+    for file in files {
+        match vaultx_policy_packs::load_pack(&file) {
+            Ok(pack) if pack.name == name => {
+                return Ok(crate::output::render_pack_inspect(&pack));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                first_broken.get_or_insert((file, err));
+            }
+        }
+    }
+    Err(match first_broken {
+        Some((file, err)) => CliError::Pack(format!("{}: {err}", file.display())),
+        None => CliError::Pack(format!(
+            "no policy pack named `{name}` in {}",
+            dir.display()
+        )),
+    })
 }
 
 fn cmd_pack_validate(dir: &Path) -> Result<String, CliError> {
-    let files = vaultx_policy_packs::pack_files(dir).map_err(|err| match err {
-        vaultx_policy_packs::PackError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-            CliError::Pack(format!(
-                "policy pack directory {} does not exist",
-                dir.display()
-            ))
-        }
-        other => CliError::Pack(format!(
-            "cannot scan policy pack directory {}: {other}",
-            dir.display()
-        )),
-    })?;
+    let files = vaultx_policy_packs::pack_files(dir).map_err(|err| map_dir_error(dir, err))?;
     if files.is_empty() {
         return Ok("no policy packs found".to_owned());
     }
@@ -719,7 +720,7 @@ fn cmd_pack_validate(dir: &Path) -> Result<String, CliError> {
     }
     let report = lines.join("\n");
     if failures > 0 {
-        return Err(CliError::Diagnostics(report));
+        return Err(CliError::Pack(report));
     }
     Ok(report)
 }
@@ -741,11 +742,29 @@ fn cmd_pack_add(dir: &Path, file: &Path, force: bool) -> Result<String, CliError
     let target = dir
         .join(pack.provider.as_str())
         .join(format!("{capability_last_segment}.yaml"));
-    if target.exists() && !force {
-        return Err(CliError::Usage(format!(
-            "{} already exists; pass --force to overwrite",
-            target.display()
-        )));
+    if target.exists() {
+        let existing = vaultx_policy_packs::load_pack(&target).ok();
+        match (existing.as_ref(), force) {
+            (Some(_), false) => {
+                return Err(CliError::Usage(format!(
+                    "{} already exists; pass --force to overwrite",
+                    target.display()
+                )));
+            }
+            // --force may replace the same capability's bytes, but it can
+            // never silently swap one capability for another that happens
+            // to share the derived filename.
+            (Some(existing), true) if existing.name != pack.name => {
+                return Err(CliError::Usage(format!(
+                    "{} holds capability `{}`; refusing to replace it with `{}` even under \
+                     --force",
+                    target.display(),
+                    existing.name,
+                    pack.name
+                )));
+            }
+            _ => {}
+        }
     }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)

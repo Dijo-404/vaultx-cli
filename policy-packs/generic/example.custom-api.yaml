@@ -3,7 +3,7 @@
 # placeholder corporate domain.
 #
 # Demonstrates multiple methods, wildcard tails, a query allowlist, and
-# response field redaction.
+# response field redaction (exact JSON object keys only).
 format: 1
 name: generic.example-api.invoke
 provider: generic
@@ -25,4 +25,5 @@ constraints:
 response:
   max_body_bytes: 131072
   redact_headers: [set-cookie, x-request-id]
-  redact_fields: ["items[].secret_note"]
+  # Bare object keys only: the sanitizer matches exact keys.
+  redact_fields: [secret_note]

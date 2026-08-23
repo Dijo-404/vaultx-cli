@@ -8,8 +8,9 @@
 //! * path placeholders compile to single-segment `*` wildcards so the
 //!   output patterns are directly consumable by the rule engine's
 //!   matcher;
-//! * `set-cookie` is force-appended to the response redaction list — a
-//!   pack can add redactions but never remove the default;
+//! * `set-cookie` is force-appended to the response redaction list and
+//!   the credential-bearing header pair is force-added to the request
+//!   deny list — packs can add restrictions but never remove defaults;
 //! * limits have already been capped at validation time, so compiled
 //!   values can never exceed the global ceilings.
 
@@ -27,11 +28,17 @@ use crate::schema::{PolicyPack, FORCED_REDACT_HEADER};
 /// keeps pack-derived policies distinguishable from hand-authored ones.
 const POLICY_NAME_PREFIX: &str = "pack-";
 
+/// Credential-bearing headers every pack-derived policy denies on the
+/// request path, mirroring hand-authored policy documents. The broker's
+/// transport-level sensitive-header filter stays authoritative; this is
+/// defense in depth at the policy layer.
+const FORCED_REQUEST_DENY_HEADERS: [&str; 2] = ["authorization", "proxy-authorization"];
+
 /// The generic broker constraint set produced from one pack.
 ///
 /// Everything here is expressed in primitives the broker already
 /// understands; `query_allowlist`, `content_type_allowlist`, and the
-/// response field selectors have no policy-document counterpart and are
+/// response field keys have no policy-document counterpart and are
 /// consumed by the transport/response-sanitizer layers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledPack {
@@ -62,30 +69,41 @@ pub struct CompiledPack {
     pub max_request_body_bytes: Option<u64>,
     /// Allowed media types, lowercased (empty = unconstrained).
     pub content_type_allowlist: Vec<String>,
+    /// Request headers denied at the policy layer; always contains
+    /// `authorization` and `proxy-authorization`.
+    pub deny_request_headers: Vec<String>,
     /// Response body cap (already ≤ 1 MiB).
     pub max_response_body_bytes: Option<u64>,
     /// Response headers redacted before delivery; always contains
     /// `set-cookie`.
     pub redact_response_headers: Vec<String>,
-    /// JSON field selectors redacted from response bodies.
+    /// Exact JSON object keys redacted from response bodies.
     pub redact_response_fields: Vec<String>,
 }
 
 impl CompiledPack {
     /// Derives the deterministic [`PolicyName`] for a capability name:
-    /// `pack-` prefix plus dots replaced with underscores. Two distinct
-    /// capability names can only collide if their dot/underscore layout
-    /// is ambiguous (`a.b_c` vs `a_b.c`); such collisions surface loudly
-    /// as duplicate-policy errors at engine construction instead of
-    /// silently merging.
+    /// `pack-` prefix plus dots replaced with underscores.
     ///
-    /// # Panics
-    /// Never in practice: pack validation bounds the name so the derived
-    /// value is always within [`PolicyName`] rules.
-    #[must_use]
-    pub fn policy_name_for(capability: &str) -> PolicyName {
+    /// The derivation is *not* injective: two capability names differing
+    /// only in their dot/underscore layout (`a.b` and `a_b`) derive to
+    /// the same policy name. [`crate::load_pack_dir`] therefore rejects
+    /// such collisions up front with
+    /// [`PackError::AmbiguousCapabilityName`] instead of letting them
+    /// surface later as confusing duplicate-policy failures during
+    /// engine construction.
+    ///
+    /// # Errors
+    /// Returns [`PackError::InvalidField`] if the derived value somehow
+    /// fails [`PolicyName`] validation; unreachable for names accepted by
+    /// pack validation (charset subset, bounded length), kept so the
+    /// function is total over public input.
+    pub fn policy_name_for(capability: &str) -> Result<PolicyName, PackError> {
         let derived = format!("{POLICY_NAME_PREFIX}{}", capability.replace('.', "_"));
-        PolicyName::parse(&derived).expect("validated capability names map to valid policy names")
+        PolicyName::parse(&derived).map_err(|_| PackError::InvalidField {
+            field: "name".to_owned(),
+            reason: format!("`{capability}` does not map onto a valid policy name"),
+        })
     }
 
     /// Projects the compiled constraints onto a
@@ -112,7 +130,7 @@ impl CompiledPack {
             },
             request: RequestConstraints {
                 max_body_bytes: self.max_request_body_bytes,
-                deny_headers: vec![],
+                deny_headers: self.deny_request_headers.clone(),
             },
             response: ResponseConstraints {
                 max_body_bytes: self.max_response_body_bytes,
@@ -142,7 +160,7 @@ pub fn compile(pack: &PolicyPack) -> Result<CompiledPack, PackError> {
 
     Ok(CompiledPack {
         capability: pack.name.clone(),
-        policy_name: CompiledPack::policy_name_for(&pack.name),
+        policy_name: CompiledPack::policy_name_for(&pack.name)?,
         provider: pack.provider.clone(),
         hosts: pack.request.hosts.clone(),
         methods: pack.request.methods.clone(),
@@ -163,6 +181,10 @@ pub fn compile(pack: &PolicyPack) -> Result<CompiledPack, PackError> {
             .iter()
             .flatten()
             .map(|media_type| media_type.to_ascii_lowercase())
+            .collect(),
+        deny_request_headers: FORCED_REQUEST_DENY_HEADERS
+            .iter()
+            .map(|header| (*header).to_owned())
             .collect(),
         max_response_body_bytes: pack.response.as_ref().and_then(|r| r.max_body_bytes),
         redact_response_fields: pack
@@ -278,13 +300,61 @@ response:
     #[test]
     fn policy_names_derive_deterministically_with_prefix() {
         assert_eq!(
-            CompiledPack::policy_name_for("github.pull_request.create").as_str(),
+            CompiledPack::policy_name_for("github.pull_request.create")
+                .unwrap()
+                .as_str(),
             "pack-github_pull_request_create"
+        );
+        assert_eq!(
+            CompiledPack::policy_name_for("a_b_c").unwrap().as_str(),
+            "pack-a_b_c"
         );
         // Deterministic across repeated calls.
         assert_eq!(
-            CompiledPack::policy_name_for("a.b"),
-            CompiledPack::policy_name_for("a.b")
+            CompiledPack::policy_name_for("a.b").unwrap(),
+            CompiledPack::policy_name_for("a.b").unwrap()
+        );
+    }
+
+    #[test]
+    fn mixed_dot_underscore_capability_names_collide_at_load_time() {
+        // Per-name compilation stays total: a single pack cannot know
+        // whether its derived name is contested.
+        assert!(CompiledPack::policy_name_for("a.b").is_ok());
+        assert!(CompiledPack::policy_name_for("a_b").is_ok());
+
+        // Two capabilities differing only in dot/underscore layout derive
+        // to the same policy name; directory loading rejects the collision
+        // up front instead of deferring to engine construction.
+        let dir = tempfile::tempdir().unwrap();
+        for (file, name) in [
+            ("one.yaml", "test.capability.x"),
+            ("nested/two.yaml", "test_capability.x"),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, PACK_YAML.replace("test.capability.call", name)).unwrap();
+        }
+        let err = crate::load_pack_dir(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, PackError::AmbiguousCapabilityName(name) if name == "test.capability.x"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn request_deny_headers_baseline_is_always_present_in_documents() {
+        let compiled = compile(&pack()).unwrap();
+        assert_eq!(
+            compiled.deny_request_headers,
+            vec!["authorization".to_owned(), "proxy-authorization".to_owned()]
+        );
+        let principal =
+            vaultx_policy::Principal::parse("agent:baseline-check").expect("principal parses");
+        let document = compiled.to_policy_document(&principal);
+        assert_eq!(
+            document.request.deny_headers,
+            vec!["authorization".to_owned(), "proxy-authorization".to_owned()]
         );
     }
 

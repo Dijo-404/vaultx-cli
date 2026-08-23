@@ -479,7 +479,8 @@ fn yes_no(value: bool) -> &'static str {
 
 /// Renders the full parsed form of one policy pack for
 /// `vaultx pack inspect`. Only identifiers, hostnames, patterns, and
-/// limits appear — never secret material.
+/// limits appear — never secret material. Response `redact_fields` are
+/// exact JSON object keys (the sanitizer matches keys literally).
 #[must_use]
 pub fn render_pack_inspect(pack: &PolicyPack) -> String {
     let mut lines = vec![
