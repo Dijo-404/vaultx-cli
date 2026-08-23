@@ -650,11 +650,16 @@ impl FileSessionStore {
     fn acquire_lock(&self) -> Result<FileLock, BrokerError> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt as _;
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
             if let Some(parent) = self.lock_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|err| {
                     BrokerError::TransportFailure(format!("cannot create session dir: {err}"))
                 })?;
+                // create_dir_all applies the umask; tighten to owner-only
+                // so directory listings stay private too.
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |err| BrokerError::TransportFailure(format!("cannot chmod session dir: {err}")),
+                )?;
             }
             use std::os::unix::io::IntoRawFd as _;
             let fd = std::fs::OpenOptions::new()

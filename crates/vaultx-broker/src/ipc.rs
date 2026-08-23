@@ -375,7 +375,8 @@ impl<E: EngineHandle> BrokerServer<E> {
                             ));
                         }
                     };
-                    if live.count() >= self.config.effective_connections() {
+                    let Some(slot) = live.try_acquire(self.config.effective_connections())
+                    else {
                         // Refuse off the accept path: an inline drain
                         // would let a silent peer wedge both accepts and
                         // shutdown. The spawned task bounds its wait.
@@ -384,9 +385,8 @@ impl<E: EngineHandle> BrokerServer<E> {
                             refuse_connection(stream, &mut conn_shutdown).await;
                         });
                         continue;
-                    }
+                    };
                     let engine = Arc::clone(&self.engine);
-                    let slot = live.acquire();
                     let mut conn_shutdown = shutdown_rx.clone();
                     // A fresh receiver may have missed the shutdown send;
                     // check the current value up front.
@@ -430,10 +430,28 @@ impl LiveConnections {
         self.count.load(Ordering::SeqCst)
     }
 
-    fn acquire(self: &Arc<Self>) -> ConnectionSlot {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        ConnectionSlot {
-            owner: Arc::clone(self),
+    /// Atomically claims a slot when under `limit`; `None` at the soft
+    /// cap. The compare-and-swap closes the benign TOCTOU between
+    /// counting and claiming.
+    fn try_acquire(self: &Arc<Self>, limit: usize) -> Option<ConnectionSlot> {
+        let mut current = self.count();
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match self.count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionSlot {
+                        owner: Arc::clone(self),
+                    })
+                }
+                Err(actual) => current = actual,
+            }
         }
     }
 }
@@ -551,7 +569,7 @@ async fn write_line(
     line: &ServerLine,
 ) -> Result<(), BrokerError> {
     let mut encoded =
-        serde_json::to_vec(line).map_err(|err| BrokerError::Entropy(err.to_string()))?;
+        serde_json::to_vec(line).map_err(|err| BrokerError::Serialization(err.to_string()))?;
     encoded.push(b'\n');
     writer
         .write_all(&encoded)
