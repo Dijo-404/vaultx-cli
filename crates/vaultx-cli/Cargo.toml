@@ -16,6 +16,7 @@ rpassword = { workspace = true }
 thiserror = { workspace = true }
 vaultx-core = { path = "../vaultx-core" }
 vaultx-types = { path = "../vaultx-types" }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

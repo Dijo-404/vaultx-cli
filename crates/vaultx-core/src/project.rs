@@ -40,9 +40,12 @@ pub struct ProjectContext {
     pub(crate) device_pair_slot:
         std::sync::Mutex<Option<std::sync::Arc<vaultx_crypto::signature::SigningKeyPair>>>,
     /// Lazily-initialized per-process project vault keys (project key +
-    /// fingerprint key); see [`crate::secrets`] for the loading contract.
+    /// fingerprint key), tagged with the identity (`Arc::as_ptr`) of the
+    /// root-key provider that unwrapped them so a different provider on
+    /// the same context forces a reload instead of reusing foreign keys;
+    /// see [`crate::secrets`] for the loading contract.
     pub(crate) project_key_slot:
-        std::sync::Mutex<Option<std::sync::Arc<crate::secrets::ProjectKeys>>>,
+        std::sync::Mutex<Option<(usize, std::sync::Arc<crate::secrets::ProjectKeys>)>>,
 }
 
 impl ProjectContext {

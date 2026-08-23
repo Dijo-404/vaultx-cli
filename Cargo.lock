@@ -991,6 +991,7 @@ dependencies = [
  "thiserror",
  "vaultx-core",
  "vaultx-types",
+ "zeroize",
 ]
 
 [[package]]

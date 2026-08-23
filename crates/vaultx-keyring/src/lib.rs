@@ -147,13 +147,19 @@ impl FileKeyStore {
 
 impl WrappingKeyProvider for FileKeyStore {
     fn obtain(&self) -> CryptoResult<RootKey> {
-        if self.path.exists() {
-            return self.load();
-        }
         let mut bytes = [0u8; 32];
         OsRng.fill_bytes(&mut bytes);
-        write_private_file(&self.path, &format!("{}\n", hex::encode(bytes)))?;
-        Ok(RootKey::from_bytes(&bytes))
+        // Exclusive create: two concurrent initializations must not fork
+        // the vault by both "winning" the exists() check and truncating
+        // each other's key. Losing the race adopts the stored key.
+        match create_private_file_exclusive(&self.path, &format!("{}\n", hex::encode(bytes))) {
+            Ok(()) => Ok(RootKey::from_bytes(&bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => self.load(),
+            Err(err) => Err(CryptoError::ProviderError(format!(
+                "cannot create {}: {err}",
+                self.path.display()
+            ))),
+        }
     }
 
     fn load(&self) -> CryptoResult<RootKey> {
@@ -198,37 +204,42 @@ fn decode_key_text(text: &str, path: &Path) -> CryptoResult<[u8; 32]> {
         .map_err(|raw: Vec<u8>| corrupt(format!("expected 32 bytes, found {}", raw.len())))
 }
 
-fn write_private_file(path: &Path, contents: &str) -> CryptoResult<()> {
+/// Creates `path` with `contents` only if it does not exist yet, with
+/// owner-only permissions on unix. Fails with
+/// [`std::io::ErrorKind::AlreadyExists`] when another writer got there
+/// first.
+fn create_private_file_exclusive(path: &Path, contents: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                CryptoError::ProviderError(format!("cannot create parent dir: {err}"))
-            })?;
+            std::fs::create_dir_all(parent)?;
         }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(path)
-            .map_err(|err| CryptoError::ProviderError(format!("cannot write {path:?}: {err}")))?;
-        file.write_all(contents.as_bytes())
-            .map_err(|err| CryptoError::ProviderError(format!("cannot write {path:?}: {err}")))?;
-        file.sync_all()
-            .map_err(|err| CryptoError::ProviderError(format!("cannot flush {path:?}: {err}")))?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| {
-                CryptoError::ProviderError(format!("cannot tighten permissions on {path:?}: {err}"))
-            })?;
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
     #[cfg(not(unix))]
     {
+        // Best-effort emulation where the exclusive-create mode flag is
+        // unavailable; the check-then-write window is platform-limited.
+        if path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "key file already exists",
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(path, contents)
-            .map_err(|err| CryptoError::ProviderError(format!("cannot write {path:?}: {err}")))
     }
 }
 
@@ -347,6 +358,24 @@ mod tests {
         assert!(
             matches!(err, CryptoError::ProviderError(ref msg) if msg.contains("no root wrapping key file")),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn obtain_adopts_the_stored_key_when_creation_races() {
+        // Simulates losing the exclusive-create race: the file already
+        // holds a key, so obtain must return it rather than forking a
+        // fresh one over it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.key");
+        std::fs::write(&path, format!("{}\n", hex::encode([0x42u8; 32]))).unwrap();
+
+        let key = FileKeyStore::new(&path).obtain().expect("obtain existing");
+        assert!(key.expose(|bytes| bytes == &[0x42u8; 32]));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            hex::encode([0x42u8; 32]),
+            "stored key must be untouched"
         );
     }
 }

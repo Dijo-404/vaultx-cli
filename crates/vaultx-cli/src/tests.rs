@@ -784,6 +784,35 @@ fn secret_metadata_unknown_name_is_a_runtime_error() {
 }
 
 #[test]
+fn secret_set_validates_name_before_collecting_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    // The stdin marker would trigger a real stdin read; the invalid name
+    // must fail before any plaintext is collected.
+    match dispatch(&cli(
+        root,
+        Command::Secret {
+            command: SecretCommand::Set {
+                name: "lower-case".into(),
+                stdin: Some("-".into()),
+                brokered: false,
+                injection: None,
+                provider: None,
+                env: None,
+                message: None,
+            },
+        },
+    )) {
+        Err(CliError::Runtime(CoreError::InvalidVariableName(name))) => {
+            assert_eq!(name, "lower-case")
+        }
+        other => panic!("expected InvalidVariableName, got {other:?}"),
+    }
+}
+
+#[test]
 fn secret_metadata_never_shows_a_value_for_existing_secrets() {
     // Drives set via the service layer (stdin is a process concern; the
     // end-to-end stdin path is covered by tests/secret_cli.rs).

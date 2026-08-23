@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use vaultx_core::{BrokeredBinding, CommitSummary, CoreError, SecretString, VaultxServices};
 use vaultx_types::model::{InjectionTemplateId, VariableKind};
-use vaultx_types::{CommitId, CredentialRef, ProviderName};
+use vaultx_types::{CommitId, CredentialRef, ProviderName, VariableName};
 
 /// Default number of entries printed by `vaultx log` when `--limit` is
 /// not given.
@@ -460,18 +460,13 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
                 env,
                 message: _,
             } => with_open(&cli.project, |s| {
-                cmd_secret_rotate(
-                    s,
-                    name,
-                    stdin.as_deref(),
-                    env.as_deref().unwrap_or(DEFAULT_SECRET_ENV),
-                )
+                cmd_secret_rotate(s, name, stdin.as_deref(), env.as_deref())
             }),
             SecretCommand::Metadata { name, env } => with_open(&cli.project, |s| {
-                cmd_secret_metadata(s, name, env.as_deref().unwrap_or(DEFAULT_SECRET_ENV))
+                cmd_secret_metadata(s, name, env.as_deref())
             }),
             SecretCommand::Destroy { name, yes, env } => with_open(&cli.project, |s| {
-                cmd_secret_destroy(s, name, *yes, env.as_deref().unwrap_or(DEFAULT_SECRET_ENV))
+                cmd_secret_destroy(s, name, *yes, env.as_deref())
             }),
         },
 
@@ -788,6 +783,10 @@ fn cmd_secret_set(
     provider: Option<&str>,
     env: Option<&str>,
 ) -> Result<String, CliError> {
+    // Validate the name (and flag pairing) before any prompting so a
+    // typo never collects a password it cannot use.
+    VariableName::parse(name)
+        .map_err(|_| CliError::Runtime(CoreError::InvalidVariableName(name.to_owned())))?;
     let (kind, binding) = build_secret_binding(name, brokered, injection, provider)?;
     let plaintext = acquire_plaintext(stdin_flag)?;
     let revision = services.secrets().set_secret(
@@ -804,19 +803,24 @@ fn cmd_secret_rotate(
     services: &VaultxServices,
     name: &str,
     stdin_flag: Option<&str>,
-    env: &str,
+    env: Option<&str>,
 ) -> Result<String, CliError> {
     let plaintext = acquire_plaintext(stdin_flag)?;
-    let revision = services.secrets().rotate_secret(name, &plaintext, env)?;
+    let revision =
+        services
+            .secrets()
+            .rotate_secret(name, &plaintext, env.unwrap_or(DEFAULT_SECRET_ENV))?;
     Ok(format!("rotated {name} ({revision})"))
 }
 
 fn cmd_secret_metadata(
     services: &VaultxServices,
     name: &str,
-    env: &str,
+    env: Option<&str>,
 ) -> Result<String, CliError> {
-    let metadata = services.secrets().secret_metadata(name, env)?;
+    let metadata = services
+        .secrets()
+        .secret_metadata(name, env.unwrap_or(DEFAULT_SECRET_ENV))?;
     Ok(crate::output::render_secret_metadata(&metadata))
 }
 
@@ -824,7 +828,7 @@ fn cmd_secret_destroy(
     services: &VaultxServices,
     name: &str,
     yes: bool,
-    env: &str,
+    env: Option<&str>,
 ) -> Result<String, CliError> {
     if !yes {
         return Err(CliError::Usage(
@@ -833,7 +837,9 @@ fn cmd_secret_destroy(
                 .into(),
         ));
     }
-    services.secrets().destroy_secret(name, env)?;
+    services
+        .secrets()
+        .destroy_secret(name, env.unwrap_or(DEFAULT_SECRET_ENV))?;
     Ok(format!(
         "destroyed {name}: its value and recovery material are irreversibly gone"
     ))
@@ -896,6 +902,7 @@ fn acquire_plaintext(stdin_flag: Option<&str>) -> Result<SecretString, CliError>
 
 fn read_stdin_plaintext() -> Result<SecretString, CliError> {
     use std::io::Read as _;
+    use zeroize::Zeroize as _;
     let mut raw = String::new();
     std::io::stdin()
         .lock()
@@ -903,22 +910,34 @@ fn read_stdin_plaintext() -> Result<SecretString, CliError> {
         .map_err(|err| CliError::Usage(format!("cannot read stdin: {err}")))?;
     // Strip exactly one trailing newline so `echo pw | vaultx ...` stores
     // the value without the echo's line terminator.
-    let trimmed = raw
+    let trimmed_len = raw
         .strip_suffix("\r\n")
         .or_else(|| raw.strip_suffix('\n'))
-        .unwrap_or(&raw);
-    Ok(SecretString::new(trimmed.to_owned()))
+        .map_or(raw.len(), str::len);
+    let secret = SecretString::new(raw[..trimmed_len].to_owned());
+    // Scrub the unencrypted intermediate before it drops.
+    raw.zeroize();
+    Ok(secret)
 }
 
 fn prompt_plaintext_twice() -> Result<SecretString, CliError> {
+    use zeroize::Zeroize as _;
     let first = rpassword::prompt_password("Enter secret value: ")
         .map_err(|err| CliError::Usage(format!("cannot read password: {err}")))?;
-    let second = rpassword::prompt_password("Confirm secret value: ")
+    let mut confirmed = rpassword::prompt_password("Confirm secret value: ")
         .map_err(|err| CliError::Usage(format!("cannot read password: {err}")))?;
-    if first != second {
-        return Err(CliError::Usage("Passwords do not match".into()));
+    if first == confirmed {
+        let secret = SecretString::new(first);
+        // The confirmation copy never outlives this function unscrubbed,
+        // on either branch.
+        confirmed.zeroize();
+        Ok(secret)
+    } else {
+        let mut first = first;
+        first.zeroize();
+        confirmed.zeroize();
+        Err(CliError::Usage("Passwords do not match".into()))
     }
-    Ok(SecretString::new(first))
 }
 
 /// Parses an injection-template flag value (kebab-case, matching the

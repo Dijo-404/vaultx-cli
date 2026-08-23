@@ -489,31 +489,60 @@ impl<'a> SecretService<'a> {
 
     // ---- key hierarchy ----
 
+    /// Returns the cached project keys, but only when they were unwrapped
+    /// by this service's own root-key provider (identity compared via
+    /// `Arc::as_ptr`). A different provider installed on the same context
+    /// forces a reload instead of silently reusing foreign keys.
     fn cached_keys(&self) -> CoreResult<Arc<ProjectKeys>> {
+        let provider_id = Arc::as_ptr(&self.root_store) as *const () as usize;
         let mut slot = self
             .ctx
             .project_key_slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(keys) = slot.as_ref() {
-            return Ok(Arc::clone(keys));
+        if let Some((cached_provider, keys)) = slot.as_ref() {
+            if *cached_provider == provider_id {
+                return Ok(Arc::clone(keys));
+            }
         }
         let keys = Arc::new(self.load_or_init_keys()?);
-        *slot = Some(Arc::clone(&keys));
+        *slot = Some((provider_id, Arc::clone(&keys)));
         Ok(keys)
     }
 
-    /// Loads `.vaultx/keys/project.json`, unwrapping it under the root
-    /// key; generates and persists a fresh bundle when absent. A wrong or
-    /// unusable root key errors out without touching the stored file.
     fn load_or_init_keys(&self) -> CoreResult<ProjectKeys> {
         let root = self.root_store.obtain()?;
         let path = self.keys_path();
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return self.generate_and_store_keys(&root);
+        if let Some(keys) = self.read_project_keys(&root)? {
+            return Ok(keys);
+        }
+        // Absent: mint a candidate bundle and publish it without
+        // clobbering a racing writer's bundle.
+        let (keys, stored) = Self::new_key_bundle(&root)?;
+        let bytes = serde_json::to_vec_pretty(&stored)?;
+        match publish_file_no_clobber(&path, &bytes) {
+            Ok(()) => Ok(keys),
+            // Lost the race: adopt the winner's bundle — it is wrapped
+            // under the same shared root, so it unwraps cleanly.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.read_project_keys(&root)?.ok_or_else(|| {
+                    CoreError::ProjectKey("key bundle vanished between create and read".to_owned())
+                })
             }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Reads and unwraps `.vaultx/keys/project.json`; `Ok(None)` when the
+    /// file does not exist. Malformed material errors as
+    /// [`CoreError::ProjectKey`] and never overwrites the stored file.
+    fn read_project_keys(
+        &self,
+        root: &vaultx_crypto::envelope::RootKey,
+    ) -> CoreResult<Option<ProjectKeys>> {
+        let text = match std::fs::read_to_string(self.keys_path()) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
         let stored: StoredProjectKeys = serde_json::from_str(&text).map_err(|err| {
@@ -525,56 +554,55 @@ impl<'a> SecretService<'a> {
                 stored.format_version
             )));
         }
-        let project = envelope::unwrap_project_key(
-            &root,
-            &decode_wrapped(&stored.project_nonce_hex, &stored.project_ciphertext_hex)?,
-        )
-        .map_err(|_| {
+        let project_wrapped = decode_stored_wrapped(
+            &stored.project_nonce_hex,
+            &stored.project_ciphertext_hex,
+            "project key",
+        )?;
+        let project = envelope::unwrap_project_key(root, &project_wrapped).map_err(|_| {
             CoreError::ProjectKey(
                 "cannot unwrap the project key with the configured root key".to_owned(),
             )
         })?;
-        let fingerprint_key = envelope::unwrap_fingerprint_key(
-            &project,
-            &decode_wrapped(
-                &stored.fingerprint_nonce_hex,
-                &stored.fingerprint_ciphertext_hex,
-            )?,
-        )
-        .map_err(|_| {
-            CoreError::ProjectKey(
-                "cannot unwrap the fingerprint key with the project key".to_owned(),
-            )
-        })?;
-        Ok(ProjectKeys {
+        let fingerprint_wrapped = decode_stored_wrapped(
+            &stored.fingerprint_nonce_hex,
+            &stored.fingerprint_ciphertext_hex,
+            "fingerprint key",
+        )?;
+        let fingerprint_key = envelope::unwrap_fingerprint_key(&project, &fingerprint_wrapped)
+            .map_err(|_| {
+                CoreError::ProjectKey(
+                    "cannot unwrap the fingerprint key with the project key".to_owned(),
+                )
+            })?;
+        Ok(Some(ProjectKeys {
             project,
             fingerprint: fingerprint_key,
-        })
+        }))
     }
 
-    fn generate_and_store_keys(
-        &self,
+    /// Fresh random project/fingerprint pair together with its persisted
+    /// (wrapped) form. Does not touch the filesystem.
+    fn new_key_bundle(
         root: &vaultx_crypto::envelope::RootKey,
-    ) -> CoreResult<ProjectKeys> {
+    ) -> CoreResult<(ProjectKeys, StoredProjectKeys)> {
         let project = ProjectKey::generate();
         let fpk = FingerprintKey::generate();
         let wrapped_project = envelope::wrap_project_key(root, &project)?;
         let wrapped_fpk = envelope::wrap_fingerprint_key(&project, &fpk)?;
-        let stored = StoredProjectKeys {
-            format_version: FORMAT_VERSION,
-            project_nonce_hex: hex::encode(wrapped_project.nonce.as_bytes()),
-            project_ciphertext_hex: hex::encode(&wrapped_project.ciphertext),
-            fingerprint_nonce_hex: hex::encode(wrapped_fpk.nonce.as_bytes()),
-            fingerprint_ciphertext_hex: hex::encode(&wrapped_fpk.ciphertext),
-        };
-        write_atomic(
-            &self.keys_path(),
-            serde_json::to_vec_pretty(&stored)?.as_slice(),
-        )?;
-        Ok(ProjectKeys {
-            project,
-            fingerprint: fpk,
-        })
+        Ok((
+            ProjectKeys {
+                project,
+                fingerprint: fpk,
+            },
+            StoredProjectKeys {
+                format_version: FORMAT_VERSION,
+                project_nonce_hex: hex::encode(wrapped_project.nonce.as_bytes()),
+                project_ciphertext_hex: hex::encode(&wrapped_project.ciphertext),
+                fingerprint_nonce_hex: hex::encode(wrapped_fpk.nonce.as_bytes()),
+                fingerprint_ciphertext_hex: hex::encode(&wrapped_fpk.ciphertext),
+            },
+        ))
     }
 
     // ---- revision plumbing ----
@@ -717,7 +745,13 @@ impl<'a> SecretService<'a> {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path)?;
-                let record: EncryptedSecretRevision = serde_json::from_str(&text)?;
+                let record: EncryptedSecretRevision =
+                    serde_json::from_str(&text).map_err(|err| {
+                        CoreError::Json(serde_json::Error::io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("corrupt secret record {}: {err}", path.display()),
+                        )))
+                    })?;
                 if env.is_none_or(|wanted| wanted == &record.environment) {
                     records.push(record);
                 }
@@ -786,8 +820,8 @@ fn validate_binding(
     }
 }
 
-fn plaintext_bytes(plaintext: &SecretString) -> CoreResult<Vec<u8>> {
-    let bytes = plaintext.expose_str(|value| value.as_bytes().to_vec());
+fn plaintext_bytes(plaintext: &SecretString) -> CoreResult<Zeroizing<Vec<u8>>> {
+    let bytes = Zeroizing::new(plaintext.expose_str(|value| value.as_bytes().to_vec()));
     if bytes.is_empty() {
         Err(CoreError::EmptySecretValue)
     } else {
@@ -851,12 +885,18 @@ fn encode_wrapped(wrapped: &WrappedKey) -> String {
 }
 
 /// Decodes a wrapped key from the `(nonce_hex, ciphertext_hex)` field
-/// pair used by `.vaultx/keys/project.json`.
-fn decode_wrapped(nonce_hex: &str, ciphertext_hex: &str) -> CryptoResult<WrappedKey> {
-    Ok(WrappedKey {
-        nonce: decode_nonce(nonce_hex)?,
-        ciphertext: decode_hex(ciphertext_hex)?,
-    })
+/// pair used by `.vaultx/keys/project.json`, mapping malformed material
+/// onto [`CoreError::ProjectKey`] (not a crypto failure).
+fn decode_stored_wrapped(
+    nonce_hex: &str,
+    ciphertext_hex: &str,
+    field: &str,
+) -> CoreResult<WrappedKey> {
+    let nonce = decode_nonce(nonce_hex)
+        .map_err(|_| CoreError::ProjectKey(format!("malformed `{field}` nonce")))?;
+    let ciphertext = hex::decode(ciphertext_hex.trim())
+        .map_err(|_| CoreError::ProjectKey(format!("malformed `{field}` ciphertext")))?;
+    Ok(WrappedKey { nonce, ciphertext })
 }
 
 /// Decodes a wrapped key from the hex-encoded JSON form used inside
@@ -878,7 +918,9 @@ fn decode_hex(hex_str: &str) -> CryptoResult<Vec<u8>> {
     hex::decode(hex_str.trim()).map_err(|_| CryptoError::DecryptionFailed)
 }
 
-/// Writes `bytes` to `path` atomically (temp file + rename after fsync).
+/// Writes `bytes` to `path` atomically (temp file + rename after fsync),
+/// with owner-only permissions on unix (defense-in-depth parity with the
+/// root key file; contents are ciphertext or wrapped keys).
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -891,11 +933,51 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             .map_or(0, |d| d.as_nanos())
     ));
     {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp_path)?
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::File::create(&temp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
     std::fs::rename(&temp_path, path)
+}
+
+/// Publishes `bytes` at `path` only if `path` does not exist yet, with
+/// owner-only permissions on unix. The temp-then-hard-link sequence is
+/// atomic against concurrent publishers: losing a race fails with
+/// [`std::io::ErrorKind::AlreadyExists`] instead of clobbering the
+/// winner's bytes.
+fn publish_file_no_clobber(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp_path = path.with_file_name(format!(
+        ".tmp-new-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    write_atomic(&temp_path, bytes)?;
+    match std::fs::hard_link(&temp_path, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1495,6 +1577,77 @@ mod tests {
         assert!(!blob.is_empty(), "objects must exist after commit");
         let needle = CANARY.as_bytes();
         assert!(!blob.windows(needle.len()).any(|w| w == needle));
+    }
+
+    #[test]
+    fn cache_is_keyed_to_the_provider_that_populated_it() {
+        let fx = fixture();
+        let first = service(&fx);
+        first
+            .set_secret("K", &secret("v"), VariableKind::Secret, "dev", None)
+            .unwrap();
+
+        // A second provider with unrelated root material over the SAME
+        // context must not silently reuse the first provider's cached
+        // keys; it has to reload and then fails loudly.
+        let other_dir = tempfile::tempdir().unwrap();
+        let second = SecretService::with_root_store(
+            &fx.ctx,
+            Arc::new(FileKeyStore::new(other_dir.path().join("root.key"))),
+        );
+        match second.reveal_secret("K", "dev") {
+            Err(CoreError::ProjectKey(_)) => {}
+            other => panic!("expected ProjectKey error, got {other:?}"),
+        }
+
+        // The original provider still works off its cache entry.
+        assert!(first.reveal_secret("K", "dev").is_ok());
+    }
+
+    #[test]
+    fn malformed_project_key_material_errors_as_project_key() {
+        let fx = fixture();
+        service(&fx)
+            .set_secret("K", &secret("v"), VariableKind::Secret, "dev", None)
+            .unwrap();
+        let path = fx.ctx.vault_dir().join(KEYS_DIR_NAME).join("project.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["project_ciphertext_hex"] = serde_json::json!("zz-not-hex");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        // Fresh provider identity forces a reload from disk.
+        let svc = service(&fx);
+        match svc.reveal_secret("K", "dev") {
+            Err(CoreError::ProjectKey(reason)) => {
+                assert!(reason.contains("malformed"), "got: {reason}");
+            }
+            other => panic!("expected ProjectKey error, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revision_records_and_project_keys_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture();
+        service(&fx)
+            .set_secret("PERMS", &secret("v"), VariableKind::Secret, "dev", None)
+            .unwrap();
+
+        let metadata = service(&fx).secret_metadata("PERMS", "dev").unwrap();
+        let record = fx
+            .ctx
+            .vault_dir()
+            .join(SECRETS_DIR_NAME)
+            .join(metadata.secret_id.as_str())
+            .join(format!("{}.json", metadata.current_revision));
+        let record_mode = std::fs::metadata(record).unwrap().permissions().mode();
+        assert_eq!(record_mode & 0o777, 0o600);
+
+        let keys = fx.ctx.vault_dir().join(KEYS_DIR_NAME).join("project.json");
+        let keys_mode = std::fs::metadata(keys).unwrap().permissions().mode();
+        assert_eq!(keys_mode & 0o777, 0o600);
     }
 
     fn collect_bytes(dir: &Path, out: &mut Vec<u8>) {
