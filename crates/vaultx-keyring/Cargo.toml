@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+hex = { workspace = true }
+rand_core = { workspace = true }
+vaultx-crypto = { path = "../vaultx-crypto" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

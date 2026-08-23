@@ -206,6 +206,32 @@ pub fn unwrap_fingerprint_key(
     })
 }
 
+/// Encrypts `plaintext` directly under a per-revision [`Dek`].
+///
+/// Convenience wrapper so callers never juggle the `Dek → AeadKey`
+/// conversion themselves; see [`crate::aead::encrypt`] for nonce/AAD
+/// semantics.
+///
+/// # Errors
+/// Propagates AEAD failures.
+pub fn encrypt_with_dek(dek: &Dek, plaintext: &[u8], aad: &[u8]) -> CryptoResult<CiphertextBundle> {
+    dek.expose(|bytes| crate::aead::encrypt(&AeadKey::from_bytes(bytes), plaintext, aad))
+}
+
+/// Decrypts `bundle` under a per-revision [`Dek`], verifying it against
+/// `aad`.
+///
+/// # Errors
+/// [`CryptoError::DecryptionFailed`] on any authentication mismatch; see
+/// [`crate::aead::decrypt`].
+pub fn decrypt_with_dek(
+    dek: &Dek,
+    bundle: &CiphertextBundle,
+    aad: &[u8],
+) -> CryptoResult<Zeroizing<Vec<u8>>> {
+    dek.expose(|bytes| crate::aead::decrypt(&AeadKey::from_bytes(bytes), bundle, aad))
+}
+
 fn wrap_child(
     kek: &[u8; 32],
     child: &[u8; 32],
@@ -323,6 +349,22 @@ mod tests {
         let err = unwrap_dek(&project_key, &wrapped_fp)
             .expect_err("fingerprint blob must not unwrap as dek");
         assert!(matches!(err, CryptoError::UnwrapFailed));
+    }
+
+    #[test]
+    fn dek_encrypt_decrypt_round_trip_and_rejects_wrong_aad() {
+        let dek = Dek::generate();
+        let aad = b"vaultx:secret-revision:v1";
+        let bundle = encrypt_with_dek(&dek, b"revision payload", aad).expect("encrypt");
+        assert_ne!(bundle.ciphertext, b"revision payload".to_vec());
+        let recovered = decrypt_with_dek(&dek, &bundle, aad).expect("decrypt");
+        assert_eq!(recovered.as_slice(), b"revision payload".as_slice());
+
+        let err = decrypt_with_dek(&dek, &bundle, b"other-aad").expect_err("wrong aad must fail");
+        assert!(matches!(err, CryptoError::DecryptionFailed));
+
+        let other = decrypt_with_dek(&Dek::generate(), &bundle, aad);
+        assert!(matches!(other, Err(CryptoError::DecryptionFailed)));
     }
 
     #[test]
