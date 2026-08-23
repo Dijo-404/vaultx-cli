@@ -8,6 +8,7 @@
 //! ([`subtle`]) so token guessing cannot be timed.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use serde::de::Error as _;
@@ -105,6 +106,10 @@ pub struct AgentSessionRecord {
     pub token_hash: TokenHash,
     /// Revocation flag; revoked sessions fail validation forever.
     pub revoked: bool,
+    /// Optional unix-seconds expiry. Expired sessions validate as
+    /// revoked; `None` means no expiry.
+    #[serde(default)]
+    pub expires_at_secs: Option<u64>,
 }
 
 /// Session authentication boundary used by the broker engine.
@@ -125,13 +130,25 @@ pub trait SessionStore: Send + Sync {
         environment: &EnvironmentId,
     ) -> Result<(SessionId, String), BrokerError>;
 
+    /// Creates a session bound to an optional time-to-live. Expired
+    /// sessions validate exactly like revoked ones.
+    ///
+    /// # Errors
+    /// Implementation-defined (entropy failure, persistence failure).
+    fn create_expiring(
+        &self,
+        agent: &AgentId,
+        environment: &EnvironmentId,
+        ttl_secs: Option<u64>,
+    ) -> Result<(SessionId, String), BrokerError>;
+
     /// Validates a presented raw token and returns the live session
     /// record it belongs to.
     ///
     /// # Errors
     /// Returns [`BrokerError::InvalidSession`] when no session matches or
     /// the verifier differs, and [`BrokerError::SessionRevoked`] when the
-    /// matched session was revoked.
+    /// matched session was revoked or has expired.
     fn validate(&self, raw_token: &str) -> Result<AgentSessionRecord, BrokerError>;
 
     /// Revokes a session by id. Revoked sessions stay stored (audit trail
@@ -140,6 +157,33 @@ pub trait SessionStore: Send + Sync {
     /// # Errors
     /// Returns [`BrokerError::InvalidSession`] when the id is unknown.
     fn revoke(&self, session_id: &SessionId) -> Result<(), BrokerError>;
+
+    /// Lists stored sessions belonging to `agent`, oldest first. Only
+    /// verifier hashes and metadata are returned — never raw tokens.
+    ///
+    /// # Errors
+    /// Implementation-defined (persistence failure).
+    fn list_for_agent(&self, agent: &AgentId) -> Result<Vec<AgentSessionRecord>, BrokerError>;
+}
+
+/// True when `record` can no longer validate: revoked or past its expiry.
+fn is_dead(record: &AgentSessionRecord, clock: &std::sync::atomic::AtomicU64) -> bool {
+    record.revoked
+        || record
+            .expires_at_secs
+            .is_some_and(|expiry| expiry <= now_secs(clock))
+}
+
+/// Reads the effective unix-seconds clock for one store instance.
+fn now_secs(clock: &std::sync::atomic::AtomicU64) -> u64 {
+    let overridden = clock.load(std::sync::atomic::Ordering::Relaxed);
+    if overridden != 0 {
+        return overridden;
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +206,9 @@ struct InMemoryState {
 #[derive(Debug, Default)]
 pub struct InMemorySessionStore {
     state: Mutex<InMemoryState>,
+    /// Test-only wall-clock override (unix seconds; `0` = use the real
+    /// clock). Per-instance so parallel tests never race each other.
+    clock_override: std::sync::atomic::AtomicU64,
 }
 
 impl InMemorySessionStore {
@@ -169,6 +216,13 @@ impl InMemorySessionStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test-only: pins the wall clock used for session-expiry decisions.
+    #[doc(hidden)]
+    pub fn set_clock_for_tests(&self, unix_secs: u64) {
+        self.clock_override
+            .store(unix_secs, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, InMemoryState> {
@@ -184,37 +238,16 @@ impl SessionStore for InMemorySessionStore {
         agent: &AgentId,
         environment: &EnvironmentId,
     ) -> Result<(SessionId, String), BrokerError> {
-        // Session id: `sess_` + 16 random bytes hex (fits the SessionId
-        // grammar: lowercase hex content, well under the 64-char cap).
-        let session_id = SessionId::parse(&format!("sess_{}", random_hex(SESSION_ID_BYTES)?))
-            .map_err(|_| {
-                BrokerError::Entropy("generated session id failed validation".to_owned())
-            })?;
-        // Raw token: 32 random bytes hex, independent of the id. Only its
-        // SHA-256 verifier is stored.
-        let raw_token = random_hex(SESSION_TOKEN_BYTES)?;
-        let token_hash = TokenHash::from_token(&raw_token);
+        Self::create_impl(self, agent, environment, None)
+    }
 
-        let mut state = self.lock();
-        if state.by_hash.contains_key(&token_hash) {
-            // Astronomically unlikely collision; refuse rather than
-            // silently shadowing an existing session.
-            return Err(BrokerError::Entropy(
-                "session token verifier collision".to_owned(),
-            ));
-        }
-        state.sessions.insert(
-            session_id.clone(),
-            AgentSessionRecord {
-                session_id: session_id.clone(),
-                agent: agent.clone(),
-                environment: environment.clone(),
-                token_hash,
-                revoked: false,
-            },
-        );
-        state.by_hash.insert(token_hash, session_id.clone());
-        Ok((session_id, raw_token))
+    fn create_expiring(
+        &self,
+        agent: &AgentId,
+        environment: &EnvironmentId,
+        ttl_secs: Option<u64>,
+    ) -> Result<(SessionId, String), BrokerError> {
+        Self::create_impl(self, agent, environment, ttl_secs)
     }
 
     fn validate(&self, raw_token: &str) -> Result<AgentSessionRecord, BrokerError> {
@@ -236,7 +269,9 @@ impl SessionStore for InMemorySessionStore {
         if !record.token_hash.ct_eq(&computed) {
             return Err(BrokerError::InvalidSession);
         }
-        if record.revoked {
+        // Expired sessions are indistinguishable from revoked ones — the
+        // distinction would only help an attacker holding a stale token.
+        if is_dead(&record, &self.clock_override) {
             return Err(BrokerError::SessionRevoked);
         }
         Ok(record)
@@ -250,6 +285,64 @@ impl SessionStore for InMemorySessionStore {
             .ok_or(BrokerError::InvalidSession)?;
         record.revoked = true;
         Ok(())
+    }
+
+    fn list_for_agent(&self, agent: &AgentId) -> Result<Vec<AgentSessionRecord>, BrokerError> {
+        let state = self.lock();
+        let mut records: Vec<AgentSessionRecord> = state
+            .sessions
+            .values()
+            .filter(|record| record.agent == *agent)
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        Ok(records)
+    }
+}
+
+impl InMemorySessionStore {
+    /// Shared creation path for [`SessionStore::create`] and
+    /// [`SessionStore::create_expiring`].
+    fn create_impl(
+        &self,
+        agent: &AgentId,
+        environment: &EnvironmentId,
+        ttl_secs: Option<u64>,
+    ) -> Result<(SessionId, String), BrokerError> {
+        // Session id: `sess_` + 16 random bytes hex (fits the SessionId
+        // grammar: lowercase hex content, well under the 64-char cap).
+        let session_id = SessionId::parse(&format!("sess_{}", random_hex(SESSION_ID_BYTES)?))
+            .map_err(|_| {
+                BrokerError::Entropy("generated session id failed validation".to_owned())
+            })?;
+        // Raw token: 32 random bytes hex, independent of the id. Only its
+        // SHA-256 verifier is stored.
+        let raw_token = random_hex(SESSION_TOKEN_BYTES)?;
+        let token_hash = TokenHash::from_token(&raw_token);
+        let expires_at_secs =
+            ttl_secs.map(|ttl| now_secs(&self.clock_override).saturating_add(ttl));
+
+        let mut state = self.lock();
+        if state.by_hash.contains_key(&token_hash) {
+            // Astronomically unlikely collision; refuse rather than
+            // silently shadowing an existing session.
+            return Err(BrokerError::Entropy(
+                "session token verifier collision".to_owned(),
+            ));
+        }
+        state.sessions.insert(
+            session_id.clone(),
+            AgentSessionRecord {
+                session_id: session_id.clone(),
+                agent: agent.clone(),
+                environment: environment.clone(),
+                token_hash,
+                revoked: false,
+                expires_at_secs,
+            },
+        );
+        state.by_hash.insert(token_hash, session_id.clone());
+        Ok((session_id, raw_token))
     }
 }
 
@@ -340,6 +433,47 @@ mod tests {
     }
 
     #[test]
+    fn expired_session_validates_as_revoked() {
+        let store = InMemorySessionStore::new();
+        store.set_clock_for_tests(1_000);
+        let (_, raw_token) = store
+            .create_expiring(&agent(), &environment(), Some(60))
+            .unwrap();
+        assert!(store.validate(&raw_token).is_ok());
+
+        // Past expiry: same dedicated error class as revocation.
+        store.set_clock_for_tests(1_061);
+        assert!(matches!(
+            store.validate(&raw_token),
+            Err(BrokerError::SessionRevoked)
+        ));
+    }
+
+    #[test]
+    fn list_for_agent_scopes_and_never_leaks_raw_tokens() {
+        let store = InMemorySessionStore::new();
+        let (first, token_one) = store.create(&agent(), &environment()).unwrap();
+        let (second, _) = store
+            .create(&AgentId::parse("agent_other").unwrap(), &environment())
+            .unwrap();
+
+        let mine = store.list_for_agent(&agent()).unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].session_id, first);
+        assert!(store
+            .list_for_agent(&AgentId::parse("agent_other").unwrap())
+            .is_ok());
+        let _ = second;
+
+        // Raw tokens never appear in listed records: every stored field is
+        // the 32-byte verifier.
+        for record in &mine {
+            assert_ne!(hex::encode(record.token_hash.as_bytes()), token_one);
+            assert_eq!(record.token_hash.as_bytes().len(), 32);
+        }
+    }
+
+    #[test]
     fn raw_tokens_are_distinct_across_sessions_and_only_hashes_stored() {
         let store = InMemorySessionStore::new();
         let (_, first) = store.create(&agent(), &environment()).unwrap();
@@ -393,5 +527,266 @@ mod tests {
         let decoded: AgentSessionRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, record);
         assert!(!encoded.contains("\"revoked\":true"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File-backed store (cross-process sessions)
+// ---------------------------------------------------------------------------
+
+/// Persistent [`SessionStore`] backed by a single JSON file holding
+/// verifier hashes and identity metadata only — raw tokens are returned
+/// exactly once at creation and never written.
+///
+/// The file is created with `0600` permissions; loading refuses files
+/// whose mode grants group/other access rather than silently reading a
+/// leaked store. Every mutation rewrites the whole file atomically
+/// (tempfile + rename within the same directory).
+pub struct FileSessionStore {
+    path: PathBuf,
+    state: Mutex<InMemorySessionStore>,
+}
+
+impl std::fmt::Debug for FileSessionStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSessionStore")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileSessionStore {
+    /// Opens (or creates) the store at `path`.
+    ///
+    /// # Errors
+    /// Propagates I/O failures, JSON corruption, and permission-refusal
+    /// ([`BrokerError::TransportFailure`]) when the existing file is
+    /// readable by group/other.
+    pub fn open(path: PathBuf) -> Result<Self, BrokerError> {
+        let state = if path.exists() {
+            Self::check_mode(&path)?;
+            let text = std::fs::read_to_string(&path).map_err(|err| {
+                BrokerError::TransportFailure(format!("cannot read session store: {err}"))
+            })?;
+            let records: Vec<AgentSessionRecord> = serde_json::from_str(&text).map_err(|err| {
+                BrokerError::TransportFailure(format!("corrupt session store: {err}"))
+            })?;
+            let inner = InMemorySessionStore::new();
+            {
+                let mut state = inner.lock();
+                for record in records {
+                    state
+                        .by_hash
+                        .insert(record.token_hash, record.session_id.clone());
+                    state.sessions.insert(record.session_id.clone(), record);
+                }
+            }
+            inner
+        } else {
+            InMemorySessionStore::new()
+        };
+        Ok(Self {
+            path,
+            state: Mutex::new(state),
+        })
+    }
+
+    /// Refuses stores whose unix mode grants group/other any access.
+    fn check_mode(path: &Path) -> Result<(), BrokerError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(path)
+                .map_err(|err| {
+                    BrokerError::TransportFailure(format!("cannot stat session store: {err}"))
+                })?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(BrokerError::TransportFailure(
+                    "session store permissions are too open; refusing to load".to_owned(),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+        Ok(())
+    }
+
+    /// Atomically persists the current records.
+    fn persist(&self) -> Result<(), BrokerError> {
+        let mut records: Vec<AgentSessionRecord> = self.list_all_internal()?;
+        records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        let text = serde_json::to_string_pretty(&records)
+            .map_err(|err| BrokerError::Entropy(err.to_string()))?;
+
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                BrokerError::TransportFailure(format!("cannot create session dir: {err}"))
+            })?;
+        }
+        // Write-through-temp-then-rename keeps readers from observing a
+        // torn file; the temp inherits restrictive mode via OpenOptions.
+        let tmp = self.path.with_extension("json.tmp");
+        {
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options.open(&tmp).map_err(|err| {
+                BrokerError::TransportFailure(format!("cannot write session store: {err}"))
+            })?;
+            std::io::Write::write_all(&mut file, text.as_bytes()).map_err(|err| {
+                BrokerError::TransportFailure(format!("cannot write session store: {err}"))
+            })?;
+        }
+        std::fs::rename(&tmp, &self.path).map_err(|err| {
+            BrokerError::TransportFailure(format!("cannot finalize session store: {err}"))
+        })?;
+        Ok(())
+    }
+
+    /// Snapshot of every stored record (internal helper).
+    fn list_all_internal(&self) -> Result<Vec<AgentSessionRecord>, BrokerError> {
+        let guard = self.lock();
+        let inner = guard.lock();
+        Ok(inner.sessions.values().cloned().collect())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, InMemorySessionStore> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Test-only: pins the wall clock of the wrapped in-memory store.
+    #[doc(hidden)]
+    pub fn set_clock_for_tests(&self, unix_secs: u64) {
+        self.lock().set_clock_for_tests(unix_secs);
+    }
+}
+
+impl SessionStore for FileSessionStore {
+    fn create(
+        &self,
+        agent: &AgentId,
+        environment: &EnvironmentId,
+    ) -> Result<(SessionId, String), BrokerError> {
+        let created = self.lock().create(agent, environment)?;
+        self.persist()?;
+        Ok(created)
+    }
+
+    fn create_expiring(
+        &self,
+        agent: &AgentId,
+        environment: &EnvironmentId,
+        ttl_secs: Option<u64>,
+    ) -> Result<(SessionId, String), BrokerError> {
+        let created = self.lock().create_expiring(agent, environment, ttl_secs)?;
+        self.persist()?;
+        Ok(created)
+    }
+
+    fn validate(&self, raw_token: &str) -> Result<AgentSessionRecord, BrokerError> {
+        self.lock().validate(raw_token)
+    }
+
+    fn revoke(&self, session_id: &SessionId) -> Result<(), BrokerError> {
+        self.lock().revoke(session_id)?;
+        self.persist()
+    }
+
+    fn list_for_agent(&self, agent: &AgentId) -> Result<Vec<AgentSessionRecord>, BrokerError> {
+        self.lock().list_for_agent(agent)
+    }
+}
+
+#[cfg(test)]
+mod file_store_tests {
+    use super::*;
+
+    fn agent() -> AgentId {
+        AgentId::parse("agent_coding").unwrap()
+    }
+
+    fn environment() -> EnvironmentId {
+        EnvironmentId::parse("env_development").unwrap()
+    }
+
+    #[test]
+    fn file_store_round_trips_across_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+
+        let store = FileSessionStore::open(path.clone()).unwrap();
+        let (session_id, raw_token) = store.create(&agent(), &environment()).unwrap();
+        drop(store);
+
+        let reopened = FileSessionStore::open(path).unwrap();
+        let record = reopened.validate(&raw_token).unwrap();
+        assert_eq!(record.session_id, session_id);
+        assert_eq!(record.agent, agent());
+
+        reopened.revoke(&session_id).unwrap();
+        assert!(matches!(
+            reopened.validate(&raw_token),
+            Err(BrokerError::SessionRevoked)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_is_owner_only_and_refuses_loose_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        FileSessionStore::open(path.clone())
+            .unwrap()
+            .create(&agent(), &environment())
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // A loosened store must be refused on next open.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = FileSessionStore::open(path).unwrap_err();
+        assert!(err.to_string().contains("too open"), "{err}");
+    }
+
+    #[test]
+    fn file_store_lists_by_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let store = FileSessionStore::open(path).unwrap();
+        let (mine, _) = store.create(&agent(), &environment()).unwrap();
+        store
+            .create(&AgentId::parse("agent_other").unwrap(), &environment())
+            .unwrap();
+        let listed = store.list_for_agent(&agent()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, mine);
+    }
+
+    #[test]
+    fn file_store_supports_ttl_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let store = FileSessionStore::open(path).unwrap();
+        store.set_clock_for_tests(5_000);
+        let (_, token) = store
+            .create_expiring(&agent(), &environment(), Some(30))
+            .unwrap();
+        store.set_clock_for_tests(5_031);
+        assert!(matches!(
+            store.validate(&token),
+            Err(BrokerError::SessionRevoked)
+        ));
     }
 }

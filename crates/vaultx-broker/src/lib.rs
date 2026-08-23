@@ -22,8 +22,10 @@
 //!   (plan §21; INV-018).
 //! - [`credential`]: the resolution seam standing in for the encrypted
 //!   vault until repository integration.
-//! - [`transport`]: the outbound execution seam; the real hardened HTTP
-//!   client lands with the IPC/server task.
+//! - [`transport`]: the outbound execution seam; [`http_transport`]
+//!   provides the hardened real client.
+//! - [`ipc`]: the local IPC server (Unix socket / named pipe) speaking
+//!   JSON lines (plan §18/§19).
 //! - [`engine`]: [`BrokerEngine`], wiring all seams
 //!   into the exact pipeline order.
 //!
@@ -38,7 +40,10 @@
 pub mod credential;
 pub mod engine;
 pub mod error;
+#[cfg(unix)]
+pub mod http_transport;
 pub mod inject;
+pub mod ipc;
 pub mod request;
 pub mod session;
 pub mod transport;
@@ -48,16 +53,25 @@ pub use engine::{
     scrub_secret_patterns, BrokerDependencies, BrokerEngine, BrokerService, MAX_RESPONSE_BODY_BYTES,
 };
 pub use error::BrokerError;
+#[cfg(unix)]
+pub use http_transport::HttpTransport;
 pub use inject::{
     ApiKeyHeaderInjector, AwsSigv4Injector, BasicPasswordInjector, BearerInjector,
     CredentialInjector, CredentialMetadata, CustomStaticHeaderPlusSecretInjector,
     GithubBearerInjector, InjectionTemplateId, InjectorRegistry, OutboundRequest,
     QueryParameterInjector,
 };
+#[cfg(unix)]
+pub use ipc::BrokerServer;
+pub use ipc::{
+    ClientLine, EngineHandle, ServerConfig, ServerLine, DEFAULT_MAX_CONNECTIONS, MAX_LINE_BYTES,
+};
 pub use request::{
     BrokerBody, BrokerRequest, BrokerResponse, Decision, RequestId, PROTOCOL_VERSION,
 };
-pub use session::{hash_token, AgentSessionRecord, InMemorySessionStore, SessionStore, TokenHash};
+pub use session::{
+    hash_token, AgentSessionRecord, FileSessionStore, InMemorySessionStore, SessionStore, TokenHash,
+};
 pub use transport::{ExecutedResponse, TransportExecutor};
 
 #[cfg(test)]

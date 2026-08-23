@@ -60,3 +60,8 @@ zeroize = "1"
 base64 = "0.22"
 # Used by `vaultx-cli` only for no-echo secret-value prompts.
 rpassword = "7"
+# Async runtime for the broker IPC server, client, and real transport.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+# Hardened outbound HTTP client for the broker transport (rustls only;
+# default features pull the native-tls stack and are deliberately off).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
