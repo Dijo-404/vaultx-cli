@@ -41,6 +41,10 @@ pub enum RepoError {
     /// A commit was requested while the staging index held no changes.
     #[error("staging index is empty; nothing to commit")]
     StagingEmpty,
+    /// A history-rewriting operation (rollback) was requested while the
+    /// staging index still held pending changes.
+    #[error("staging index has pending changes; restore or commit them before rolling back")]
+    StagingNotEmpty,
     /// A manifest-level invariant was violated.
     #[error("manifest mismatch: {0}")]
     ManifestMismatch(String),

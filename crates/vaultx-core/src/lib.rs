@@ -44,6 +44,7 @@
 
 mod agents;
 mod config;
+mod doctor;
 mod envs;
 mod error;
 mod history;
@@ -55,9 +56,13 @@ mod staging;
 
 pub use agents::{AgentIdentityFile, AgentLifecycleService, AgentSummary};
 pub use config::{ConfigService, ImportReport};
+pub use doctor::{render_checks, CheckOutcome, CheckStatus, DoctorService};
 pub use envs::{EnvironmentService, EnvironmentSummary};
 pub use error::{CoreError, CoreResult};
-pub use history::{CommitDetail, CommitSummary, EntrySummary, HistoryService};
+pub use history::{
+    CommitDetail, CommitSummary, ConfigValueConflict, EntrySummary, HistoryService,
+    MergeConflictSet, MergeOutcome, RollbackReport, SecretRevisionConflict,
+};
 pub use policies::PolicyOpsService;
 pub use project::ProjectContext;
 pub use secrets::{
@@ -70,6 +75,10 @@ pub use staging::{StagedChangeKind, StagingService, StatusReport};
 /// Re-exported so consumers can name diff entries without depending on
 /// `vaultx-repository` directly.
 pub use vaultx_repository::DiffEntry;
+
+/// Re-exported so CLI/TUI surfaces can pass merge strategies without
+/// depending on `vaultx-repository` directly.
+pub use vaultx_repository::MergeStrategy;
 
 /// Re-exported so CLI/TUI surfaces handle secret values without depending
 /// on `vaultx-crypto` directly.

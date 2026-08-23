@@ -505,6 +505,38 @@ impl<'a> SecretService<'a> {
             .collect())
     }
 
+    /// Resolves the lifecycle state of one revision record by id across
+    /// every environment. `None` when no record carries that revision id
+    /// (e.g. manifest entries predating the secret layer).
+    ///
+    /// # Errors
+    /// * Propagates record decode failures.
+    pub fn revision_state(
+        &self,
+        revision: &SecretRevisionId,
+    ) -> CoreResult<Option<SecretRevisionState>> {
+        Ok(self
+            .scan_records(None)?
+            .into_iter()
+            .find(|record| &record.id == revision)
+            .map(|record| record.state))
+    }
+
+    /// Verifies that the wrapped project vault keys unwrap under the
+    /// configured root key, discarding them immediately. Intended for
+    /// diagnostics; never returns key material.
+    ///
+    /// Callers should confirm `.vaultx/keys/project.json` exists first:
+    /// when it does and the root key file is present this is a pure read.
+    ///
+    /// # Errors
+    /// * [`CoreError::ProjectKey`] when the bundle is unreadable,
+    ///   unsupported, or fails to unwrap (wrong root key).
+    pub fn verify_project_keys(&self) -> CoreResult<()> {
+        self.cached_keys()?;
+        Ok(())
+    }
+
     // ---- key hierarchy ----
 
     /// Returns the cached project keys, but only when they were unwrapped

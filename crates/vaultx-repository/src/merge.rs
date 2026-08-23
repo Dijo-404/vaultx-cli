@@ -25,6 +25,23 @@ use vaultx_types::{ObjectId, PolicyName, SecretRevisionId, VariableName};
 use crate::error::RepoError;
 use crate::manifest::{Manifest, ManifestEntry};
 
+/// Automatic resolution applied to **non-secret** disagreements during a
+/// merge. Secret revisions are atomic values: they are never picked
+/// automatically and remain blocking under every strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeStrategy {
+    /// Keep our side of each resolvable disagreement.
+    Ours,
+    /// Take their side of each resolvable disagreement.
+    Theirs,
+}
+
+impl MergeStrategy {
+    fn picks_ours(self) -> bool {
+        matches!(self, Self::Ours)
+    }
+}
+
 /// A disagreement that requires explicit human resolution before a merge
 /// can complete.
 #[derive(
@@ -86,6 +103,31 @@ pub fn three_way_merge(
     ours: &Manifest,
     theirs: &Manifest,
 ) -> Result<Manifest, Vec<Conflict>> {
+    merge_inner(base, ours, theirs, None)
+}
+
+/// Like [`three_way_merge`], but non-secret disagreements are resolved
+/// automatically by picking `strategy`'s side. Secret revision conflicts
+/// are never auto-resolvable and still block with a full conflict list.
+///
+/// # Errors
+/// [`Vec<Conflict>`] holding only the unresolvable (secret) disagreements,
+/// sorted deterministically; nothing is partially applied.
+pub fn three_way_merge_with_strategy(
+    base: &Manifest,
+    ours: &Manifest,
+    theirs: &Manifest,
+    strategy: MergeStrategy,
+) -> Result<Manifest, Vec<Conflict>> {
+    merge_inner(base, ours, theirs, Some(strategy))
+}
+
+fn merge_inner(
+    base: &Manifest,
+    ours: &Manifest,
+    theirs: &Manifest,
+    strategy: Option<MergeStrategy>,
+) -> Result<Manifest, Vec<Conflict>> {
     let mut merged = Manifest::new();
     let mut conflicts: Vec<Conflict> = Vec::new();
 
@@ -116,7 +158,18 @@ pub fn three_way_merge(
                 merged.entries.insert(name.clone(), entry);
             }
             Some(None) => {}
-            None => conflicts.push(classify_entry_conflict(name, b, o, t)),
+            None => {
+                let classified = classify_entry_conflict(name, b, o, t);
+                if matches!(classified, Conflict::SecretConflict { .. }) {
+                    // Secret revisions are atomic: no strategy may pick one.
+                    conflicts.push(classified);
+                } else if let Some(side) = strategy {
+                    let chosen = if side.picks_ours() { o } else { t };
+                    apply_entry_side(&mut merged.entries, name.clone(), chosen);
+                } else {
+                    conflicts.push(classified);
+                }
+            }
         }
     }
 
@@ -147,7 +200,18 @@ pub fn three_way_merge(
                 merged.policies.insert(name.clone(), obj);
             }
             Some(None) => {}
-            None => conflicts.push(Conflict::PolicyConflict { name: name.clone() }),
+            None => {
+                // Policies are never secret material, so a strategy may
+                // always pick a side here.
+                if let Some(side) = strategy {
+                    let chosen = if side.picks_ours() { o } else { t };
+                    if let Some(obj) = chosen.cloned() {
+                        merged.policies.insert(name.clone(), obj);
+                    }
+                } else {
+                    conflicts.push(Conflict::PolicyConflict { name: name.clone() });
+                }
+            }
         }
     }
 
@@ -156,6 +220,22 @@ pub fn three_way_merge(
     } else {
         conflicts.sort();
         Err(conflicts)
+    }
+}
+
+/// Applies one side's entry resolution (`None` = removal) for `name`.
+fn apply_entry_side(
+    entries: &mut std::collections::BTreeMap<VariableName, ManifestEntry>,
+    name: VariableName,
+    chosen: Option<&ManifestEntry>,
+) {
+    match chosen {
+        Some(entry) => {
+            entries.insert(name, entry.clone());
+        }
+        None => {
+            entries.remove(&name);
+        }
     }
 }
 
@@ -460,5 +540,63 @@ mod tests {
     fn empty_everything_merges_to_empty() {
         let empty = Manifest::new();
         assert_eq!(three_way_merge(&empty, &empty, &empty).unwrap(), empty);
+    }
+
+    #[test]
+    fn strategy_resolves_config_conflicts_by_side() {
+        let base = manifest_of(&[("PORT", cfg("obj_port_1"))]);
+        let ours = manifest_of(&[("PORT", cfg("obj_port_ours"))]);
+        let theirs = manifest_of(&[("PORT", cfg("obj_port_theirs"))]);
+
+        let merged =
+            three_way_merge_with_strategy(&base, &ours, &theirs, MergeStrategy::Ours).unwrap();
+        assert_eq!(merged.get(&var("PORT")), Some(&cfg("obj_port_ours")));
+
+        let merged =
+            three_way_merge_with_strategy(&base, &ours, &theirs, MergeStrategy::Theirs).unwrap();
+        assert_eq!(merged.get(&var("PORT")), Some(&cfg("obj_port_theirs")));
+    }
+
+    #[test]
+    fn strategy_resolves_policy_conflicts_but_never_secrets() {
+        let mut base = Manifest::new();
+        base.set_config(var("PORT"), obj("obj_port_1"));
+        base.set_policy(pol("rules"), obj("obj_policy_v1"));
+        base.entries.insert(var("TOKEN"), sec("sec_rev_base"));
+
+        let mut ours = base.clone();
+        ours.set_policy(pol("rules"), obj("obj_policy_ours"));
+        ours.entries.insert(var("TOKEN"), sec("sec_rev_ours"));
+
+        let mut theirs = base.clone();
+        theirs.set_policy(pol("rules"), obj("obj_policy_theirs"));
+        theirs.entries.insert(var("TOKEN"), sec("sec_rev_theirs"));
+
+        // The secret conflict survives every strategy...
+        let conflicts = three_way_merge_with_strategy(&base, &ours, &theirs, MergeStrategy::Theirs)
+            .expect_err("secret must still block");
+        assert_eq!(
+            conflicts,
+            vec![Conflict::SecretConflict {
+                name: var("TOKEN"),
+                ours_rev: Some(rev("sec_rev_ours")),
+                theirs_rev: Some(rev("sec_rev_theirs")),
+            }]
+        );
+
+        // ...and with the secret aligned, both sides' policy disagreement
+        // resolves by side.
+        let mut theirs_aligned = theirs.clone();
+        theirs_aligned
+            .entries
+            .insert(var("TOKEN"), sec("sec_rev_ours"));
+        let merged =
+            three_way_merge_with_strategy(&base, &ours, &theirs_aligned, MergeStrategy::Ours)
+                .unwrap();
+        assert_eq!(
+            merged.policies.get(&pol("rules")),
+            Some(&obj("obj_policy_ours"))
+        );
+        assert_eq!(merged.get(&var("TOKEN")), Some(&sec("sec_rev_ours")));
     }
 }

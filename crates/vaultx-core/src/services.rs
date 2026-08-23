@@ -123,6 +123,12 @@ impl VaultxServices {
     pub fn secrets(&self) -> crate::secrets::SecretService<'_> {
         crate::secrets::SecretService::new(&self.ctx)
     }
+
+    /// Health diagnostics.
+    #[must_use]
+    pub const fn doctor(&self) -> crate::doctor::DoctorService<'_> {
+        crate::doctor::DoctorService::new(&self.ctx)
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +155,7 @@ mod tests {
         let _ = services.agents();
         let _ = services.policies();
         let _ = services.secrets();
+        let _ = services.doctor();
         assert_eq!(services.context().root(), root);
         drop(services);
 

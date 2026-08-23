@@ -70,6 +70,11 @@ pub enum CoreError {
     /// A file or ref that was expected to be unique already exists.
     #[error("`{0}` already exists")]
     AlreadyExists(String),
+    /// A merge was refused because it would remove variables bound by a
+    /// protected environment following the target branch's lineage.
+    /// Retrying with explicit override consent is required.
+    #[error("merge would weaken environment protection: {0}; pass --allow-weaker-protection to override")]
+    ProtectionWeakening(String),
     /// The persisted device signing key (`.vaultx/device.key`) is
     /// unreadable: not hex, wrong length, or not loadable key material.
     /// The file is never overwritten automatically so the operator can

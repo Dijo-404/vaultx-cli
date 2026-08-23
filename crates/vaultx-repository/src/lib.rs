@@ -50,7 +50,7 @@ pub use commit::Commit;
 pub use diff::{compute_diff, render_diff, DiffEntry};
 pub use error::RepoError;
 pub use manifest::{DynamicProviderRef, Manifest, ManifestEntry};
-pub use merge::{three_way_merge, Conflict};
+pub use merge::{three_way_merge, three_way_merge_with_strategy, Conflict, MergeStrategy};
 pub use object::{hash_canonical, object_id, ObjectEnvelope, ObjectType};
 pub use refs::{EnvironmentProtection, HeadTarget, RefNamespace, RefStore};
 pub use repo::{Repository, StatusReport};

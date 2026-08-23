@@ -281,16 +281,34 @@ impl Repository {
             None => Manifest::default(),
         };
         let next_manifest = index.apply_onto(&base);
+        let parents: Vec<CommitId> = head.iter().cloned().collect();
+        let commit_id =
+            self.store_signed_commit(&parents, &next_manifest, message, author, keypair)?;
+        self.advance_head_to(&commit_id)?;
 
-        let manifest_payload = serde_json::to_vec(&next_manifest)?;
+        self.clear_staging()?;
+        Ok(commit_id)
+    }
+
+    /// Signs, stores, and returns a commit capturing `manifest` with the
+    /// given parents — without touching any ref. Callers own ref updates.
+    fn store_signed_commit(
+        &self,
+        parents: &[CommitId],
+        manifest: &Manifest,
+        message: &str,
+        author: IdentityRef,
+        keypair: &SigningKeyPair,
+    ) -> Result<CommitId, RepoError> {
+        History::new(&self.store).validate_parents(parents)?;
+
+        let manifest_payload = serde_json::to_vec(manifest)?;
         let manifest_id = self
             .store
             .put(&ObjectEnvelope::new(ObjectType::Manifest, manifest_payload))?;
 
-        let parents: Vec<CommitId> = head.iter().cloned().collect();
-        History::new(&self.store).validate_parents(&parents)?;
-
-        let commit = Commit::new(parents, manifest_id, author, message).sign_with(keypair)?;
+        let commit =
+            Commit::new(parents.to_vec(), manifest_id, author, message).sign_with(keypair)?;
         let expected_oid = crate::commit::commit_object_id(&commit)?;
         let stored_oid = self.store.put(&commit_envelope(&commit)?)?;
         if stored_oid != expected_oid {
@@ -299,24 +317,23 @@ impl Repository {
                 reason: "commit storage id diverged from derived id".to_owned(),
             });
         }
-        let commit_id = commit.commit_id()?;
+        commit.commit_id()
+    }
 
+    /// Moves HEAD (and therefore its symbolic branch, if any) onto
+    /// `commit_id`. Used by history-appending operations whose new tip is
+    /// the caller's current position.
+    fn advance_head_to(&self, commit_id: &CommitId) -> Result<(), RepoError> {
         match self.refs.read_head()? {
             Some(HeadTarget::Branch { name }) => {
-                self.refs
-                    .write_ref(RefNamespace::Heads, &name, &commit_id)?;
+                self.refs.write_ref(RefNamespace::Heads, &name, commit_id)
             }
             // Detached (or otherwise non-branch) heads advance to the new
             // commit directly.
-            _ => {
-                self.refs.write_head(&HeadTarget::Detached {
-                    commit: commit_id.clone(),
-                })?;
-            }
+            _ => self.refs.write_head(&HeadTarget::Detached {
+                commit: commit_id.clone(),
+            }),
         }
-
-        self.clear_staging()?;
-        Ok(commit_id)
     }
 
     /// First-parent history from the current head (newest first).
@@ -387,6 +404,119 @@ impl Repository {
         History::new(&self.store).find_commit(id)?;
         self.refs
             .write_head(&HeadTarget::Detached { commit: id.clone() })
+    }
+
+    /// Finds a best-effort common ancestor of `a` and `b` by breadth-first
+    /// search over the **full** parent graph (merge commits included).
+    ///
+    /// Returns the first commit reachable from `b` that is also an
+    /// ancestor of (or equal to) `a`, which yields the closest shared
+    /// ancestor along `b`'s ancestry — correct for ordinary branch
+    /// topologies; criss-cross merges may pick any valid base. `None`
+    /// when the two histories share no commits.
+    ///
+    /// # Errors
+    /// Propagates lookup/decode failures for visited commits.
+    pub fn merge_base(&self, a: &CommitId, b: &CommitId) -> Result<Option<CommitId>, RepoError> {
+        let history = History::new(&self.store);
+        let mut ancestors_of_a = std::collections::BTreeSet::new();
+        let mut queue_a = std::collections::VecDeque::from([a.clone()]);
+        while let Some(id) = queue_a.pop_front() {
+            if !ancestors_of_a.insert(id.clone()) {
+                continue;
+            }
+            for parent in history.find_commit(&id)?.parents {
+                queue_a.push_back(parent);
+            }
+        }
+
+        let mut seen_b = std::collections::BTreeSet::new();
+        let mut queue_b = std::collections::VecDeque::from([b.clone()]);
+        while let Some(id) = queue_b.pop_front() {
+            if !seen_b.insert(id.clone()) {
+                continue;
+            }
+            if ancestors_of_a.contains(&id) {
+                return Ok(Some(id));
+            }
+            // Commits that do not resolve in this store (disjoint roots,
+            // foreign stores) have no traversable ancestry here; treat
+            // them as leaves so "no common ancestor" stays representable
+            // instead of surfacing as ObjectNotFound.
+            let parents = match history.find_commit(&id) {
+                Ok(commit) => commit.parents,
+                Err(_) => Vec::new(),
+            };
+            queue_b.extend(parents);
+        }
+        Ok(None)
+    }
+
+    /// Creates a signed two-parent merge commit on `target_branch`
+    /// capturing an already-merged `manifest`.
+    ///
+    /// Parents are `[target_tip, theirs_tip]`; nothing here recomputes or
+    /// validates the merge itself — callers must have resolved conflicts
+    /// beforehand. The target branch ref advances; when HEAD symbolically
+    /// points at the same branch its working state follows automatically.
+    ///
+    /// # Errors
+    /// * [`RepoError::RefNotFound`] for unknown branches.
+    /// * [`RepoError::ParentNotFound`] for dangling ancestry.
+    /// * Propagates storage/ref failures.
+    pub fn create_merge_commit(
+        &self,
+        message: &str,
+        author: IdentityRef,
+        keypair: &SigningKeyPair,
+        target_branch: &str,
+        theirs_tip: &CommitId,
+        manifest: &Manifest,
+    ) -> Result<CommitId, RepoError> {
+        let ours_tip = self
+            .refs
+            .read_ref(RefNamespace::Heads, target_branch)?
+            .ok_or_else(|| RepoError::RefNotFound(format!("heads/{target_branch}")))?;
+        let parents = vec![ours_tip, theirs_tip.clone()];
+        let commit_id = self.store_signed_commit(&parents, manifest, message, author, keypair)?;
+        self.refs
+            .write_ref(RefNamespace::Heads, target_branch, &commit_id)?;
+        Ok(commit_id)
+    }
+
+    /// Creates a signed rollback commit whose manifest equals the one
+    /// captured by `target`. Because manifests are content-addressed, the
+    /// new commit references the *historical* manifest object id — no
+    /// history is rewritten and old commits stay intact.
+    ///
+    /// Refuses while the staging index holds pending changes so staged
+    /// intent cannot silently diverge from the restored state. HEAD (and
+    /// its symbolic branch) advances onto the rollback commit.
+    ///
+    /// # Errors
+    /// * [`RepoError::StagingNotEmpty`] with pending changes.
+    /// * [`RepoError::RefNotFound`] before the first commit (no head).
+    /// * Propagates lookup/storage/ref failures.
+    pub fn create_rollback_commit(
+        &self,
+        message: &str,
+        author: IdentityRef,
+        keypair: &SigningKeyPair,
+        target: &CommitId,
+    ) -> Result<CommitId, RepoError> {
+        let index = StagingIndex::load(&self.vault_dir)?;
+        if !index.is_empty() {
+            return Err(RepoError::StagingNotEmpty);
+        }
+        // Loading the historical manifest both validates the target and
+        // provides the payload; storing it dedups onto the original object.
+        let manifest = self.manifest_at(target)?;
+        let head = self
+            .current_head()?
+            .ok_or_else(|| RepoError::RefNotFound("heads/HEAD".to_owned()))?;
+        let commit_id = self.store_signed_commit(&[head], &manifest, message, author, keypair)?;
+        self.advance_head_to(&commit_id)?;
+        Ok(commit_id)
     }
 
     /// Merges `theirs` (a branch's tip) into the working state against
@@ -757,6 +887,55 @@ mod tests {
             }
             other => panic!("expected merge conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_base_finds_shared_ancestor_or_none() {
+        let fx = temp_repo();
+        let author = IdentityRef::parse("user:b").unwrap();
+
+        fx.repo.add(var("ROOT"), cfg_obj("root_v1")).unwrap();
+        let base = fx
+            .repo
+            .create_commit("base", author.clone(), &fx.pair)
+            .unwrap();
+
+        // Diverge main (ours) and feature (theirs).
+        fx.repo.add(var("OURS"), cfg_obj("o1")).unwrap();
+        let ours_tip = fx
+            .repo
+            .create_commit("ours", author.clone(), &fx.pair)
+            .unwrap();
+        fx.repo.create_branch("feature", Some(&base)).unwrap();
+        fx.repo.checkout_branch("feature").unwrap();
+        fx.repo.add(var("THEIRS"), cfg_obj("t1")).unwrap();
+        let theirs_tip = fx
+            .repo
+            .create_commit("theirs", author.clone(), &fx.pair)
+            .unwrap();
+
+        assert_eq!(
+            fx.repo.merge_base(&ours_tip, &theirs_tip).unwrap(),
+            Some(base.clone())
+        );
+        assert_eq!(
+            fx.repo.merge_base(&base, &ours_tip).unwrap(),
+            Some(base.clone())
+        );
+        assert_eq!(fx.repo.merge_base(&ours_tip, &base).unwrap(), Some(base));
+
+        // An unrelated root shares nothing.
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = Repository::init(other_dir.path()).unwrap();
+        other.add(var("X"), cfg_obj("x")).unwrap();
+        let unrelated = other
+            .create_commit(
+                "unrelated",
+                IdentityRef::parse("user:o").unwrap(),
+                &SigningKeyPair::generate(),
+            )
+            .unwrap();
+        assert_eq!(fx.repo.merge_base(&ours_tip, &unrelated).unwrap(), None);
     }
 
     #[test]

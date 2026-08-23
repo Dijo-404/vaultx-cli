@@ -172,6 +172,18 @@ impl<'a> ConfigService<'a> {
             })
     }
 
+    /// Decodes the plaintext value stored in a config-value object.
+    ///
+    /// Used by merge reporting to show both sides of a config conflict;
+    /// never applicable to secret material.
+    ///
+    /// # Errors
+    /// * [`CoreError::Repo`] wrapping [`CorruptObject`](vaultx_repository::RepoError::CorruptObject)
+    ///   when the object is missing, not a config value, or malformed.
+    pub fn value_of_config_object(&self, object: &vaultx_types::ObjectId) -> CoreResult<String> {
+        self.read_config_object(object)
+    }
+
     /// Stages removal of a config variable.
     ///
     /// The name must be bound at HEAD or carry a staged `Set` intent;
