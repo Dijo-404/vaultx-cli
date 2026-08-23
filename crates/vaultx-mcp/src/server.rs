@@ -118,20 +118,22 @@ pub async fn serve(config: ServeConfig) -> Result<(), McpError> {
 }
 
 /// Result of one bounded line read.
+#[derive(Debug)]
 enum ReadOutcome {
     /// Clean end of input.
     Eof,
-    /// One line whose terminating newline was consumed.
+    /// One line whose terminating newline was consumed and stripped.
     Line(String),
-    /// The line exceeded [`MAX_LINE_BYTES`] before any newline.
+    /// The line's content exceeded [`MAX_LINE_BYTES`] before any newline.
     Oversize,
 }
 
 /// Reads one newline-terminated line while enforcing [`MAX_LINE_BYTES`]
-/// *during* accumulation: once the cap is reached without a newline,
-/// buffering stops and the reader drains (without storing bytes) until
-/// the next real newline, so oversized lines can never grow memory
-/// unboundedly and following lines still parse.
+/// *during* accumulation (only content bytes count; the terminating
+/// newline is framing): once the cap would be exceeded without a
+/// newline, buffering stops and the reader drains (without storing
+/// bytes) until the next real newline, so oversized lines can never
+/// grow memory unboundedly and following lines still parse.
 async fn read_line_bounded<R>(reader: &mut R) -> std::io::Result<ReadOutcome>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -154,14 +156,15 @@ where
             Some(pos) => pos + 1,
             None => chunk.len(),
         };
-        if !oversize && line.len() + take > MAX_LINE_BYTES {
+        let terminated = newline.is_some();
+        let content = take - usize::from(terminated);
+        if !oversize && line.len() + content > MAX_LINE_BYTES {
             oversize = true;
             line.clear();
         }
         if !oversize {
-            line.extend_from_slice(&chunk[..take]);
+            line.extend_from_slice(&chunk[..content]);
         }
-        let terminated = newline.is_some();
         reader.consume(take);
         if terminated {
             return Ok(if oversize {
@@ -235,5 +238,80 @@ async fn handle_request(ctx: &ToolContext<'_>, request: IncomingRequest) -> Stri
     match outcome {
         Ok(result) => success_line(&id, result),
         Err(err) => error_line(&id, err.code, &err.message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_line_bounded, ReadOutcome, MAX_LINE_BYTES};
+    use tokio::io::BufReader;
+
+    async fn next(input: &[u8]) -> std::io::Result<ReadOutcome> {
+        let mut reader = BufReader::new(input);
+        read_line_bounded(&mut reader).await
+    }
+
+    #[tokio::test]
+    async fn empty_input_is_eof() {
+        assert!(matches!(next(b"").await.unwrap(), ReadOutcome::Eof));
+    }
+
+    #[tokio::test]
+    async fn line_is_returned_stripped_of_newline() {
+        match next(b"hello\nworld").await.unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line, "hello"),
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_mid_line_returns_partial_line_then_eof() {
+        match next(b"abc").await.unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line, "abc"),
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn content_exactly_at_cap_is_accepted() {
+        let input: Vec<u8> = b"a"
+            .repeat(MAX_LINE_BYTES)
+            .into_iter()
+            .chain(b"\n".iter().copied())
+            .collect();
+        match next(&input).await.unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line.len(), MAX_LINE_BYTES),
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_line_is_flagged_and_following_lines_still_parse() {
+        let mut input = vec![b'x'; MAX_LINE_BYTES + 5];
+        input.push(b'\n');
+        input.extend_from_slice(b"ok\n");
+        let mut reader = BufReader::new(&input[..]);
+        assert!(matches!(
+            read_line_bounded(&mut reader).await.unwrap(),
+            ReadOutcome::Oversize
+        ));
+        match read_line_bounded(&mut reader).await.unwrap() {
+            ReadOutcome::Line(line) => assert_eq!(line, "ok"),
+            other => panic!("expected Line after drain, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_mid_oversize_returns_oversize_then_eof() {
+        let input = vec![b'y'; MAX_LINE_BYTES + 1];
+        let mut reader = BufReader::new(&input[..]);
+        assert!(matches!(
+            read_line_bounded(&mut reader).await.unwrap(),
+            ReadOutcome::Oversize
+        ));
+        assert!(matches!(
+            read_line_bounded(&mut reader).await.unwrap(),
+            ReadOutcome::Eof
+        ));
     }
 }
