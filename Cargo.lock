@@ -1731,7 +1731,6 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
- "libc",
  "rpassword",
  "tempfile",
  "thiserror",
@@ -1812,7 +1811,6 @@ name = "vaultx-mcp"
 version = "0.1.0"
 dependencies = [
  "base64",
- "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -1822,6 +1820,7 @@ dependencies = [
  "vaultx-broker-client",
  "vaultx-core",
  "vaultx-policy",
+ "vaultx-policy-packs",
  "vaultx-types",
 ]
 

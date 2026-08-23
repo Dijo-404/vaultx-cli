@@ -385,4 +385,39 @@ async fn secrets_never_surface_through_any_tool_result() {
         .unwrap();
     let rendered = ok.to_string();
     assert!(!rendered.contains("canary-hunter2"));
+
+    // Asking for the secret by name through config_get must fail with
+    // the exact generic message — never a value, never a near-miss hint.
+    let err = call_tool(
+        &context,
+        "vaultx.config_get",
+        &json!({"name": "GITHUB_TOKEN"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, -32000);
+    assert_eq!(err.message, "config lookup failed");
+
+    // And no response body anywhere on the wire carries the canary VALUE.
+    for request in [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+               "params":{"name":"vaultx.config_get","arguments":{"name":"GITHUB_TOKEN"}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+               "params":{"name":"vaultx.config_get","arguments":{"name":"SAFE"}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+               "params":{"name":"vaultx.list_capabilities"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"no/such/method"}),
+    ] {
+        if let Some(response) = handle_line(&context, &request.to_string()).await {
+            assert!(
+                !response.contains("canary-hunter2"),
+                "secret value surfaced in response: {response}"
+            );
+        }
+    }
+
+    // Blank lines stay silent even in this flow (framing regression).
+    assert!(handle_line(&context, "").await.is_none());
+    assert!(handle_line(&context, "   ").await.is_none());
 }

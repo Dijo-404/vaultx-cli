@@ -1297,7 +1297,15 @@ fn cmd_run(
     match status.code() {
         Some(0) => Ok(String::new()),
         Some(code) => Err(CliError::ChildExit(code)),
-        // Terminated by signal: no exit code exists to forward.
+        // Killed by a signal (unix): report the conventional 128+N code.
+        #[cfg(unix)]
+        None => {
+            use std::os::unix::process::ExitStatusExt as _;
+            let signal = status.signal().unwrap_or(0);
+            Err(CliError::ChildExit(128 + signal))
+        }
+        // No exit-code concept on this platform; fall back to failure.
+        #[cfg(not(unix))]
         None => Err(CliError::ChildExit(1)),
     }
 }
@@ -1514,31 +1522,10 @@ fn cmd_mcp_serve(
     Ok(String::new())
 }
 
-fn resolve_endpoint(project: &Path, socket: Option<&Path>) -> PathBuf {
+fn resolve_endpoint(_project: &Path, socket: Option<&Path>) -> PathBuf {
     match socket {
         Some(path) => path.to_path_buf(),
-        None => {
-            #[cfg(unix)]
-            {
-                let _ = project;
-                // Mirrors vaultx_broker::ipc::default_socket_path's
-                // uid-scoped fallback so client and server agree without
-                // importing unix-only items here.
-                let base = std::env::var_os("XDG_RUNTIME_DIR")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        let uid = unsafe { libc::getuid() };
-                        PathBuf::from("/tmp").join(format!("vaultx-{uid}"))
-                    });
-                base.join("vaultx").join("local").join("broker.sock")
-            }
-            #[cfg(windows)]
-            {
-                let _ = project;
-                PathBuf::from(r"\\.\pipe\vaultx-local")
-            }
-        }
+        None => PathBuf::from(vaultx_broker_client::default_endpoint()),
     }
 }
 

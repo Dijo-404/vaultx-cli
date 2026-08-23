@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 base64 = { workspace = true }
-libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -14,6 +13,7 @@ vaultx-broker = { path = "../vaultx-broker" }
 vaultx-broker-client = { path = "../vaultx-broker-client" }
 vaultx-core = { path = "../vaultx-core" }
 vaultx-policy = { path = "../vaultx-policy" }
+vaultx-policy-packs = { path = "../vaultx-policy-packs" }
 vaultx-types = { path = "../vaultx-types" }
 
 [dev-dependencies]

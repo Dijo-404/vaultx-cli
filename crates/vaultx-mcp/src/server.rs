@@ -95,39 +95,96 @@ pub async fn serve(config: ServeConfig) -> Result<(), McpError> {
     };
 
     let mut stdout = tokio::io::stdout();
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => return Ok(()),
+        let response = match read_line_bounded(&mut stdin).await {
+            Ok(ReadOutcome::Eof) => return Ok(()),
+            Ok(ReadOutcome::Oversize) => Some(error_line(
+                &serde_json::Value::Null,
+                PARSE_ERROR,
+                "line too long",
+            )),
+            Ok(ReadOutcome::Line(line)) => handle_line(&ctx, &line).await,
             Err(err) => return Err(McpError(err.to_string())),
         };
-        if line.len() > MAX_LINE_BYTES {
-            write_response(
-                &mut stdout,
-                error_line(&serde_json::Value::Null, PARSE_ERROR, "line too long"),
-            )
-            .await;
-            continue;
-        }
-        if let Some(response) = handle_line(&ctx, &line).await {
-            write_response(&mut stdout, response).await;
+        if let Some(response) = response {
+            // A dead stdout pipe means the client is gone; nothing is
+            // left to answer, so shut the session down cleanly.
+            if write_response(&mut stdout, response).await.is_err() {
+                return Ok(());
+            }
         }
     }
 }
 
-async fn write_response(stdout: &mut tokio::io::Stdout, line: String) {
-    if stdout.write_all(line.as_bytes()).await.is_ok() {
-        let _ = stdout.write_all(b"\n").await;
-        let _ = stdout.flush().await;
+/// Result of one bounded line read.
+enum ReadOutcome {
+    /// Clean end of input.
+    Eof,
+    /// One line whose terminating newline was consumed.
+    Line(String),
+    /// The line exceeded [`MAX_LINE_BYTES`] before any newline.
+    Oversize,
+}
+
+/// Reads one newline-terminated line while enforcing [`MAX_LINE_BYTES`]
+/// *during* accumulation: once the cap is reached without a newline,
+/// buffering stops and the reader drains (without storing bytes) until
+/// the next real newline, so oversized lines can never grow memory
+/// unboundedly and following lines still parse.
+async fn read_line_bounded<R>(reader: &mut R) -> std::io::Result<ReadOutcome>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    let mut oversize = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(if oversize {
+                ReadOutcome::Oversize
+            } else if line.is_empty() {
+                ReadOutcome::Eof
+            } else {
+                ReadOutcome::Line(String::from_utf8_lossy(&line).into_owned())
+            });
+        }
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let take = match newline {
+            Some(pos) => pos + 1,
+            None => chunk.len(),
+        };
+        if !oversize && line.len() + take > MAX_LINE_BYTES {
+            oversize = true;
+            line.clear();
+        }
+        if !oversize {
+            line.extend_from_slice(&chunk[..take]);
+        }
+        let terminated = newline.is_some();
+        reader.consume(take);
+        if terminated {
+            return Ok(if oversize {
+                ReadOutcome::Oversize
+            } else {
+                ReadOutcome::Line(String::from_utf8_lossy(&line).into_owned())
+            });
+        }
     }
+}
+
+async fn write_response(stdout: &mut tokio::io::Stdout, line: String) -> std::io::Result<()> {
+    stdout.write_all(line.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await
 }
 
 /// Handles one inbound line, returning the response line to emit (or
-/// `None` for notifications and blank input). Crate-visible so protocol
-/// tests can drive it directly.
+/// `None` for notifications, blank input, and anything else that owes no
+/// response). Crate-visible so protocol tests can drive it directly.
 pub(crate) async fn handle_line(ctx: &ToolContext<'_>, line: &str) -> Option<String> {
     match parse_line(line) {
+        ParsedLine::Blank => None,
         ParsedLine::Malformed => Some(error_line(
             &serde_json::Value::Null,
             PARSE_ERROR,

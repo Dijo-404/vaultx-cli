@@ -13,6 +13,7 @@ use serde_json::{json, Map, Value};
 use vaultx_broker_client::BrokerClient;
 use vaultx_core::VaultxServices;
 use vaultx_policy::HttpMethod;
+use vaultx_policy_packs::CompiledPack;
 use vaultx_types::CredentialRef;
 
 use crate::jsonrpc::{INVALID_PARAMS, TOOL_FAILURE, UNKNOWN_CAPABILITY};
@@ -305,12 +306,20 @@ async fn http_request_tool(
     send_via_broker(ctx, args, capability_hint).await
 }
 
-/// Resolves `<capability>` against pack-derived policies named
-/// `pack-<capability with '.' replaced by '_'>`; unknown capabilities are
+/// Resolves `<capability>` against the pack-derived policy name computed
+/// by [`CompiledPack::policy_name_for`]; unknown capabilities are
 /// refused before any network activity.
 async fn capability_request(ctx: &ToolContext<'_>, args: &Value) -> Result<Value, ToolError> {
     let capability = arg_string(args, "capability")?;
-    let expected_policy = format!("pack-{}", capability.replace('.', "_"));
+    let expected_policy = match CompiledPack::policy_name_for(capability) {
+        Ok(name) => name,
+        Err(_) => {
+            return Err(ToolError::new(
+                UNKNOWN_CAPABILITY,
+                format!("unknown capability `{capability}`"),
+            ))
+        }
+    };
     let documents = ctx
         .services
         .policies()
@@ -318,7 +327,7 @@ async fn capability_request(ctx: &ToolContext<'_>, args: &Value) -> Result<Value
         .map_err(|_| ToolError::new(TOOL_FAILURE, "policy load failed"))?;
     if !documents
         .iter()
-        .any(|doc| doc.name.as_str() == expected_policy)
+        .any(|doc| doc.name.as_str() == expected_policy.as_str())
     {
         return Err(ToolError::new(
             UNKNOWN_CAPABILITY,
@@ -331,30 +340,13 @@ async fn capability_request(ctx: &ToolContext<'_>, args: &Value) -> Result<Value
     send_via_broker(ctx, &ensure_object(params)?, Some(capability)).await
 }
 
-/// Broker endpoint selection mirroring the CLI's default rules: explicit
-/// override first, else `$XDG_RUNTIME_DIR/vaultx/local/broker.sock`
-/// (unix) or the platform pipe name.
+/// Broker endpoint selection shared with the CLI via
+/// [`vaultx_broker_client::default_endpoint`]: explicit override first,
+/// else the platform default.
 #[must_use]
 pub fn resolve_endpoint(socket: Option<&Path>) -> PathBuf {
     match socket {
         Some(path) => path.to_path_buf(),
-        None => default_socket_path(),
+        None => PathBuf::from(vaultx_broker_client::default_endpoint()),
     }
-}
-
-#[cfg(unix)]
-fn default_socket_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let uid = unsafe { libc::getuid() };
-            PathBuf::from("/tmp").join(format!("vaultx-{uid}"))
-        });
-    base.join("vaultx").join("local").join("broker.sock")
-}
-
-#[cfg(windows)]
-fn default_socket_path() -> PathBuf {
-    PathBuf::from(r"\\.\pipe\vaultx-local")
 }

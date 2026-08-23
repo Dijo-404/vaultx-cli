@@ -2,10 +2,10 @@
 //! (plan §26).
 //!
 //! Requests arrive one per line; responses leave one per line.
-//! Notifications (no usable `id`) produce no output. Only the subset the
-//! server needs is implemented: parse errors (`-32700`), method not
-//! found (`-32601`), invalid params (`-32602`), plus two server-defined
-//! classes used by tool execution.
+//! Notifications (no usable `id`) produce no output, and neither do
+//! blank lines. Only the subset the server needs is implemented: parse
+//! errors (`-32700`), method not found (`-32601`), invalid params
+//! (`-32602`), plus two server-defined classes used by tool execution.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,16 +45,28 @@ impl IncomingRequest {
 pub enum ParsedLine {
     /// Well-formed JSON object carrying a `method`.
     Request(IncomingRequest),
+    /// Blank or whitespace-only input: no response is owed.
+    Blank,
     /// Anything else: malformed JSON or missing `method`.
     Malformed,
 }
 
-/// Classifies one stdin line. Blank lines are swallowed silently —
-/// terminal transports routinely emit stray newlines.
+/// Classifies one stdin line.
+///
+/// Deliberate minimal-subset choices:
+///
+/// * blank/whitespace-only lines are classified [`ParsedLine::Blank`] so
+///   the caller can swallow them silently — terminal transports
+///   routinely emit stray newlines and must not be spammed with
+///   `-32700` responses;
+/// * a missing `method` field and JSON batch arrays both map to the
+///   `-32700` parse-error class rather than dedicated codes;
+/// * when an `id` is present it is echoed back verbatim (any JSON
+///   value); absent or `null` ids make the request a notification.
 #[must_use]
 pub fn parse_line(line: &str) -> ParsedLine {
     if line.trim().is_empty() {
-        return ParsedLine::Malformed;
+        return ParsedLine::Blank;
     }
     #[derive(Deserialize)]
     struct Wire {
@@ -134,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_lines_and_blank_lines_are_flagged() {
+    fn malformed_lines_are_flagged_and_blank_lines_are_classified_separately() {
         assert!(matches!(parse_line("{nope"), ParsedLine::Malformed));
         assert!(matches!(parse_line("[1,2,3]"), ParsedLine::Malformed));
         // Missing method entirely.
@@ -142,7 +154,9 @@ mod tests {
             parse_line(r#"{"jsonrpc":"2.0","id":1}"#),
             ParsedLine::Malformed
         ));
-        assert!(matches!(parse_line("   "), ParsedLine::Malformed));
+        assert!(matches!(parse_line(""), ParsedLine::Blank));
+        assert!(matches!(parse_line("   "), ParsedLine::Blank));
+        assert!(matches!(parse_line("\t\r"), ParsedLine::Blank));
     }
 
     #[test]

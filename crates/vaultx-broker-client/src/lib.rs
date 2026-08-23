@@ -167,6 +167,27 @@ pub const fn protocol_version() -> u16 {
     PROTOCOL_VERSION
 }
 
+/// Default broker IPC endpoint used by every client-facing surface
+/// (`vaultx` CLI, MCP tools): `$XDG_RUNTIME_DIR/vaultx/local/broker.sock`
+/// with a uid-scoped `/tmp` fallback (unix), or the platform pipe name
+/// (windows).
+///
+/// Wraps [`vaultx_broker::ipc::default_socket_path`] so clients and the
+/// broker always agree on the bind location.
+#[must_use]
+pub fn default_endpoint() -> String {
+    #[cfg(unix)]
+    {
+        vaultx_broker::ipc::default_socket_path("local")
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(windows)]
+    {
+        r"\\.\pipe\vaultx-local".to_owned()
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = { workspace = true }
-libc = { workspace = true }
 clap = { workspace = true }
 rpassword = { workspace = true }
 thiserror = { workspace = true }
