@@ -88,7 +88,6 @@ pub struct HttpTransport {
     /// runtime panics. A broker process keeps exactly one transport for
     /// its whole life, so leaking it costs nothing and removes the
     /// failure class entirely.
-    #[allow(dead_code)]
     runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
     /// Test-only relaxation of certificate verification; never set by
     /// production constructors.
@@ -176,7 +175,12 @@ impl HttpTransport {
             .redirect(reqwest::redirect::Policy::none())
             .resolve(&key, std::net::SocketAddr::new(addr, port))
             .use_rustls_tls()
-            .no_proxy();
+            .no_proxy()
+            // Bounded failure: a silent peer must never park a
+            // spawn_blocking thread indefinitely.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(60));
         if self.insecure_certs {
             builder = builder.danger_accept_invalid_certs(true);
         }
@@ -279,6 +283,10 @@ impl HttpTransport {
 
     /// Runs the manual redirect-aware loop for one outbound request.
     async fn run(&self, outbound: OutboundRequest) -> Result<ExecutedResponse, BrokerError> {
+        // Anchor for the redirect authorizer: always the INITIAL target,
+        // never the previous hop, so chain approvals stay tied to what
+        // the agent asked for (INV-007).
+        let initial = outbound.canonical_url.clone();
         let mut canonical = outbound.canonical_url.clone();
         let mut method = outbound.method;
         let mut body = outbound.body.clone();
@@ -312,17 +320,36 @@ impl HttpTransport {
                 });
             }
 
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    BrokerError::TransportFailure("redirect missing location".to_owned())
-                })?;
+            // A redirect status without Location cannot be followed;
+            // surface it as the final response rather than failing the
+            // whole exchange.
+            let Some(location_value) = response.headers().get(reqwest::header::LOCATION) else {
+                let headers: Vec<(String, String)> = response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_ascii_lowercase(),
+                            value.to_str().unwrap_or("").to_owned(),
+                        )
+                    })
+                    .collect();
+                let payload = self.read_capped(&mut response).await?;
+                return Ok(ExecutedResponse {
+                    status,
+                    headers,
+                    body: payload,
+                });
+            };
+            let location = location_value.to_str().map_err(|_| {
+                BrokerError::TransportFailure("redirect location is not valid text".to_owned())
+            })?;
+            // Contract: `original` is the INITIAL request target, not
+            // the previous hop, so chained approvals stay anchored to
+            // what the agent asked for.
             match self.redirects.evaluate(
-                &canonical,
-                &location,
+                &initial,
+                location,
                 hop,
                 self.redirect_authorizer.as_ref(),
             ) {

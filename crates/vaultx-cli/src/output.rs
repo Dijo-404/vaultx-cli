@@ -331,11 +331,9 @@ pub fn render_agent_detail(agent: &AgentIdentityFile) -> String {
     .join("\n")
 }
 
-/// Renders per-policy validation outcomes: `OK <name>` or the failure
-/// reason verbatim from the loader.
-#[must_use]
 /// Renders stored agent sessions (verifier metadata only — raw tokens
 /// were shown exactly once at creation and are unrecoverable).
+#[must_use]
 pub fn render_sessions(agent: &str, records: &[vaultx_broker::AgentSessionRecord]) -> String {
     let rows: Vec<Vec<String>> = records
         .iter()
@@ -365,6 +363,7 @@ pub fn render_sessions(agent: &str, records: &[vaultx_broker::AgentSessionRecord
 
 /// Renders a broker allow response: status line, sanitized headers, and
 /// at most the first 2 KiB of the body as a preview.
+#[must_use]
 pub fn render_broker_response(response: &vaultx_broker::BrokerResponse) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();

@@ -538,13 +538,27 @@ mod tests {
 /// verifier hashes and identity metadata only — raw tokens are returned
 /// exactly once at creation and never written.
 ///
+/// # Cross-process coherence
+///
+/// The CLI (`agent session create/revoke`) and a serving broker open this
+/// store independently, so naive in-memory snapshots would let one side
+/// resurrect what the other revoked. Every operation therefore runs
+/// inside an exclusive `flock` on `<path>.lock` **and** reloads the
+/// on-disk state first, making each call read-modify-write against the
+/// freshest snapshot. Revocation is durable against concurrent writers;
+/// the residual cost is one file read per operation (negligible at
+/// session-store scale).
+///
 /// The file is created with `0600` permissions; loading refuses files
 /// whose mode grants group/other access rather than silently reading a
-/// leaked store. Every mutation rewrites the whole file atomically
-/// (tempfile + rename within the same directory).
+/// leaked store. Mutations persist atomically via a unique tempfile +
+/// fsync + rename within the same directory.
 pub struct FileSessionStore {
     path: PathBuf,
-    state: Mutex<InMemorySessionStore>,
+    lock_path: PathBuf,
+    /// Test-only wall-clock pin (unix seconds; 0 = real clock), applied
+    /// to every freshly-loaded in-memory snapshot.
+    clock_override: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for FileSessionStore {
@@ -552,6 +566,22 @@ impl std::fmt::Debug for FileSessionStore {
         f.debug_struct("FileSessionStore")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+/// RAII holder releasing the advisory lock on drop.
+struct FileLock {
+    #[cfg(unix)]
+    fd: std::os::fd::RawFd,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+            libc::close(self.fd);
+        }
     }
 }
 
@@ -563,32 +593,32 @@ impl FileSessionStore {
     /// ([`BrokerError::TransportFailure`]) when the existing file is
     /// readable by group/other.
     pub fn open(path: PathBuf) -> Result<Self, BrokerError> {
-        let state = if path.exists() {
+        if path.exists() {
             Self::check_mode(&path)?;
+            // Corruption is surfaced eagerly so operators learn about it
+            // before the first mutation would clobber context.
             let text = std::fs::read_to_string(&path).map_err(|err| {
                 BrokerError::TransportFailure(format!("cannot read session store: {err}"))
             })?;
-            let records: Vec<AgentSessionRecord> = serde_json::from_str(&text).map_err(|err| {
+            let _: Vec<AgentSessionRecord> = serde_json::from_str(&text).map_err(|err| {
                 BrokerError::TransportFailure(format!("corrupt session store: {err}"))
             })?;
-            let inner = InMemorySessionStore::new();
-            {
-                let mut state = inner.lock();
-                for record in records {
-                    state
-                        .by_hash
-                        .insert(record.token_hash, record.session_id.clone());
-                    state.sessions.insert(record.session_id.clone(), record);
-                }
-            }
-            inner
-        } else {
-            InMemorySessionStore::new()
-        };
+        }
+        let mut lock_name = path.clone().into_os_string();
+        lock_name.push(".lock");
         Ok(Self {
             path,
-            state: Mutex::new(state),
+            lock_path: PathBuf::from(lock_name),
+            clock_override: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Test-only: pins the wall clock used for expiry decisions across
+    /// all subsequent locked operations.
+    #[doc(hidden)]
+    pub fn set_clock_for_tests(&self, unix_secs: u64) {
+        self.clock_override
+            .store(unix_secs, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Refuses stores whose unix mode grants group/other any access.
@@ -615,22 +645,114 @@ impl FileSessionStore {
         Ok(())
     }
 
-    /// Atomically persists the current records.
-    fn persist(&self) -> Result<(), BrokerError> {
-        let mut records: Vec<AgentSessionRecord> = self.list_all_internal()?;
-        records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    /// Acquires the exclusive cross-process lock, creating the lock file
+    /// with restrictive permissions on first use.
+    fn acquire_lock(&self) -> Result<FileLock, BrokerError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            if let Some(parent) = self.lock_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    BrokerError::TransportFailure(format!("cannot create session dir: {err}"))
+                })?;
+            }
+            use std::os::unix::io::IntoRawFd as _;
+            let fd = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .open(&self.lock_path)
+                .map_err(|err| {
+                    BrokerError::TransportFailure(format!("cannot open session lock: {err}"))
+                })?
+                .into_raw_fd();
+            // Blocking acquire: contention windows are single-digit
+            // milliseconds (one small JSON rewrite).
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(BrokerError::TransportFailure(format!(
+                    "cannot lock session store: {err}"
+                )));
+            }
+            Ok(FileLock { fd })
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-unix platforms are single-user in v1; documented rather
+            // than faked coherence.
+            Ok(FileLock { fd: 0 })
+        }
+    }
+
+    /// Loads the current on-disk records under an already-held lock.
+    fn load_records(&self) -> Result<Vec<AgentSessionRecord>, BrokerError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        Self::check_mode(&self.path)?;
+        let text = std::fs::read_to_string(&self.path).map_err(|err| {
+            BrokerError::TransportFailure(format!("cannot read session store: {err}"))
+        })?;
+        serde_json::from_str(&text)
+            .map_err(|err| BrokerError::TransportFailure(format!("corrupt session store: {err}")))
+    }
+
+    /// Runs `body` against a freshly-loaded in-memory store under the
+    /// exclusive lock, persisting when the body reports a mutation.
+    fn with_locked<T>(
+        &self,
+        body: impl FnOnce(&InMemorySessionStore) -> Result<(T, bool), BrokerError>,
+    ) -> Result<T, BrokerError> {
+        let _guard = self.acquire_lock()?;
+        let records = self.load_records()?;
+        let inner = InMemorySessionStore::new();
+        inner.set_clock_for_tests(
+            self.clock_override
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        {
+            let mut state = inner.lock();
+            for record in records {
+                state
+                    .by_hash
+                    .insert(record.token_hash, record.session_id.clone());
+                state.sessions.insert(record.session_id.clone(), record);
+            }
+        }
+        let (value, mutated) = body(&inner)?;
+        if mutated {
+            self.persist_locked(&inner)?;
+        }
+        Ok(value)
+    }
+
+    /// Persists records; caller must hold the lock.
+    fn persist_locked(&self, inner: &InMemorySessionStore) -> Result<(), BrokerError> {
+        let guard = inner.lock();
+        let mut records: Vec<AgentSessionRecord> = guard.sessions.values().cloned().collect();
+        drop(guard);
         records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         let text = serde_json::to_string_pretty(&records)
-            .map_err(|err| BrokerError::Entropy(err.to_string()))?;
+            .map_err(|err| BrokerError::Serialization(err.to_string()))?;
 
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 BrokerError::TransportFailure(format!("cannot create session dir: {err}"))
             })?;
         }
-        // Write-through-temp-then-rename keeps readers from observing a
-        // torn file; the temp inherits restrictive mode via OpenOptions.
-        let tmp = self.path.with_extension("json.tmp");
+        // Unique temp name: two processes never collide mid-rename, and
+        // a crashed writer leaves identifiable debris instead of corrupt
+        // live state.
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
         {
             #[cfg(unix)]
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -644,30 +766,16 @@ impl FileSessionStore {
             std::io::Write::write_all(&mut file, text.as_bytes()).map_err(|err| {
                 BrokerError::TransportFailure(format!("cannot write session store: {err}"))
             })?;
+            // Durability before rename: a crash cannot publish an empty
+            // or torn store under the live name.
+            file.sync_all().map_err(|err| {
+                BrokerError::TransportFailure(format!("cannot flush session store: {err}"))
+            })?;
         }
         std::fs::rename(&tmp, &self.path).map_err(|err| {
             BrokerError::TransportFailure(format!("cannot finalize session store: {err}"))
         })?;
         Ok(())
-    }
-
-    /// Snapshot of every stored record (internal helper).
-    fn list_all_internal(&self) -> Result<Vec<AgentSessionRecord>, BrokerError> {
-        let guard = self.lock();
-        let inner = guard.lock();
-        Ok(inner.sessions.values().cloned().collect())
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, InMemorySessionStore> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Test-only: pins the wall clock of the wrapped in-memory store.
-    #[doc(hidden)]
-    pub fn set_clock_for_tests(&self, unix_secs: u64) {
-        self.lock().set_clock_for_tests(unix_secs);
     }
 }
 
@@ -677,9 +785,10 @@ impl SessionStore for FileSessionStore {
         agent: &AgentId,
         environment: &EnvironmentId,
     ) -> Result<(SessionId, String), BrokerError> {
-        let created = self.lock().create(agent, environment)?;
-        self.persist()?;
-        Ok(created)
+        self.with_locked(|inner| {
+            let created = inner.create(agent, environment)?;
+            Ok((created, true))
+        })
     }
 
     fn create_expiring(
@@ -688,22 +797,28 @@ impl SessionStore for FileSessionStore {
         environment: &EnvironmentId,
         ttl_secs: Option<u64>,
     ) -> Result<(SessionId, String), BrokerError> {
-        let created = self.lock().create_expiring(agent, environment, ttl_secs)?;
-        self.persist()?;
-        Ok(created)
+        self.with_locked(|inner| {
+            let created = inner.create_expiring(agent, environment, ttl_secs)?;
+            Ok((created, true))
+        })
     }
 
     fn validate(&self, raw_token: &str) -> Result<AgentSessionRecord, BrokerError> {
-        self.lock().validate(raw_token)
+        // Reload under lock: a revocation written by another process
+        // after our last touch must be visible here, or revoked tokens
+        // stay valid until restart.
+        self.with_locked(|inner| Ok((inner.validate(raw_token)?, false)))
     }
 
     fn revoke(&self, session_id: &SessionId) -> Result<(), BrokerError> {
-        self.lock().revoke(session_id)?;
-        self.persist()
+        self.with_locked(|inner| {
+            inner.revoke(session_id)?;
+            Ok(((), true))
+        })
     }
 
     fn list_for_agent(&self, agent: &AgentId) -> Result<Vec<AgentSessionRecord>, BrokerError> {
-        self.lock().list_for_agent(agent)
+        self.with_locked(|inner| Ok((inner.list_for_agent(agent)?, false)))
     }
 }
 
@@ -772,6 +887,40 @@ mod file_store_tests {
         let listed = store.list_for_agent(&agent()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, mine);
+    }
+
+    #[test]
+    fn revocation_by_second_instance_is_visible_immediately() {
+        // The CLI-vs-broker coherence contract: instance B must observe
+        // instance A's revocation on its very next validate, and B's own
+        // later create must not resurrect A's revoked session.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+
+        let cli_side = FileSessionStore::open(path.clone()).unwrap();
+        let (session_id, token) = cli_side.create(&agent(), &environment()).unwrap();
+
+        let broker_side = FileSessionStore::open(path.clone()).unwrap();
+        assert!(broker_side.validate(&token).is_ok());
+
+        cli_side.revoke(&session_id).unwrap();
+        assert!(matches!(
+            broker_side.validate(&token),
+            Err(BrokerError::SessionRevoked)
+        ));
+
+        // The resurrection vector: broker-side mutation reloads disk
+        // first, so its write carries the revoked flag forward.
+        let (_, _fresh) = broker_side
+            .create(&AgentId::parse("agent_other").unwrap(), &environment())
+            .unwrap();
+        assert!(
+            matches!(
+                broker_side.validate(&token),
+                Err(BrokerError::SessionRevoked)
+            ),
+            "broker-side create must not un-revoke"
+        );
     }
 
     #[test]

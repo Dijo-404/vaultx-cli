@@ -432,7 +432,9 @@ pub enum BrokerCommand {
 /// [`BrokerCommand`] to keep the enum small).
 #[derive(Args, Debug)]
 pub struct BrokerRequestArgs {
-    /// Raw capability token printed by `agent session create`.
+    /// Raw capability token printed by `agent session create`, or `-`
+    /// to read it from stdin (recommended: argv values land in shell
+    /// history and process listings).
     #[arg(long)]
     session: String,
     /// Logical credential reference to resolve.
@@ -1279,7 +1281,7 @@ fn cmd_agent_session_create(
         None => "no expiry".to_owned(),
     };
     Ok(format!(
-        "created session {session_id} for {name} in {env_name} ({expiry_note})\n\n         CAPABILITY TOKEN (shown once; it cannot be recovered):\n{raw_token}"
+        "created session {session_id} for {name} in {env_name} ({expiry_note})\n\nCAPABILITY TOKEN (shown once; it cannot be recovered):\n{raw_token}"
     ))
 }
 
@@ -1384,10 +1386,16 @@ fn resolve_endpoint(project: &Path, socket: Option<&Path>) -> PathBuf {
             #[cfg(unix)]
             {
                 let _ = project;
+                // Mirrors vaultx_broker::ipc::default_socket_path's
+                // uid-scoped fallback so client and server agree without
+                // importing unix-only items here.
                 let base = std::env::var_os("XDG_RUNTIME_DIR")
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/tmp"));
+                    .unwrap_or_else(|| {
+                        let uid = unsafe { libc::getuid() };
+                        PathBuf::from("/tmp").join(format!("vaultx-{uid}"))
+                    });
                 base.join("vaultx").join("local").join("broker.sock")
             }
             #[cfg(windows)]
@@ -1433,6 +1441,22 @@ fn cmd_broker_request(
 ) -> Result<String, CliError> {
     use base64::Engine as _;
     let endpoint = resolve_endpoint(project, socket);
+
+    let session_token = match session_token {
+        "-" => {
+            use std::io::Read as _;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|err| CliError::Usage(format!("cannot read session token: {err}")))?;
+            let trimmed = buf
+                .strip_suffix("\r\n")
+                .or_else(|| buf.strip_suffix('\n'))
+                .unwrap_or(&buf);
+            trimmed.to_owned()
+        }
+        other => other.to_owned(),
+    };
 
     let http_method = parse_http_method(method)?;
     let parsed_credential = CredentialRef::parse(credential)

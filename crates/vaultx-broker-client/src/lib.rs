@@ -80,12 +80,12 @@ impl BrokerClient {
     /// # Errors
     /// See [`ClientError`].
     pub async fn ping(&mut self) -> Result<String, ClientError> {
-        self.exchange(&ClientLine::Ping, DEFAULT_TIMEOUT)
-            .await
-            .map(|line| match line {
-                ServerLine::Pong { version, .. } => version,
-                other => format!("unexpected reply: {other:?}"),
-            })
+        match self.exchange(&ClientLine::Ping, DEFAULT_TIMEOUT).await? {
+            ServerLine::Pong { version, .. } => Ok(version),
+            ServerLine::Response(_) | ServerLine::ProtocolViolation { .. } => Err(
+                ClientError::ProtocolViolation("expected pong for ping".to_owned()),
+            ),
+        }
     }
 
     /// Sends one brokered request and returns the broker's response.

@@ -64,6 +64,10 @@ pub enum BrokerError {
     /// call site and surfaced rather than papered over with weak IDs.
     #[error("secure entropy source unavailable: {0}")]
     Entropy(String),
+    /// A value could not be serialized for persistence. Messages quote
+    /// the failure class only — never the payload.
+    #[error("serialization failure: {0}")]
+    Serialization(String),
 }
 
 #[cfg(test)]
@@ -92,6 +96,7 @@ mod tests {
             BrokerError::SanitizationFailed("set-cookie".to_owned()),
             BrokerError::InjectionError("header_name required".to_owned()),
             BrokerError::Entropy("no entropy".to_owned()),
+            BrokerError::Serialization("bad json".to_owned()),
         ];
 
         for err in &errors {

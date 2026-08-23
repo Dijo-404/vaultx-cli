@@ -428,7 +428,7 @@ impl BrokerEngine {
     > {
         let template = self
             .credentials
-            .template_for(credential)
+            .template_for_in_env(credential, environment)
             .map_err(|_| BrokerError::UnknownCredential(credential.to_string()))?;
         let metadata = self
             .credentials

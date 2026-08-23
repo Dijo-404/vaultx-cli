@@ -42,6 +42,20 @@ pub trait CredentialSource: Send + Sync {
     /// Same as [`CredentialSource::resolve`].
     fn template_for(&self, credential: &CredentialRef) -> Result<InjectionTemplateId, BrokerError>;
 
+    /// Environment-scoped template lookup. Sources that scope bindings
+    /// per environment must override this; the default ignores the
+    /// environment for backward compatibility with flat sources.
+    ///
+    /// # Errors
+    /// Same as [`CredentialSource::resolve`].
+    fn template_for_in_env(
+        &self,
+        credential: &CredentialRef,
+        _environment: &EnvironmentId,
+    ) -> Result<InjectionTemplateId, BrokerError> {
+        self.template_for(credential)
+    }
+
     /// Returns the non-secret placement metadata of `credential`.
     /// Defaults to empty metadata for sources that store none.
     ///

@@ -99,22 +99,23 @@ fn to_broker_template(template: vaultx_types::model::InjectionTemplateId) -> Inj
 }
 
 impl CredentialSource for VaultCredentialSource {
-    fn resolve(
+    /// Bindings are scoped per environment: the same ref may use
+    /// different templates in staging vs production, so selection MUST
+    /// honor the session's environment rather than scanning globally.
+    fn template_for_in_env(
         &self,
         credential: &CredentialRef,
         environment: &EnvironmentId,
-    ) -> Result<SecretBytes, BrokerError> {
-        self.lookup(credential, environment)?;
-        // Reveal happens only after the binding matched; any failure
-        // collapses to the same unknown-credential denial so callers
-        // cannot probe which step failed.
-        let secrets = SecretService::new(self.ctx.as_ref());
-        let plaintext = secrets
-            .reveal_secret(&credential.to_string(), Self::bare_env(environment))
-            .map_err(|_| BrokerError::UnknownCredential(credential.to_string()))?;
-        Ok(SecretBytes::from_bytes(plaintext.as_slice()))
+    ) -> Result<InjectionTemplateId, BrokerError> {
+        let metadata = self.lookup(credential, environment)?;
+        metadata
+            .brokered
+            .map(|binding| to_broker_template(binding.injection))
+            .ok_or_else(|| BrokerError::UnknownCredential(credential.to_string()))
     }
 
+    /// Flat lookup retained for trait completeness; production paths go
+    /// through [`Self::template_for_in_env`].
     fn template_for(&self, credential: &CredentialRef) -> Result<InjectionTemplateId, BrokerError> {
         // The resolution seam carries no environment context here, so the
         // binding is located through every registered environment (the
@@ -132,6 +133,22 @@ impl CredentialSource for VaultCredentialSource {
             }
         }
         Err(BrokerError::UnknownCredential(credential.to_string()))
+    }
+
+    fn resolve(
+        &self,
+        credential: &CredentialRef,
+        environment: &EnvironmentId,
+    ) -> Result<SecretBytes, BrokerError> {
+        self.lookup(credential, environment)?;
+        // Reveal happens only after the binding matched; any failure
+        // collapses to the same unknown-credential denial so callers
+        // cannot probe which step failed.
+        let secrets = SecretService::new(self.ctx.as_ref());
+        let plaintext = secrets
+            .reveal_secret(&credential.to_string(), Self::bare_env(environment))
+            .map_err(|_| BrokerError::UnknownCredential(credential.to_string()))?;
+        Ok(SecretBytes::from_bytes(plaintext.as_slice()))
     }
 }
 

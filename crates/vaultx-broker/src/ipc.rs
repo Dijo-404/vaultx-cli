@@ -155,16 +155,30 @@ impl Serialize for ServerLine {
 // ---------------------------------------------------------------------------
 
 /// Resolves the default bind path for `endpoint_id`:
-/// `$XDG_RUNTIME_DIR/vaultx/<id>/broker.sock`, falling back to
-/// `/tmp/vaultx/<id>/broker.sock` when the runtime dir is unset.
+/// `$XDG_RUNTIME_DIR/vaultx/<id>/broker.sock`, falling back to a
+/// **uid-scoped** `/tmp` directory when the runtime dir is unset.
+///
+/// The fallback is `/tmp/vaultx-<uid>/<id>/broker.sock`, never the bare
+/// shared `/tmp`: a world-writable parent would let an attacker
+/// pre-create the tree, own it (0700 on their own dir constrains
+/// nothing), and swap or harvest the socket. Scoping by uid keeps the
+/// parent attacker-inaccessible from the first mkdir.
 #[cfg(unix)]
 #[must_use]
 pub fn default_socket_path(endpoint_id: &str) -> PathBuf {
-    let base = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from("/tmp"),
-    };
-    base.join("vaultx").join(endpoint_id).join("broker.sock")
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir)
+            .join("vaultx")
+            .join(endpoint_id)
+            .join("broker.sock"),
+        _ => {
+            let uid = unsafe { libc::getuid() };
+            PathBuf::from("/tmp")
+                .join(format!("vaultx-{uid}"))
+                .join(endpoint_id)
+                .join("broker.sock")
+        }
+    }
 }
 
 /// Sanitizes an endpoint segment: lowercase alphanumerics and `-`
@@ -340,7 +354,15 @@ impl<E: EngineHandle> BrokerServer<E> {
             ));
         };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let live = Arc::new(AtomicUsize::new(0));
+        // A trigger fired before this subscribe must still stop us:
+        // borrow_and_update surfaces already-set values that `changed()`
+        // alone would miss.
+        if *shutdown_rx.borrow_and_update() {
+            drop(listener);
+            let _ = std::fs::remove_file(&self.path);
+            return Ok(());
+        }
+        let live = Arc::new(LiveConnections::default());
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
@@ -353,25 +375,31 @@ impl<E: EngineHandle> BrokerServer<E> {
                             ));
                         }
                     };
-                    if live.load(Ordering::SeqCst) >= self.config.effective_connections() {
-                        // Refuse politely. Draining the peer's pending
-                        // line first prevents an RST from destroying the
-                        // refusal before the client reads it.
-                        let mut guarded = stream;
-                        let _ = read_line_capped(&mut guarded).await;
-                        let line = ServerLine::ProtocolViolation {
-                            error: "connection limit reached".to_owned(),
-                        };
-                        let _ = write_line(&mut guarded, &line).await;
+                    if live.count() >= self.config.effective_connections() {
+                        // Refuse off the accept path: an inline drain
+                        // would let a silent peer wedge both accepts and
+                        // shutdown. The spawned task bounds its wait.
+                        let mut conn_shutdown = shutdown_rx.clone();
+                        tokio::spawn(async move {
+                            refuse_connection(stream, &mut conn_shutdown).await;
+                        });
                         continue;
                     }
-                    live.fetch_add(1, Ordering::SeqCst);
                     let engine = Arc::clone(&self.engine);
-                    let live_counter = Arc::clone(&live);
+                    let slot = live.acquire();
                     let mut conn_shutdown = shutdown_rx.clone();
+                    // A fresh receiver may have missed the shutdown send;
+                    // check the current value up front.
+                    if *conn_shutdown.borrow_and_update() {
+                        drop(slot);
+                        drop(stream);
+                        continue;
+                    }
+                    // `slot` is an RAII guard: its Drop releases the
+                    // count even when the connection task panics.
                     tokio::spawn(async move {
                         serve_connection(stream, engine, &mut conn_shutdown).await;
-                        live_counter.fetch_sub(1, Ordering::SeqCst);
+                        drop(slot);
                     });
                 }
             }
@@ -388,6 +416,62 @@ impl<E: EngineHandle> BrokerServer<E> {
             "windows named-pipe serving is not implemented yet".to_owned(),
         ))
     }
+}
+
+/// Tracks live connections with RAII slots so panics cannot leak the
+/// count and permanently wedge the limit at zero capacity.
+#[derive(Default)]
+struct LiveConnections {
+    count: AtomicUsize,
+}
+
+impl LiveConnections {
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    fn acquire(self: &Arc<Self>) -> ConnectionSlot {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        ConnectionSlot {
+            owner: Arc::clone(self),
+        }
+    }
+}
+
+struct ConnectionSlot {
+    owner: Arc<LiveConnections>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.owner.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Bounded refusal exchange for over-limit peers: drain one pending line
+/// (so our reply is not destroyed by an RST), answer, and close — all off
+/// the accept path, all under a short timeout so silent peers cost
+/// nothing.
+async fn refuse_connection(
+    mut stream: tokio::net::UnixStream,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let drain = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        read_line_capped(&mut stream),
+    );
+    let _ = drain.await;
+    let line = ServerLine::ProtocolViolation {
+        error: "connection limit reached".to_owned(),
+    };
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        write_line(&mut stream, &line),
+    );
+    let _ = reply.await;
+    // Keep the receiver alive to end of scope: a dropped clone that never
+    // observed a send would be harmless, but holding it documents intent.
+    let _ = shutdown.borrow();
 }
 
 /// Creates `path` and every missing parent with `0700`.
@@ -632,32 +716,38 @@ mod tests {
         (handle, bound)
     }
 
-    /// Writes one line and reads the full reply until EOF.
+    /// Writes one line and reads one newline-framed reply. The overall
+    /// deadline is generous (5 s) so CI load slows nothing into flake
+    /// territory; the framing means we return the instant the reply is
+    /// complete rather than sleeping and hoping.
     async fn exchange_line(bound: &Path, line: &[u8]) -> String {
         let mut stream = tokio::net::UnixStream::connect(bound).await.unwrap();
         stream.write_all(line).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let mut buf = Vec::new();
-        read_reply(&mut stream, &mut buf).await;
-        String::from_utf8(buf).unwrap()
+        read_framed_reply(&mut stream).await
     }
 
-    /// Reads until the peer closes its side, bounded by a short timeout
-    /// so a wedged server fails the test instead of hanging it.
-    async fn read_reply(stream: &mut tokio::net::UnixStream, buf: &mut Vec<u8>) {
+    /// Reads bytes until the first `\n` or the deadline; returns the raw
+    /// line text (newline stripped).
+    async fn read_framed_reply(stream: &mut tokio::net::UnixStream) -> String {
         let mut byte = [0u8; 1];
+        let mut buf = Vec::new();
         loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                stream.read(&mut byte),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut byte))
+                .await
             {
                 Ok(Ok(0)) | Err(_) => break,
-                Ok(Ok(_)) => buf.push(byte[0]),
+                Ok(Ok(_)) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    if byte[0] != b'\r' {
+                        buf.push(byte[0]);
+                    }
+                }
                 Ok(Err(_)) => break,
             }
         }
+        String::from_utf8(buf).unwrap()
     }
 
     #[tokio::test]
@@ -700,10 +790,7 @@ mod tests {
         let (_handle, bound) = spawn_server(dir.path(), 16).await;
         let mut stream = tokio::net::UnixStream::connect(&bound).await.unwrap();
         stream.write_all(b"this is not json\n").await.unwrap();
-
-        let mut buf = Vec::new();
-        read_reply(&mut stream, &mut buf).await;
-        let text = String::from_utf8(buf).unwrap();
+        let text = read_framed_reply(&mut stream).await;
         assert!(text.contains("\"error\""), "{text}");
     }
 
@@ -715,38 +802,37 @@ mod tests {
         let huge = vec![b'a'; MAX_LINE_BYTES + 1];
         stream.write_all(&huge).await.unwrap();
 
-        let mut buf = Vec::new();
-        read_reply(&mut stream, &mut buf).await;
-        let text = String::from_utf8(buf).unwrap();
+        let text = read_framed_reply(&mut stream).await;
         assert!(text.contains("exceeds maximum permitted size"), "{text}");
 
         // The server survives and still answers pings.
-        let mut client = tokio::net::UnixStream::connect(&bound).await.unwrap();
-        client
-            .write_all(b"{\"protocol\":1,\"op\":\"ping\"}\n")
-            .await
-            .unwrap();
-        let mut pong = Vec::new();
-        read_reply(&mut client, &mut pong).await;
-        assert!(String::from_utf8(pong).unwrap().contains("\"ok\":true"));
+        let reply = exchange_line(&bound, b"{\"protocol\":1,\"op\":\"ping\"}\n").await;
+        assert!(reply.contains("\"ok\":true"), "{reply}");
     }
 
     #[tokio::test]
     async fn connection_limit_refuses_extra_peers_politely() {
         let dir = tempfile::tempdir().expect("tmp");
         let (_handle, bound) = spawn_server(dir.path(), 1).await;
-        // One connection occupies the single slot; it never sends.
-        let _holder = tokio::net::UnixStream::connect(&bound).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // The holder occupies the single slot. Synchronize on a completed
+        // exchange instead of a sleep so the slot is guaranteed live.
+        let mut holder = tokio::net::UnixStream::connect(&bound).await.unwrap();
+        holder
+            .write_all(b"{\"protocol\":1,\"op\":\"ping\"}\n")
+            .await
+            .unwrap();
+        let pong = read_framed_reply(&mut holder).await;
+        assert!(pong.contains("\"ok\":true"), "{pong}");
+
+        // Second peer is refused (drained + violation line) even though
+        // it stays silent afterwards.
         let mut second = tokio::net::UnixStream::connect(&bound).await.unwrap();
         second
             .write_all(b"{\"protocol\":1,\"op\":\"ping\"}\n")
             .await
             .unwrap();
-        let mut reply = Vec::new();
-        second.read_to_end(&mut reply).await.unwrap();
-        let text = String::from_utf8(reply).unwrap();
+        let text = read_framed_reply(&mut second).await;
         assert!(text.contains("connection limit"), "{text}");
     }
 

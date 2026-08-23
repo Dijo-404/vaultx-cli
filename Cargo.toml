@@ -65,3 +65,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"
 # Hardened outbound HTTP client for the broker transport (rustls only;
 # default features pull the native-tls stack and are deliberately off).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Unix-only: flock-based session-store coherence and uid-scoped endpoints.
+libc = "0.2"
