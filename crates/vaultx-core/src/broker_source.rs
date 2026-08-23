@@ -1,0 +1,202 @@
+//! [`VaultCredentialSource`]: bridges the encrypted secret vault into the
+//! broker's credential-resolution seam.
+//!
+//! Only secrets stored with `kind == Brokered` are resolvable — plain
+//! `Secret` values can never be pulled through the outbound-request
+//! pipeline (plan §18: the broker resolves *brokered credentials*, not
+//! arbitrary vault entries). Resolution happens per request: plaintext is
+//! decrypted inside this boundary and handed to injection as
+//! zeroizing-on-drop bytes; nothing is cached.
+//!
+//! The CLI convention binds a brokered secret's logical credential ref to
+//! its lowercased variable name, so lookups go name-first and then verify
+//! that the stored binding matches the requested ref exactly.
+
+use std::sync::Arc;
+
+use vaultx_broker::credential::CredentialSource;
+use vaultx_broker::error::BrokerError;
+use vaultx_broker::inject::InjectionTemplateId;
+use vaultx_crypto::secret::SecretBytes;
+use vaultx_types::{CredentialRef, EnvironmentId};
+
+use crate::error::{CoreError, CoreResult};
+use crate::secrets::SecretService;
+use crate::ProjectContext;
+
+/// Resolves brokered credentials by decrypting on demand.
+#[derive(Debug)]
+pub struct VaultCredentialSource {
+    ctx: Arc<ProjectContext>,
+}
+
+impl VaultCredentialSource {
+    /// Wraps an opened project context. The context is shared (not
+    /// owned) so the CLI/TUI keep using their own facade alongside.
+    #[must_use]
+    pub fn new(ctx: Arc<ProjectContext>) -> Self {
+        Self { ctx }
+    }
+
+    /// Environment ids use the `env_<bare>` spelling everywhere; secret
+    /// service lookups take the bare name.
+    fn bare_env(environment: &EnvironmentId) -> &str {
+        environment.as_str().trim_start_matches("env_")
+    }
+
+    fn lookup(
+        &self,
+        credential: &CredentialRef,
+        environment: &EnvironmentId,
+    ) -> Result<crate::secrets::SecretMetadata, BrokerError> {
+        let unknown = || BrokerError::UnknownCredential(credential.to_string());
+        let secrets = SecretService::new(self.ctx.as_ref());
+        for entry in secrets
+            .list_secrets(Self::bare_env(environment))
+            .map_err(|_| unknown())?
+        {
+            if entry.kind != vaultx_types::model::VariableKind::Brokered {
+                continue;
+            }
+            let Ok(metadata) =
+                secrets.secret_metadata(entry.name.as_str(), Self::bare_env(environment))
+            else {
+                continue;
+            };
+            if metadata.state != crate::secrets::SecretRevisionState::Active {
+                continue;
+            }
+            let Some(binding) = metadata.brokered.as_ref() else {
+                continue;
+            };
+            if binding.credential_ref == *credential {
+                return Ok(metadata);
+            }
+        }
+        Err(unknown())
+    }
+}
+
+/// Maps the type-layer template id onto the broker seam's enum. Both are
+/// kebab-case tagged; matching stays explicit so a new variant cannot
+/// silently fall through.
+fn to_broker_template(template: vaultx_types::model::InjectionTemplateId) -> InjectionTemplateId {
+    match template {
+        vaultx_types::model::InjectionTemplateId::Bearer => InjectionTemplateId::Bearer,
+        vaultx_types::model::InjectionTemplateId::BasicPassword => {
+            InjectionTemplateId::BasicPassword
+        }
+        vaultx_types::model::InjectionTemplateId::ApiKeyHeader => InjectionTemplateId::ApiKeyHeader,
+        vaultx_types::model::InjectionTemplateId::GithubBearer => InjectionTemplateId::GithubBearer,
+        vaultx_types::model::InjectionTemplateId::QueryParameter => {
+            InjectionTemplateId::QueryParameter
+        }
+        vaultx_types::model::InjectionTemplateId::AwsSigv4 => InjectionTemplateId::AwsSigv4,
+        vaultx_types::model::InjectionTemplateId::CustomStaticHeaderPlusSecret => {
+            InjectionTemplateId::CustomStaticHeaderPlusSecret
+        }
+    }
+}
+
+impl CredentialSource for VaultCredentialSource {
+    fn resolve(
+        &self,
+        credential: &CredentialRef,
+        environment: &EnvironmentId,
+    ) -> Result<SecretBytes, BrokerError> {
+        self.lookup(credential, environment)?;
+        // Reveal happens only after the binding matched; any failure
+        // collapses to the same unknown-credential denial so callers
+        // cannot probe which step failed.
+        let secrets = SecretService::new(self.ctx.as_ref());
+        let plaintext = secrets
+            .reveal_secret(&credential.to_string(), Self::bare_env(environment))
+            .map_err(|_| BrokerError::UnknownCredential(credential.to_string()))?;
+        Ok(SecretBytes::from_bytes(plaintext.as_slice()))
+    }
+
+    fn template_for(&self, credential: &CredentialRef) -> Result<InjectionTemplateId, BrokerError> {
+        // The resolution seam carries no environment context here, so the
+        // binding is located through every registered environment (the
+        // authoritative registry, not guessed spellings).
+        let environments = crate::EnvironmentService::new(self.ctx.as_ref())
+            .list_environments()
+            .map_err(|_| BrokerError::UnknownCredential(credential.to_string()))?;
+        for summary in environments {
+            if let Ok(environment) = EnvironmentId::parse(&format!("env_{}", summary.name)) {
+                if let Ok(metadata) = self.lookup(credential, &environment) {
+                    if let Some(binding) = metadata.brokered {
+                        return Ok(to_broker_template(binding.injection));
+                    }
+                }
+            }
+        }
+        Err(BrokerError::UnknownCredential(credential.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Production engine assembly (used by `vaultx broker serve`)
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc as StdArc;
+
+use vaultx_audit::JsonlAppendStore;
+use vaultx_broker::engine::{BrokerDependencies, BrokerEngine};
+use vaultx_broker::http_transport::HttpTransport;
+use vaultx_broker::session::FileSessionStore;
+use vaultx_http::{CanonicalUrl, EgressGuard, RedirectAuthorizer, RedirectPolicy, SizeLimits};
+
+/// Redirect gate for v1 serving: same origin only (host + port). The
+/// original request was already authorized against policy, so a
+/// same-origin hop stays inside its approval scope; every cross-origin
+/// hop is refused outright and credentials therefore never leave the
+/// approved origin (INV-006/007 by construction).
+#[derive(Debug, Default)]
+pub struct SameOriginRedirectAuthorizer;
+
+impl RedirectAuthorizer for SameOriginRedirectAuthorizer {
+    fn authorize_redirect(&self, original: &CanonicalUrl, next: &CanonicalUrl) -> bool {
+        original.host() == next.host() && original.port_or_default() == next.port_or_default()
+    }
+}
+
+/// Assembles a fully wired [`BrokerEngine`] over an opened project:
+///
+/// * authorizer — project policies via [`crate::PolicyOpsService::build_engine`];
+/// * sessions — persistent verifier-hash store at
+///   `<project>/.vaultx/sessions.json` (`0600`);
+/// * credentials — [`VaultCredentialSource`] decrypting brokered
+///   secrets on demand;
+/// * audit — hash-chained JSONL store on the project's audit path
+///   (fail-closed: every outcome lands there);
+/// * transport — hardened reqwest/rustls client with DNS pinning,
+///   manual redirects (same-origin), and plan size limits.
+///
+/// # Errors
+/// Propagates policy compilation and session-store open failures.
+pub fn build_production_engine(ctx: &StdArc<ProjectContext>) -> CoreResult<BrokerEngine> {
+    let rule_engine = crate::PolicyOpsService::new(ctx.as_ref()).build_engine()?;
+    let sessions = FileSessionStore::open(ctx.vault_dir().join("sessions.json"))
+        .map_err(|err| CoreError::Io(std::io::Error::other(err.to_string())))?;
+    let transport = HttpTransport::new(
+        EgressGuard::new(false),
+        SizeLimits::default(),
+        RedirectPolicy::new(5),
+        StdArc::new(SameOriginRedirectAuthorizer),
+        None,
+    )
+    .map_err(|err| CoreError::Io(std::io::Error::other(err.to_string())))?;
+
+    Ok(BrokerEngine::new(BrokerDependencies {
+        authorizer: StdArc::new(rule_engine),
+        sessions: StdArc::new(sessions),
+        credentials: StdArc::new(VaultCredentialSource::new(StdArc::clone(ctx))),
+        injectors: StdArc::new(vaultx_broker::InjectorRegistry::new()),
+        transport: StdArc::new(transport),
+        audit: StdArc::new(JsonlAppendStore::open(ctx.audit_path())),
+        project: vaultx_types::ProjectId::parse("proj_local")
+            .map_err(|_| CoreError::Io(std::io::Error::other("invalid local project id")))?,
+        egress_allow_private: false,
+    }))
+}

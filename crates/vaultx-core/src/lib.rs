@@ -43,6 +43,7 @@
 //! point yet; history and refs remain purely local.
 
 mod agents;
+pub mod broker_source;
 mod config;
 mod doctor;
 mod envs;
@@ -55,6 +56,7 @@ mod services;
 mod staging;
 
 pub use agents::{AgentIdentityFile, AgentLifecycleService, AgentSummary};
+pub use broker_source::VaultCredentialSource;
 pub use config::{ConfigService, ImportReport};
 pub use doctor::{render_checks, CheckOutcome, CheckStatus, DoctorService};
 pub use envs::{EnvironmentService, EnvironmentSummary};

@@ -10,7 +10,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 vaultx-audit = { path = "../vaultx-audit" }
+vaultx-broker = { path = "../vaultx-broker" }
 vaultx-crypto = { path = "../vaultx-crypto" }
+vaultx-http = { path = "../vaultx-http" }
 vaultx-keyring = { path = "../vaultx-keyring" }
 vaultx-policy = { path = "../vaultx-policy" }
 vaultx-repository = { path = "../vaultx-repository" }
