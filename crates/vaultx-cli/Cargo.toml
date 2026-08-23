@@ -11,10 +11,15 @@ name = "vaultx"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { workspace = true }
 clap = { workspace = true }
 rpassword = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+vaultx-broker = { path = "../vaultx-broker" }
+vaultx-broker-client = { path = "../vaultx-broker-client" }
 vaultx-core = { path = "../vaultx-core" }
+vaultx-policy = { path = "../vaultx-policy" }
 vaultx-policy-packs = { path = "../vaultx-policy-packs" }
 vaultx-types = { path = "../vaultx-types" }
 zeroize = { workspace = true }

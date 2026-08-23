@@ -357,7 +357,8 @@ fn unsupported_groups_return_not_implemented_with_exit_two() {
     let dir = tempfile::tempdir().unwrap();
     let stubs = [
         ("run", Command::Run(StubArgs { args: Vec::new() })),
-        ("broker", Command::Broker(StubArgs { args: Vec::new() })),
+        // `broker` is implemented now; its subcommands are exercised in
+        // the dedicated broker tests below.
         ("mcp", Command::Mcp(StubArgs { args: Vec::new() })),
         (
             "audit",

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use thiserror::Error;
 
+use vaultx_broker::SessionStore as _;
 use vaultx_core::{
     BrokeredBinding, CommitSummary, CoreError, MergeOutcome, MergeStrategy, SecretString,
     VaultxServices,
@@ -67,6 +68,10 @@ pub enum CliError {
     /// report. Exit code 1.
     #[error("{0}")]
     Diagnostics(String),
+    /// A policy denial returned by the broker. Exit code 4 — distinct
+    /// from transport/usage failures so agents can branch on it.
+    #[error("denied by policy: {0}")]
+    Denied(String),
     /// An underlying application service failed at runtime.
     /// Exit code 1.
     #[error(transparent)]
@@ -83,7 +88,8 @@ impl CliError {
     /// * 1 — runtime or usage failure, merge conflicts, failing
     ///   diagnostics, or policy pack failures,
     /// * 2 — not-yet-implemented command group,
-    /// * 3 — target directory is not a vaultx repository.
+    /// * 3 — target directory is not a vaultx repository,
+    /// * 4 — brokered request denied by policy.
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
@@ -92,6 +98,7 @@ impl CliError {
             | Self::Conflicts(_)
             | Self::Diagnostics(_)
             | Self::Pack(_) => 1,
+            Self::Denied(_) => 4,
             Self::NotImplemented(_) => 2,
             Self::NotARepository(_) => 3,
         }
@@ -287,8 +294,11 @@ pub enum Command {
     // ---- planned groups (exit code 2 notices) ----
     /// Run commands with resolved environment (planned).
     Run(StubArgs),
-    /// Broker server/session operations (planned).
-    Broker(StubArgs),
+    /// Local broker process operations.
+    Broker {
+        #[command(subcommand)]
+        command: BrokerCommand,
+    },
     /// Manage declarative policy packs.
     Pack {
         #[command(subcommand)]
@@ -357,6 +367,29 @@ pub enum AgentCommand {
         /// Agent bare name.
         name: String,
     },
+    /// Create an agent session and print its capability token once.
+    SessionCreate {
+        /// Agent bare name owning the session.
+        name: String,
+        /// Environment the session operates in (default: development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+        /// Optional time-to-live in seconds; expired sessions validate
+        /// exactly like revoked ones.
+        #[arg(long, value_name = "SECS")]
+        ttl_secs: Option<u64>,
+    },
+    /// List an agent's stored sessions (verifier metadata only).
+    SessionsList {
+        /// Agent bare name.
+        name: String,
+    },
+    /// Revoke one session by exact id (`sess_...`). Revocation is
+    /// permanent.
+    Revoke {
+        /// Full session id to revoke.
+        session_id: String,
+    },
 }
 
 /// `vaultx policy <subcommand>` (save/edit arrive later).
@@ -366,6 +399,70 @@ pub enum PolicyCommand {
     Validate,
     /// List policies as NAME / PRINCIPAL / CREDENTIAL columns.
     List,
+}
+
+/// `vaultx broker <subcommand>`.
+///
+/// `serve` runs the local broker process over the plan's Unix-socket /
+/// named-pipe endpoint; `status` probes it; `request` performs one
+/// brokered exchange as an agent would.
+///
+/// The `Request` variant is boxed: its many string options dwarf the
+/// other variants and clap derives a large struct for it.
+#[derive(Subcommand, Debug)]
+pub enum BrokerCommand {
+    /// Bind the IPC endpoint and serve until Ctrl-C.
+    Serve {
+        /// Endpoint override (default:
+        /// `$XDG_RUNTIME_DIR/vaultx/local/broker.sock` or platform pipe).
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Probe the broker endpoint and print its version.
+    Status {
+        /// Endpoint override.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Perform one brokered HTTP request through the endpoint.
+    Request(Box<BrokerRequestArgs>),
+}
+
+/// Flag bundle behind `vaultx broker request` (boxed in
+/// [`BrokerCommand`] to keep the enum small).
+#[derive(Args, Debug)]
+pub struct BrokerRequestArgs {
+    /// Raw capability token printed by `agent session create`.
+    #[arg(long)]
+    session: String,
+    /// Logical credential reference to resolve.
+    #[arg(long)]
+    credential: String,
+    /// Outbound HTTP method.
+    #[arg(long, default_value = "GET")]
+    method: String,
+    /// Destination URL (canonicalized and policy-checked remotely).
+    #[arg(long)]
+    url: String,
+    /// Extra caller headers as NAME=VALUE (repeatable). Sensitive
+    /// names are stripped by the broker regardless.
+    #[arg(long = "header", value_name = "NAME=VALUE")]
+    headers: Vec<String>,
+    /// UTF-8 request body.
+    #[arg(long, conflicts_with_all = ["data_binary", "data_base64"])]
+    data: Option<String>,
+    /// Raw request body read from @FILE.
+    #[arg(long, value_name = "@FILE", conflicts_with_all = ["data", "data_base64"])]
+    data_binary: Option<String>,
+    /// Base64-encoded request body.
+    #[arg(long, conflicts_with_all = ["data", "data_binary"])]
+    data_base64: Option<String>,
+    /// Informational capability name (never used for authorization).
+    #[arg(long)]
+    capability_hint: Option<String>,
+    /// Endpoint override.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
 }
 
 /// `vaultx pack <subcommand>`.
@@ -528,6 +625,19 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             AgentCommand::Disable { name } => {
                 with_open(&cli.project, |s| cmd_agent_disable(s, name))
             }
+            AgentCommand::SessionCreate {
+                name,
+                env,
+                ttl_secs,
+            } => with_open(&cli.project, |s| {
+                cmd_agent_session_create(s, name, env.as_deref(), *ttl_secs)
+            }),
+            AgentCommand::SessionsList { name } => {
+                with_open(&cli.project, |s| cmd_agent_sessions_list(s, name))
+            }
+            AgentCommand::Revoke { session_id } => {
+                with_open(&cli.project, |s| cmd_agent_session_revoke(s, session_id))
+            }
         },
 
         Command::Policy { command } => match command {
@@ -594,7 +704,29 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
 
         // Planned groups: reserved names, clear notices, exit code 2.
         Command::Run(_) => Err(CliError::NotImplemented("run")),
-        Command::Broker(_) => Err(CliError::NotImplemented("broker")),
+        Command::Broker { command } => match command {
+            BrokerCommand::Serve { socket } => {
+                let services = VaultxServices::open(&cli.project).map_err(|err| match err {
+                    CoreError::NotARepository(path) => CliError::NotARepository(path),
+                    other => other.into(),
+                })?;
+                cmd_broker_serve(services, socket.as_deref())
+            }
+            BrokerCommand::Status { socket } => cmd_broker_status(&cli.project, socket.as_deref()),
+            BrokerCommand::Request(args) => cmd_broker_request(
+                &cli.project,
+                args.socket.as_deref(),
+                &args.session,
+                &args.credential,
+                &args.method,
+                &args.url,
+                &args.headers,
+                args.data.as_deref(),
+                args.data_binary.as_deref(),
+                args.data_base64.as_deref(),
+                args.capability_hint.as_deref(),
+            ),
+        },
         Command::Pack { command } => match command {
             PackCommand::List { dir } => cmd_pack_list(&resolve_pack_dir(&cli.project, dir)),
             PackCommand::Inspect { name, dir } => {
@@ -1089,6 +1221,287 @@ fn cmd_agent_inspect(services: &VaultxServices, name: &str) -> Result<String, Cl
 fn cmd_agent_disable(services: &VaultxServices, name: &str) -> Result<String, CliError> {
     services.agents().disable(name)?;
     Ok(format!("disabled agent {name}"))
+}
+
+fn map_session_error(err: vaultx_broker::BrokerError) -> CliError {
+    CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string())))
+}
+
+/// Opens (creating if needed) the persistent session store under
+/// `<project>/.vaultx/sessions.json`.
+fn open_session_store(
+    services: &VaultxServices,
+) -> Result<vaultx_broker::FileSessionStore, CliError> {
+    let path = services.context().vault_dir().join("sessions.json");
+    vaultx_broker::FileSessionStore::open(path)
+        .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))
+}
+
+fn environment_id_for(
+    bare: Option<&str>,
+) -> Result<(String, vaultx_types::EnvironmentId), CliError> {
+    let bare = bare.unwrap_or(DEFAULT_SECRET_ENV);
+    let id = vaultx_types::EnvironmentId::parse(&format!("env_{bare}"))
+        .map_err(|_| CliError::Usage(format!("`{bare}` is not a valid environment name")))?;
+    Ok((bare.to_owned(), id))
+}
+
+#[allow(clippy::type_complexity)]
+fn cmd_agent_session_create(
+    services: &VaultxServices,
+    name: &str,
+    env: Option<&str>,
+    ttl_secs: Option<u64>,
+) -> Result<String, CliError> {
+    // Refuse sessions for unknown or disabled agents before minting a
+    // token the broker would immediately reject.
+    let summary = services
+        .agents()
+        .list_agents()?
+        .into_iter()
+        .find(|agent| agent.name == name)
+        .ok_or_else(|| CliError::Usage(format!("unknown agent `{name}`")))?;
+    if !summary.enabled {
+        return Err(CliError::Usage(format!(
+            "agent `{name}` is disabled; enable it before creating sessions"
+        )));
+    }
+    let agent_id = services.agents().inspect(name)?;
+
+    let store = open_session_store(services)?;
+    let (env_name, environment) = environment_id_for(env)?;
+    let (session_id, raw_token) = store
+        .create_expiring(&agent_id.name, &environment, ttl_secs)
+        .map_err(map_session_error)?;
+
+    let expiry_note = match ttl_secs {
+        Some(secs) => format!("expires in {secs}s"),
+        None => "no expiry".to_owned(),
+    };
+    Ok(format!(
+        "created session {session_id} for {name} in {env_name} ({expiry_note})\n\n         CAPABILITY TOKEN (shown once; it cannot be recovered):\n{raw_token}"
+    ))
+}
+
+fn cmd_agent_sessions_list(services: &VaultxServices, name: &str) -> Result<String, CliError> {
+    // Existence check first so the failure names the agent, not a bare
+    // "no such file" from the identity store.
+    let _ = services
+        .agents()
+        .list_agents()?
+        .into_iter()
+        .find(|agent| agent.name == name)
+        .ok_or_else(|| CliError::Usage(format!("unknown agent `{name}`")))?;
+    let agent_id = services.agents().inspect(name)?;
+
+    let records = open_session_store(services)?
+        .list_for_agent(&agent_id.name)
+        .map_err(map_session_error)?;
+    if records.is_empty() {
+        return Ok(format!("no sessions for {name}"));
+    }
+    Ok(crate::output::render_sessions(name, &records))
+}
+
+fn cmd_agent_session_revoke(
+    services: &VaultxServices,
+    session_id: &str,
+) -> Result<String, CliError> {
+    let id = vaultx_types::SessionId::parse(session_id)
+        .map_err(|_| CliError::Usage("expected a full session id (`sess_...`)".into()))?;
+    open_session_store(services)?
+        .revoke(&id)
+        .map_err(|err| match err {
+            vaultx_broker::BrokerError::InvalidSession => {
+                CliError::Usage(format!("no such session `{session_id}`"))
+            }
+            other => CliError::Runtime(CoreError::Io(std::io::Error::other(other.to_string()))),
+        })?;
+    Ok(format!("revoked {id}"))
+}
+
+/// Runs `future` to completion on a private multi-thread runtime. The
+/// CLI is otherwise synchronous; only broker process operations need a
+/// reactor.
+fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(future)
+}
+
+/// Consumes the facade so the engine can share one [`ProjectContext`]
+/// behind an `Arc` across threads.
+fn cmd_broker_serve(services: VaultxServices, socket: Option<&Path>) -> Result<String, CliError> {
+    let ctx = std::sync::Arc::new(services.into_context());
+    let engine = vaultx_core::broker_source::build_production_engine(&ctx)
+        .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))?;
+
+    // Bind inside the runtime: tokio listener construction requires a
+    // reactor context.
+    let socket_path = socket.map(Path::to_path_buf);
+    let outcome = run_async(async move {
+        let server = vaultx_broker::BrokerServer::bind(
+            std::sync::Arc::new(engine),
+            "local",
+            vaultx_broker::ServerConfig {
+                socket_path,
+                max_connections: 0,
+            },
+        )
+        .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))?;
+        println!("vaultx broker listening on {}", server.path().display());
+        let serve = tokio::spawn(async move { server.serve().await });
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("vaultx broker shutting down");
+        match serve.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(CliError::Runtime(CoreError::Io(std::io::Error::other(
+                err.to_string(),
+            )))),
+            Err(join) => Err(CliError::Runtime(CoreError::Io(std::io::Error::other(
+                join.to_string(),
+            )))),
+        }
+    });
+    outcome?;
+    Ok("stopped".to_owned())
+}
+
+fn resolve_endpoint(project: &Path, socket: Option<&Path>) -> PathBuf {
+    match socket {
+        Some(path) => path.to_path_buf(),
+        None => {
+            #[cfg(unix)]
+            {
+                let _ = project;
+                let base = std::env::var_os("XDG_RUNTIME_DIR")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/tmp"));
+                base.join("vaultx").join("local").join("broker.sock")
+            }
+            #[cfg(windows)]
+            {
+                let _ = project;
+                PathBuf::from(r"\\.\pipe\vaultx-local")
+            }
+        }
+    }
+}
+
+fn map_client_error(err: vaultx_broker_client::ClientError) -> CliError {
+    let text = err.to_string();
+    CliError::Runtime(CoreError::Io(std::io::Error::other(text)))
+}
+
+fn cmd_broker_status(project: &Path, socket: Option<&Path>) -> Result<String, CliError> {
+    let _ = project;
+    let endpoint = resolve_endpoint(project, socket);
+    let shown = endpoint.display().to_string();
+    run_async(async move {
+        let mut client = vaultx_broker_client::BrokerClient::connect(&endpoint)
+            .await
+            .map_err(map_client_error)?;
+        client.ping().await.map_err(map_client_error)
+    })
+    .map(|version| format!("broker reachable at {shown} (version {version})"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_broker_request(
+    project: &Path,
+    socket: Option<&Path>,
+    session_token: &str,
+    credential: &str,
+    method: &str,
+    url: &str,
+    headers: &[String],
+    data: Option<&str>,
+    data_binary: Option<&str>,
+    data_base64: Option<&str>,
+    capability_hint: Option<&str>,
+) -> Result<String, CliError> {
+    use base64::Engine as _;
+    let endpoint = resolve_endpoint(project, socket);
+
+    let http_method = parse_http_method(method)?;
+    let parsed_credential = CredentialRef::parse(credential)
+        .map_err(|_| CliError::Usage(format!("invalid credential ref `{credential}`")))?;
+
+    let mut header_pairs = Vec::new();
+    for raw in headers {
+        let (name, value) = raw
+            .split_once('=')
+            .ok_or_else(|| CliError::Usage(format!("expected --header NAME=VALUE, got `{raw}`")))?;
+        header_pairs.push((name.to_ascii_lowercase(), value.to_owned()));
+    }
+
+    let body = match (data, data_binary, data_base64) {
+        (Some(text), _, _) => vaultx_broker::BrokerBody::Bytes {
+            data: text.as_bytes().to_vec(),
+        },
+        (_, Some(at_file), _) => {
+            let path = at_file
+                .strip_prefix('@')
+                .ok_or_else(|| CliError::Usage("--data-binary expects @FILE".into()))?;
+            std::fs::read(path)
+                .map(|data| vaultx_broker::BrokerBody::Bytes { data })
+                .map_err(|err| CliError::Runtime(CoreError::Io(err)))?
+        }
+        (_, _, Some(encoded)) => vaultx_broker::BrokerBody::Bytes {
+            data: base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| CliError::Usage("--data-base64 expects valid base64".into()))?,
+        },
+        _ => vaultx_broker::BrokerBody::None,
+    };
+
+    let request = vaultx_broker::BrokerRequest {
+        protocol: vaultx_broker::PROTOCOL_VERSION,
+        // The token crosses the wire once; it never enters diagnostics.
+        session_token: session_token.to_owned(),
+        credential: parsed_credential,
+        method: http_method,
+        url: url.to_owned(),
+        headers: header_pairs,
+        body,
+        capability_hint: capability_hint.map(str::to_owned),
+    };
+
+    let response = run_async(async move {
+        let mut client = vaultx_broker_client::BrokerClient::connect(&endpoint)
+            .await
+            .map_err(map_client_error)?;
+        client.request(request).await.map_err(map_client_error)
+    })?;
+
+    match response.decision {
+        vaultx_broker::Decision::Allow => Ok(crate::output::render_broker_response(&response)),
+        vaultx_broker::Decision::Deny { reason, policy } => Err(CliError::Denied(match policy {
+            Some(name) => format!("{reason} (policy: {name})"),
+            None => reason,
+        })),
+    }
+}
+
+/// Parses the `--method` flag against the policy layer's verb set so
+/// unsupported methods fail before any I/O starts.
+fn parse_http_method(raw: &str) -> Result<vaultx_policy::HttpMethod, CliError> {
+    use vaultx_policy::HttpMethod;
+    match raw.to_ascii_uppercase().as_str() {
+        "GET" => Ok(HttpMethod::GET),
+        "POST" => Ok(HttpMethod::POST),
+        "PUT" => Ok(HttpMethod::PUT),
+        "PATCH" => Ok(HttpMethod::PATCH),
+        "DELETE" => Ok(HttpMethod::DELETE),
+        "HEAD" => Ok(HttpMethod::HEAD),
+        "OPTIONS" => Ok(HttpMethod::OPTIONS),
+        other => Err(CliError::Usage(format!(
+            "`{other}` is not a supported HTTP method"
+        ))),
+    }
 }
 
 fn cmd_policy_validate(services: &VaultxServices) -> Result<String, CliError> {

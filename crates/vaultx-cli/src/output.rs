@@ -334,6 +334,72 @@ pub fn render_agent_detail(agent: &AgentIdentityFile) -> String {
 /// Renders per-policy validation outcomes: `OK <name>` or the failure
 /// reason verbatim from the loader.
 #[must_use]
+/// Renders stored agent sessions (verifier metadata only — raw tokens
+/// were shown exactly once at creation and are unrecoverable).
+pub fn render_sessions(agent: &str, records: &[vaultx_broker::AgentSessionRecord]) -> String {
+    let rows: Vec<Vec<String>> = records
+        .iter()
+        .map(|record| {
+            vec![
+                record.session_id.to_string(),
+                record.environment.to_string(),
+                if record.revoked {
+                    "revoked".to_owned()
+                } else {
+                    "active".to_owned()
+                },
+                match record.expires_at_secs {
+                    Some(expiry) => format!("unix {expiry}"),
+                    None => "-".to_owned(),
+                },
+            ]
+        })
+        .collect();
+    let mut out = format!("sessions for {agent}:\n");
+    out.push_str(&render_table(
+        &["SESSION", "ENVIRONMENT", "STATE", "EXPIRES"],
+        &rows,
+    ));
+    out
+}
+
+/// Renders a broker allow response: status line, sanitized headers, and
+/// at most the first 2 KiB of the body as a preview.
+pub fn render_broker_response(response: &vaultx_broker::BrokerResponse) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} {}",
+        response.status,
+        decision_label(&response.decision)
+    );
+    for (name, value) in &response.headers {
+        let _ = writeln!(out, "{name}: {value}");
+    }
+    if !response.body.is_empty() {
+        const PREVIEW_BYTES: usize = 2048;
+        let preview_len = response.body.len().min(PREVIEW_BYTES);
+        let preview = String::from_utf8_lossy(&response.body[..preview_len]);
+        let _ = writeln!(out, "\n{}", preview.trim_end());
+        if response.body.len() > PREVIEW_BYTES {
+            let _ = writeln!(
+                out,
+                "\n[{} more bytes withheld]",
+                response.body.len() - PREVIEW_BYTES
+            );
+        }
+    }
+    out.trim_end().to_owned()
+}
+
+fn decision_label(decision: &vaultx_broker::Decision) -> &'static str {
+    match decision {
+        vaultx_broker::Decision::Allow => "OK",
+        vaultx_broker::Decision::Deny { .. } => "DENIED",
+    }
+}
+
 pub fn render_policy_validation(results: Vec<Result<String, String>>) -> String {
     if results.is_empty() {
         return "no policies found".to_owned();
