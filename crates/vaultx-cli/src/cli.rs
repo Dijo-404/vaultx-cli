@@ -327,8 +327,11 @@ pub enum Command {
         #[command(subcommand)]
         command: PackCommand,
     },
-    /// MCP server (planned).
-    Mcp(StubArgs),
+    /// MCP server operations.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Audit log inspection (planned).
     Audit(StubArgs),
     /// Remote repository configuration (planned).
@@ -597,6 +600,27 @@ pub enum SecretCommand {
     },
 }
 
+/// `vaultx mcp <subcommand>`.
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Serve MCP tools over stdio JSON-RPC for one agent.
+    ///
+    /// A broker session is minted at startup (its token is held in
+    /// memory only); the process answers `initialize`, `tools/list`, and
+    /// `tools/call` until stdin closes.
+    Serve {
+        /// Agent bare name whose session backs every tool call.
+        #[arg(long)]
+        agent: String,
+        /// Environment the session operates in (default: development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+        /// Broker endpoint override.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+}
+
 /// Executes an already-parsed invocation against the application
 /// services selected by `cli.project`, returning the rendered output.
 ///
@@ -770,7 +794,11 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
                 cmd_pack_add(&resolve_pack_dir(&cli.project, dir), file, *force)
             }
         },
-        Command::Mcp(_) => Err(CliError::NotImplemented("mcp")),
+        Command::Mcp { command } => match command {
+            McpCommand::Serve { agent, env, socket } => {
+                cmd_mcp_serve(&cli.project, agent, env.as_deref(), socket.as_deref())
+            }
+        },
         Command::Audit(_) => Err(CliError::NotImplemented("audit")),
         Command::Remote(_) => Err(CliError::NotImplemented("remote")),
         Command::Login(_) => Err(CliError::NotImplemented("login")),
@@ -1460,6 +1488,30 @@ fn cmd_broker_serve(services: VaultxServices, socket: Option<&Path>) -> Result<S
     });
     outcome?;
     Ok("stopped".to_owned())
+}
+
+/// Serves the MCP stdio server (plan §26). The project is opened first
+/// so a bad directory maps onto the exit-3 class; everything else is
+/// delegated to `vaultx-mcp`, which owns its own runtime needs.
+fn cmd_mcp_serve(
+    project: &Path,
+    agent: &str,
+    env: Option<&str>,
+    socket: Option<&Path>,
+) -> Result<String, CliError> {
+    VaultxServices::open(project).map_err(|err| match err {
+        CoreError::NotARepository(path) => CliError::NotARepository(path),
+        other => other.into(),
+    })?;
+    let config = vaultx_mcp::ServeConfig {
+        project: project.to_path_buf(),
+        agent: agent.to_owned(),
+        env: env.map(str::to_owned),
+        socket: socket.map(Path::to_path_buf),
+    };
+    run_async(vaultx_mcp::serve(config))
+        .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))?;
+    Ok(String::new())
 }
 
 fn resolve_endpoint(project: &Path, socket: Option<&Path>) -> PathBuf {

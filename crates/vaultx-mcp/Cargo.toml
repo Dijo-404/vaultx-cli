@@ -4,3 +4,17 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+vaultx-broker = { path = "../vaultx-broker" }
+vaultx-broker-client = { path = "../vaultx-broker-client" }
+vaultx-core = { path = "../vaultx-core" }
+vaultx-policy = { path = "../vaultx-policy" }
+vaultx-types = { path = "../vaultx-types" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

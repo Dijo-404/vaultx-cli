@@ -20,6 +20,7 @@ tokio = { workspace = true }
 vaultx-broker = { path = "../vaultx-broker" }
 vaultx-broker-client = { path = "../vaultx-broker-client" }
 vaultx-core = { path = "../vaultx-core" }
+vaultx-mcp = { path = "../vaultx-mcp" }
 vaultx-policy = { path = "../vaultx-policy" }
 vaultx-policy-packs = { path = "../vaultx-policy-packs" }
 vaultx-types = { path = "../vaultx-types" }

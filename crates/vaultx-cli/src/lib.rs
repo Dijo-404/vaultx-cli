@@ -18,6 +18,6 @@ mod output;
 mod tests;
 
 pub use cli::{
-    dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, PackCommand, PolicyCommand,
-    SecretCommand, StubArgs,
+    dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, McpCommand, PackCommand,
+    PolicyCommand, SecretCommand, StubArgs,
 };

@@ -10,8 +10,8 @@ use vaultx_core::{CoreError, MergeStrategy};
 use vaultx_types::CommitId;
 
 use crate::{
-    dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, PackCommand, PolicyCommand,
-    SecretCommand, StubArgs,
+    dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, McpCommand, PackCommand,
+    PolicyCommand, SecretCommand, StubArgs,
 };
 
 /// Builds a `Cli` pointing at `project` with the given command.
@@ -2138,6 +2138,46 @@ fn run_injects_committed_config_only_and_propagates_exit_codes() {
     .unwrap_err();
     assert!(
         matches!(&err, CliError::Usage(text) if text.contains("command after `--`")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn mcp_serve_maps_unknown_project_and_agent_onto_error_classes() {
+    // Outside a repository keeps the exit-3 class before any session
+    // work starts.
+    let empty = tempfile::tempdir().unwrap();
+    let err = dispatch(&cli(
+        empty.path(),
+        Command::Mcp {
+            command: McpCommand::Serve {
+                agent: "coding-agent".into(),
+                env: None,
+                socket: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CliError::NotARepository(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 3);
+
+    // Unknown agent is a runtime failure (exit 1); the message names the
+    // agent but never any token.
+    let dir = tempfile::tempdir().unwrap();
+    init_in(dir.path());
+    let err = dispatch(&cli(
+        dir.path(),
+        Command::Mcp {
+            command: McpCommand::Serve {
+                agent: "ghost-agent".into(),
+                env: None,
+                socket: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Runtime(CoreError::Io(io)) if io.to_string().contains("unknown agent `ghost-agent`")),
         "{err:?}"
     );
 }

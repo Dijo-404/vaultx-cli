@@ -1739,6 +1739,7 @@ dependencies = [
  "vaultx-broker",
  "vaultx-broker-client",
  "vaultx-core",
+ "vaultx-mcp",
  "vaultx-policy",
  "vaultx-policy-packs",
  "vaultx-types",
@@ -1809,6 +1810,20 @@ dependencies = [
 [[package]]
 name = "vaultx-mcp"
 version = "0.1.0"
+dependencies = [
+ "base64",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "vaultx-broker",
+ "vaultx-broker-client",
+ "vaultx-core",
+ "vaultx-policy",
+ "vaultx-types",
+]
 
 [[package]]
 name = "vaultx-policy"
