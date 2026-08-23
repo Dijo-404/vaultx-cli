@@ -228,18 +228,19 @@ fn create_private_file_exclusive(path: &Path, contents: &str) -> std::io::Result
     }
     #[cfg(not(unix))]
     {
-        // Best-effort emulation where the exclusive-create mode flag is
-        // unavailable; the check-then-write window is platform-limited.
-        if path.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "key file already exists",
-            ));
-        }
+        // Exclusive create is portable (`OpenOptions::create_new` works
+        // on Windows too); only the unix permission mode is cfg-gated.
+        use std::io::Write as _;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, contents)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
     }
 }
 

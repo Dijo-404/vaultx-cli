@@ -191,6 +191,24 @@ struct StoredProjectKeys {
     fingerprint_ciphertext_hex: String,
 }
 
+/// Cache entry stored on the [`ProjectContext`]: the unwrapped keys
+/// together with a clone of the provider that unwrapped them, so cache
+/// identity is a live `Arc::ptr_eq` comparison rather than a reusable
+/// address.
+pub(crate) struct CachedProjectKeys {
+    /// Identity half of the cache key; kept alive so `Arc::ptr_eq`
+    /// comparisons stay sound across allocator reuse.
+    pub(crate) provider: std::sync::Arc<dyn WrappingKeyProvider>,
+    /// Keys unwrapped by `provider`.
+    pub(crate) keys: std::sync::Arc<ProjectKeys>,
+}
+
+impl std::fmt::Debug for CachedProjectKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CachedProjectKeys(<redacted>)")
+    }
+}
+
 /// Unwrapped in-process copy of the project vault keys.
 pub(crate) struct ProjectKeys {
     /// Content-encryption key wrapping every revision DEK.
@@ -491,22 +509,26 @@ impl<'a> SecretService<'a> {
 
     /// Returns the cached project keys, but only when they were unwrapped
     /// by this service's own root-key provider (identity compared via
-    /// `Arc::as_ptr`). A different provider installed on the same context
-    /// forces a reload instead of silently reusing foreign keys.
+    /// [`Arc::ptr_eq`]; the slot holds a clone of the provider, so the
+    /// comparison stays sound across drop-and-reallocate address reuse).
+    /// A different provider installed on the same context forces a reload
+    /// instead of silently reusing foreign keys.
     fn cached_keys(&self) -> CoreResult<Arc<ProjectKeys>> {
-        let provider_id = Arc::as_ptr(&self.root_store) as *const () as usize;
         let mut slot = self
             .ctx
             .project_key_slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some((cached_provider, keys)) = slot.as_ref() {
-            if *cached_provider == provider_id {
-                return Ok(Arc::clone(keys));
+        if let Some(cached) = slot.as_ref() {
+            if Arc::ptr_eq(&cached.provider, &self.root_store) {
+                return Ok(Arc::clone(&cached.keys));
             }
         }
         let keys = Arc::new(self.load_or_init_keys()?);
-        *slot = Some((provider_id, Arc::clone(&keys)));
+        *slot = Some(CachedProjectKeys {
+            provider: Arc::clone(&self.root_store),
+            keys: Arc::clone(&keys),
+        });
         Ok(keys)
     }
 
@@ -1582,7 +1604,15 @@ mod tests {
     #[test]
     fn cache_is_keyed_to_the_provider_that_populated_it() {
         let fx = fixture();
+        // Both providers stay alive for the whole test: identity is a
+        // live Arc comparison (Arc::ptr_eq), not an address that could be
+        // recycled by the allocator.
         let first = service(&fx);
+        let other_dir = tempfile::tempdir().unwrap();
+        let second_provider: Arc<dyn WrappingKeyProvider> =
+            Arc::new(FileKeyStore::new(other_dir.path().join("root.key")));
+        assert!(!Arc::ptr_eq(&second_provider, &first.root_store));
+
         first
             .set_secret("K", &secret("v"), VariableKind::Secret, "dev", None)
             .unwrap();
@@ -1590,11 +1620,7 @@ mod tests {
         // A second provider with unrelated root material over the SAME
         // context must not silently reuse the first provider's cached
         // keys; it has to reload and then fails loudly.
-        let other_dir = tempfile::tempdir().unwrap();
-        let second = SecretService::with_root_store(
-            &fx.ctx,
-            Arc::new(FileKeyStore::new(other_dir.path().join("root.key"))),
-        );
+        let second = SecretService::with_root_store(&fx.ctx, Arc::clone(&second_provider));
         match second.reveal_secret("K", "dev") {
             Err(CoreError::ProjectKey(_)) => {}
             other => panic!("expected ProjectKey error, got {other:?}"),
@@ -1602,6 +1628,24 @@ mod tests {
 
         // The original provider still works off its cache entry.
         assert!(first.reveal_secret("K", "dev").is_ok());
+    }
+
+    #[test]
+    fn same_provider_reuses_cached_keys_without_reload() {
+        let fx = fixture();
+        let svc = service(&fx);
+        svc.set_secret("K", &secret("v"), VariableKind::Secret, "dev", None)
+            .unwrap();
+        assert!(svc.reveal_secret("K", "dev").is_ok(), "cache populated");
+
+        // Remove the persisted bundle behind the cache's back. A cache
+        // hit must serve subsequent operations from memory alone; a
+        // reload would fail on the missing file.
+        std::fs::remove_file(fx.ctx.vault_dir().join(KEYS_DIR_NAME).join("project.json")).unwrap();
+        assert!(
+            svc.reveal_secret("K", "dev").is_ok(),
+            "same provider must reuse its cached keys"
+        );
     }
 
     #[test]

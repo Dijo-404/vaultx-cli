@@ -904,10 +904,12 @@ fn read_stdin_plaintext() -> Result<SecretString, CliError> {
     use std::io::Read as _;
     use zeroize::Zeroize as _;
     let mut raw = String::new();
-    std::io::stdin()
-        .lock()
-        .read_to_string(&mut raw)
-        .map_err(|err| CliError::Usage(format!("cannot read stdin: {err}")))?;
+    if let Err(err) = std::io::stdin().lock().read_to_string(&mut raw) {
+        // A failed read may still have appended partial bytes; scrub
+        // before propagating.
+        raw.zeroize();
+        return Err(CliError::Usage(format!("cannot read stdin: {err}")));
+    }
     // Strip exactly one trailing newline so `echo pw | vaultx ...` stores
     // the value without the echo's line terminator.
     let trimmed_len = raw
@@ -922,18 +924,22 @@ fn read_stdin_plaintext() -> Result<SecretString, CliError> {
 
 fn prompt_plaintext_twice() -> Result<SecretString, CliError> {
     use zeroize::Zeroize as _;
-    let first = rpassword::prompt_password("Enter secret value: ")
+    let mut first = rpassword::prompt_password("Enter secret value: ")
         .map_err(|err| CliError::Usage(format!("cannot read password: {err}")))?;
-    let mut confirmed = rpassword::prompt_password("Confirm secret value: ")
-        .map_err(|err| CliError::Usage(format!("cannot read password: {err}")))?;
+    let mut confirmed = match rpassword::prompt_password("Confirm secret value: ") {
+        Ok(value) => value,
+        Err(err) => {
+            // The already-collected first value must never outlive this
+            // function unscrubbed.
+            first.zeroize();
+            return Err(CliError::Usage(format!("cannot read password: {err}")));
+        }
+    };
     if first == confirmed {
         let secret = SecretString::new(first);
-        // The confirmation copy never outlives this function unscrubbed,
-        // on either branch.
         confirmed.zeroize();
         Ok(secret)
     } else {
-        let mut first = first;
         first.zeroize();
         confirmed.zeroize();
         Err(CliError::Usage("Passwords do not match".into()))
