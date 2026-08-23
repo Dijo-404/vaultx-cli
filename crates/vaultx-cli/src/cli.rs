@@ -1352,8 +1352,16 @@ fn cmd_broker_serve(services: VaultxServices, socket: Option<&Path>) -> Result<S
         )
         .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))?;
         println!("vaultx broker listening on {}", server.path().display());
-        let serve = tokio::spawn(async move { server.serve().await });
+        // The trigger must outlive the server: `serve` consumes it, so
+        // capture the sender clone first or Ctrl-C could never fire.
+        let trigger = server.shutdown_trigger();
+        // Run the accept loop on the blocking pool: the engine (and its
+        // transport's owned runtime) must DROP off the async reactor,
+        // which forbids dropping runtimes in place.
+        let reactor = tokio::runtime::Handle::current();
+        let serve = tokio::task::spawn_blocking(move || reactor.block_on(server.serve()));
         let _ = tokio::signal::ctrl_c().await;
+        trigger();
         eprintln!("vaultx broker shutting down");
         match serve.await {
             Ok(Ok(())) => Ok(()),

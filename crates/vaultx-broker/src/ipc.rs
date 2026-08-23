@@ -316,6 +316,16 @@ impl<E: EngineHandle> BrokerServer<E> {
         let _ = self.shutdown_tx.send(true);
     }
 
+    /// Clonable shutdown trigger usable after `serve` has consumed the
+    /// server (the CLI's signal handler needs exactly this).
+    #[must_use]
+    pub fn shutdown_trigger(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let tx = self.shutdown_tx.clone();
+        Arc::new(move || {
+            let _ = tx.send(true);
+        })
+    }
+
     /// Runs the accept loop until shutdown is signalled. On Unix the
     /// socket file is removed on exit.
     ///

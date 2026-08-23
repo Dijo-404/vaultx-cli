@@ -83,7 +83,13 @@ pub struct HttpTransport {
     redirects: RedirectPolicy,
     redirect_authorizer: Arc<dyn RedirectAuthorizer>,
     resolver: Arc<dyn DnsResolver>,
-    runtime: tokio::runtime::Runtime,
+    /// Deliberately never dropped: engine handles can outlive orderly
+    /// teardown paths and land inside async workers, where dropping a
+    /// runtime panics. A broker process keeps exactly one transport for
+    /// its whole life, so leaking it costs nothing and removes the
+    /// failure class entirely.
+    #[allow(dead_code)]
+    runtime: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
     /// Test-only relaxation of certificate verification; never set by
     /// production constructors.
     insecure_certs: bool,
@@ -115,12 +121,12 @@ impl HttpTransport {
                 BrokerError::TransportFailure(format!("cannot start transport runtime: {err}"))
             })?;
         Ok(Self {
+            runtime: std::mem::ManuallyDrop::new(runtime),
             egress,
             limits,
             redirects,
             redirect_authorizer,
             resolver: resolver.unwrap_or_else(|| Arc::new(SystemResolver)),
-            runtime,
             insecure_certs: false,
         })
     }
