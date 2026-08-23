@@ -15,6 +15,7 @@ clap = { workspace = true }
 rpassword = { workspace = true }
 thiserror = { workspace = true }
 vaultx-core = { path = "../vaultx-core" }
+vaultx-policy-packs = { path = "../vaultx-policy-packs" }
 vaultx-types = { path = "../vaultx-types" }
 zeroize = { workspace = true }
 

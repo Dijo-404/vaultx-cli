@@ -10,8 +10,8 @@ use vaultx_core::{CoreError, MergeStrategy};
 use vaultx_types::CommitId;
 
 use crate::{
-    dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, PolicyCommand, SecretCommand,
-    StubArgs,
+    dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, PackCommand, PolicyCommand,
+    SecretCommand, StubArgs,
 };
 
 /// Builds a `Cli` pointing at `project` with the given command.
@@ -358,7 +358,6 @@ fn unsupported_groups_return_not_implemented_with_exit_two() {
     let stubs = [
         ("run", Command::Run(StubArgs { args: Vec::new() })),
         ("broker", Command::Broker(StubArgs { args: Vec::new() })),
-        ("pack", Command::Pack(StubArgs { args: Vec::new() })),
         ("mcp", Command::Mcp(StubArgs { args: Vec::new() })),
         (
             "audit",
@@ -1625,4 +1624,228 @@ fn doctor_fresh_repo_passes_and_tampered_object_exits_nonzero() {
         other => panic!("expected Diagnostics, got {other:?}"),
     }
     assert_eq!(err.exit_code(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Policy pack commands
+// ---------------------------------------------------------------------------
+
+/// A minimal valid pack used as CLI test fixture.
+const PACK_YAML: &str = r#"format: 1
+name: test.capability.call
+provider: github
+request:
+  hosts: [api.github.com]
+  methods: [GET]
+  paths: ["/repos/{owner}/{repo}"]
+credential:
+  credential_ref: test-token
+  injection: bearer
+"#;
+
+fn write_pack(root: &Path, relative: &str, contents: &str) -> PathBuf {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+#[test]
+fn pack_list_inspect_and_validate_report_parsed_packs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Pack commands never require an initialized repository: run against a
+    // bare directory on purpose.
+    write_pack(root, "policy-packs/github/test.capability.yaml", PACK_YAML);
+    write_pack(
+        root,
+        "policy-packs/openai/other.yaml",
+        &PACK_YAML.replace("test.capability.call", "zzz.other.call"),
+    );
+
+    let listed = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::List { dir: None },
+        },
+    ))
+    .unwrap();
+    assert!(listed.contains("NAME"), "{listed}");
+    assert!(listed.contains("test.capability.call"), "{listed}");
+    assert!(listed.contains("bearer"), "{listed}");
+    assert!(listed.contains("HOSTS"), "{listed}");
+    // Sorted by capability name.
+    assert!(listed.find("test.capability.call").unwrap() < listed.find("zzz.other.call").unwrap());
+
+    let inspected = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Inspect {
+                name: "test.capability.call".into(),
+                dir: None,
+            },
+        },
+    ))
+    .unwrap();
+    assert!(inspected.contains("format:     1"), "{inspected}");
+    assert!(inspected.contains("/repos/{owner}/{repo}"), "{inspected}");
+    assert!(inspected.contains("injection: bearer"), "{inspected}");
+
+    let validated = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Validate { dir: None },
+        },
+    ))
+    .unwrap();
+    assert_eq!(validated.matches(": ok (").count(), 2, "{validated}");
+
+    let err = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Inspect {
+                name: "missing.pack".into(),
+                dir: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Pack(text) if text.contains("no policy pack named")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn pack_validate_reports_errors_per_file_and_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_pack(root, "policy-packs/github/good.yaml", PACK_YAML);
+    write_pack(
+        root,
+        "policy-packs/github/bad-version.yaml",
+        &PACK_YAML.replace("format: 1", "format: 2"),
+    );
+    write_pack(
+        root,
+        "policy-packs/github/bad-host.yaml",
+        &PACK_YAML.replace("[api.github.com]", "[localhost]"),
+    );
+
+    let err = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Validate { dir: None },
+        },
+    ))
+    .unwrap_err();
+    match &err {
+        CliError::Diagnostics(report) => {
+            assert!(
+                report.contains(": ok ("),
+                "good file still reported: {report}"
+            );
+            assert!(report.contains("bad-version.yaml"), "{report}");
+            assert!(report.contains("`format`"), "{report}");
+            assert!(report.contains("bad-host.yaml"), "{report}");
+            assert!(report.contains("cannot be targeted"), "{report}");
+            assert_eq!(report.matches(": ERROR").count(), 2, "{report}");
+        }
+        other => panic!("expected Diagnostics, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 1);
+
+    // Missing pack directory is its own failure class.
+    let empty = tempfile::tempdir().unwrap();
+    let err = dispatch(&cli(
+        empty.path(),
+        Command::Pack {
+            command: PackCommand::Validate { dir: None },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Pack(text) if text.contains("does not exist")),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn pack_add_copies_into_provider_tree_and_respects_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = write_pack(root, "staging/new-pack.yaml", PACK_YAML);
+
+    let out = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Add {
+                file: source.clone(),
+                dir: None,
+                force: false,
+            },
+        },
+    ))
+    .unwrap();
+    let target = root.join("policy-packs/github/call.yaml");
+    assert!(out.contains(&target.display().to_string()), "{out}");
+
+    let installed = std::fs::read_to_string(&target).unwrap();
+    assert_eq!(installed, PACK_YAML);
+
+    // Re-adding without --force refuses to overwrite.
+    let err = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Add {
+                file: source.clone(),
+                dir: None,
+                force: false,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("--force")),
+        "{err:?}"
+    );
+
+    // --force overwrites.
+    dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Add {
+                file: source,
+                dir: None,
+                force: true,
+            },
+        },
+    ))
+    .unwrap();
+
+    // Invalid packs are rejected before any copy happens.
+    let bad = write_pack(
+        root,
+        "staging/bad.yaml",
+        &PACK_YAML.replace("format: 1", "format: 3"),
+    );
+    let err = dispatch(&cli(
+        root,
+        Command::Pack {
+            command: PackCommand::Add {
+                file: bad,
+                dir: Some(root.join("elsewhere")),
+                force: true,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Pack(text) if text.contains("`format`")),
+        "{err:?}"
+    );
+    assert!(!root.join("elsewhere").exists());
 }

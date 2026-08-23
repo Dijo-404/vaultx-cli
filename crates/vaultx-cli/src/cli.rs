@@ -22,8 +22,13 @@ use vaultx_core::{
     BrokeredBinding, CommitSummary, CoreError, MergeOutcome, MergeStrategy, SecretString,
     VaultxServices,
 };
+use vaultx_policy_packs::PolicyPack;
 use vaultx_types::model::{InjectionTemplateId, VariableKind};
 use vaultx_types::{CommitId, CredentialRef, ProviderName, VariableName};
+
+/// Default directory scanned by `vaultx pack` commands (relative to the
+/// project root).
+const DEFAULT_PACKS_DIR: &str = "policy-packs";
 
 /// Default number of entries printed by `vaultx log` when `--limit` is
 /// not given.
@@ -67,19 +72,27 @@ pub enum CliError {
     /// Exit code 1.
     #[error(transparent)]
     Runtime(#[from] CoreError),
+    /// A policy pack operation failed (parse, validation, duplicate
+    /// capability, missing directory). Exit code 1.
+    #[error("{0}")]
+    Pack(String),
 }
 
 impl CliError {
     /// Process exit code for this error:
     ///
-    /// * 1 — runtime or usage failure, merge conflicts, or failing
-    ///   diagnostics,
+    /// * 1 — runtime or usage failure, merge conflicts, failing
+    ///   diagnostics, or policy pack failures,
     /// * 2 — not-yet-implemented command group,
     /// * 3 — target directory is not a vaultx repository.
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::Runtime(_) | Self::Usage(_) | Self::Conflicts(_) | Self::Diagnostics(_) => 1,
+            Self::Runtime(_)
+            | Self::Usage(_)
+            | Self::Conflicts(_)
+            | Self::Diagnostics(_)
+            | Self::Pack(_) => 1,
             Self::NotImplemented(_) => 2,
             Self::NotARepository(_) => 3,
         }
@@ -277,8 +290,11 @@ pub enum Command {
     Run(StubArgs),
     /// Broker server/session operations (planned).
     Broker(StubArgs),
-    /// Policy pack operations (planned).
-    Pack(StubArgs),
+    /// Manage declarative policy packs.
+    Pack {
+        #[command(subcommand)]
+        command: PackCommand,
+    },
     /// MCP server (planned).
     Mcp(StubArgs),
     /// Audit log inspection (planned).
@@ -351,6 +367,48 @@ pub enum PolicyCommand {
     Validate,
     /// List policies as NAME / PRINCIPAL / CREDENTIAL columns.
     List,
+}
+
+/// `vaultx pack <subcommand>`.
+///
+/// All commands operate on a directory of pack YAML files (default:
+/// `<project>/policy-packs`) and never require an initialized vaultx
+/// repository — packs are plain files usable before `vaultx init`.
+#[derive(Subcommand, Debug)]
+pub enum PackCommand {
+    /// List packs as NAME / PROVIDER / INJECTION / HOSTS columns.
+    List {
+        /// Directory to scan instead of `<project>/policy-packs`.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Render one parsed pack, selected by capability name.
+    Inspect {
+        /// Capability name, e.g. `github.pull_request.create`.
+        name: String,
+        /// Directory to scan instead of `<project>/policy-packs`.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Parse, validate, and compile every pack; per-file report, nonzero
+    /// exit on any failure.
+    Validate {
+        /// Directory to scan instead of `<project>/policy-packs`.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Validate FILE and copy it into the pack tree as
+    /// `<provider>/<capability-last-segment>.yaml`.
+    Add {
+        /// Pack file to install.
+        file: PathBuf,
+        /// Pack tree root (default: `<project>/policy-packs`).
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Overwrite an existing pack file with the same target path.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// `vaultx secret <subcommand>`.
@@ -538,7 +596,18 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
         // Planned groups: reserved names, clear notices, exit code 2.
         Command::Run(_) => Err(CliError::NotImplemented("run")),
         Command::Broker(_) => Err(CliError::NotImplemented("broker")),
-        Command::Pack(_) => Err(CliError::NotImplemented("pack")),
+        Command::Pack { command } => match command {
+            PackCommand::List { dir } => cmd_pack_list(&resolve_pack_dir(&cli.project, dir)),
+            PackCommand::Inspect { name, dir } => {
+                cmd_pack_inspect(&resolve_pack_dir(&cli.project, dir), name)
+            }
+            PackCommand::Validate { dir } => {
+                cmd_pack_validate(&resolve_pack_dir(&cli.project, dir))
+            }
+            PackCommand::Add { file, dir, force } => {
+                cmd_pack_add(&resolve_pack_dir(&cli.project, dir), file, *force)
+            }
+        },
         Command::Mcp(_) => Err(CliError::NotImplemented("mcp")),
         Command::Audit(_) => Err(CliError::NotImplemented("audit")),
         Command::Remote(_) => Err(CliError::NotImplemented("remote")),
@@ -561,6 +630,130 @@ fn with_open(
         other => other.into(),
     })?;
     body(&services)
+}
+
+/// Resolves the pack tree root: an explicit `--dir` wins, otherwise
+/// `<project>/policy-packs`.
+fn resolve_pack_dir(project: &Path, dir: &Option<PathBuf>) -> PathBuf {
+    dir.clone()
+        .unwrap_or_else(|| project.join(DEFAULT_PACKS_DIR))
+}
+
+/// Loads packs from `dir` or maps a missing directory onto a pack error.
+fn load_packs(dir: &Path) -> Result<Vec<PolicyPack>, CliError> {
+    vaultx_policy_packs::load_pack_dir(dir).map_err(|err| match err {
+        vaultx_policy_packs::PackError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            CliError::Pack(format!(
+                "policy pack directory {} does not exist",
+                dir.display()
+            ))
+        }
+        other => CliError::Pack(other.to_string()),
+    })
+}
+
+fn cmd_pack_list(dir: &Path) -> Result<String, CliError> {
+    let packs = load_packs(dir)?;
+    if packs.is_empty() {
+        return Ok("no policy packs found".to_owned());
+    }
+    let rows: Vec<Vec<String>> = packs
+        .iter()
+        .map(|pack| {
+            vec![
+                pack.name.clone(),
+                pack.provider.to_string(),
+                crate::output::injection_label(pack.credential.injection).to_owned(),
+                pack.request.hosts.len().to_string(),
+            ]
+        })
+        .collect();
+    Ok(crate::output::render_table(
+        &["NAME", "PROVIDER", "INJECTION", "HOSTS"],
+        &rows,
+    ))
+}
+
+fn cmd_pack_inspect(dir: &Path, name: &str) -> Result<String, CliError> {
+    let packs = load_packs(dir)?;
+    let pack = packs
+        .into_iter()
+        .find(|pack| pack.name == name)
+        .ok_or_else(|| {
+            CliError::Pack(format!(
+                "no policy pack named `{name}` in {}",
+                dir.display()
+            ))
+        })?;
+    Ok(crate::output::render_pack_inspect(&pack))
+}
+
+fn cmd_pack_validate(dir: &Path) -> Result<String, CliError> {
+    let files = vaultx_policy_packs::pack_files(dir).map_err(|err| match err {
+        vaultx_policy_packs::PackError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            CliError::Pack(format!(
+                "policy pack directory {} does not exist",
+                dir.display()
+            ))
+        }
+        other => CliError::Pack(format!(
+            "cannot scan policy pack directory {}: {other}",
+            dir.display()
+        )),
+    })?;
+    if files.is_empty() {
+        return Ok("no policy packs found".to_owned());
+    }
+    let mut lines = Vec::with_capacity(files.len());
+    let mut failures = 0;
+    for file in &files {
+        match vaultx_policy_packs::load_pack(file)
+            .and_then(|pack| vaultx_policy_packs::compile(&pack).map(|_| pack))
+        {
+            Ok(pack) => lines.push(format!("{}: ok ({})", file.display(), pack.name)),
+            Err(err) => {
+                failures += 1;
+                lines.push(format!("{}: ERROR {}", file.display(), err));
+            }
+        }
+    }
+    let report = lines.join("\n");
+    if failures > 0 {
+        return Err(CliError::Diagnostics(report));
+    }
+    Ok(report)
+}
+
+fn cmd_pack_add(dir: &Path, file: &Path, force: bool) -> Result<String, CliError> {
+    // Validate (and compile, exercising every invariant gate) before
+    // touching the destination.
+    let pack =
+        vaultx_policy_packs::load_pack(file).map_err(|err| CliError::Pack(err.to_string()))?;
+    vaultx_policy_packs::compile(&pack).map_err(|err| CliError::Pack(err.to_string()))?;
+
+    let capability_last_segment = pack.name.rsplit('.').next().unwrap_or_default();
+    if capability_last_segment.is_empty() {
+        return Err(CliError::Pack(format!(
+            "capability name `{}` has no usable final segment",
+            pack.name
+        )));
+    }
+    let target = dir
+        .join(pack.provider.as_str())
+        .join(format!("{capability_last_segment}.yaml"));
+    if target.exists() && !force {
+        return Err(CliError::Usage(format!(
+            "{} already exists; pass --force to overwrite",
+            target.display()
+        )));
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| CliError::Pack(format!("cannot create {}: {err}", parent.display())))?;
+    }
+    std::fs::copy(file, &target)
+        .map_err(|err| CliError::Pack(format!("cannot copy into {}: {err}", target.display())))?;
+    Ok(format!("added {} -> {}", pack.name, target.display()))
 }
 
 fn cmd_init(project: &Path) -> Result<String, CliError> {

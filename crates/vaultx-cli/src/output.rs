@@ -18,6 +18,7 @@ use vaultx_core::{
     EnvironmentSummary, ImportReport, MergeConflictSet, RollbackReport, SecretMetadata,
     StatusReport,
 };
+use vaultx_policy_packs::PolicyPack;
 use vaultx_types::model::{InjectionTemplateId, VariableKind};
 use vaultx_types::CommitId;
 
@@ -445,7 +446,7 @@ pub fn render_rollback(report: &RollbackReport) -> String {
 }
 
 /// Kebab-case label for an injection template (matches its serde form).
-fn injection_label(template: InjectionTemplateId) -> &'static str {
+pub(crate) fn injection_label(template: InjectionTemplateId) -> &'static str {
     match template {
         InjectionTemplateId::Bearer => "bearer",
         InjectionTemplateId::BasicPassword => "basic-password",
@@ -474,6 +475,86 @@ fn yes_no(value: bool) -> &'static str {
     } else {
         "no"
     }
+}
+
+/// Renders the full parsed form of one policy pack for
+/// `vaultx pack inspect`. Only identifiers, hostnames, patterns, and
+/// limits appear — never secret material.
+#[must_use]
+pub fn render_pack_inspect(pack: &PolicyPack) -> String {
+    let mut lines = vec![
+        format!("format:     {}", pack.format),
+        format!("name:       {}", pack.name),
+        format!("provider:   {}", pack.provider.as_str()),
+        "request:".to_owned(),
+    ];
+    lines.push(format!("  hosts:    {}", pack.request.hosts.join(", ")));
+    let methods: Vec<&str> = pack
+        .request
+        .methods
+        .iter()
+        .map(|method| method.as_str())
+        .collect();
+    lines.push(format!("  methods:  {}", methods.join(", ")));
+    for path in &pack.request.paths {
+        lines.push(format!("  path:     {path}"));
+    }
+    match &pack.request.query_allowlist {
+        Some(keys) if !keys.is_empty() => {
+            lines.push(format!("  query:    {}", keys.join(", ")));
+        }
+        _ => lines.push("  query:    (unconstrained)".to_owned()),
+    }
+    if let Some(variables) = &pack.request.variables {
+        if !variables.is_empty() {
+            let rendered = variables
+                .iter()
+                .map(|(name, kind)| format!("{name}: {kind}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("  vars:     {rendered}"));
+        }
+    }
+    lines.push("credential:".to_owned());
+    lines.push(format!(
+        "  ref:      {}",
+        pack.credential.credential_ref.as_str()
+    ));
+    lines.push(format!(
+        "  injection: {}",
+        injection_label(pack.credential.injection)
+    ));
+    if pack.constraints.max_body_bytes.is_some() || pack.constraints.content_types.is_some() {
+        lines.push("constraints:".to_owned());
+        if let Some(max) = pack.constraints.max_body_bytes {
+            lines.push(format!("  max_body_bytes: {max}"));
+        }
+        if let Some(types) = &pack.constraints.content_types {
+            lines.push(format!("  content_types: {}", types.join(", ")));
+        }
+    }
+    match &pack.response {
+        Some(response) => {
+            lines.push("response:".to_owned());
+            if let Some(max) = response.max_body_bytes {
+                lines.push(format!("  max_body_bytes: {max}"));
+            }
+            if !response.redact_headers.is_empty() {
+                lines.push(format!(
+                    "  redact_headers: {}",
+                    response.redact_headers.join(", ")
+                ));
+            }
+            if !response.redact_fields.is_empty() {
+                lines.push(format!(
+                    "  redact_fields: {}",
+                    response.redact_fields.join(", ")
+                ));
+            }
+        }
+        None => lines.push("response: (none)".to_owned()),
+    }
+    lines.join("\n")
 }
 
 /// Prefixes every line of a nested block with two spaces.
