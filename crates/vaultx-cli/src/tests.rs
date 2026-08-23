@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use vaultx_core::CoreError;
+use vaultx_core::{CoreError, MergeStrategy};
 use vaultx_types::CommitId;
 
 use crate::{
@@ -356,15 +356,6 @@ fn import_file_classification_output() {
 fn unsupported_groups_return_not_implemented_with_exit_two() {
     let dir = tempfile::tempdir().unwrap();
     let stubs = [
-        ("doctor", Command::Doctor(StubArgs { args: Vec::new() })),
-        ("merge", Command::Merge(StubArgs { args: Vec::new() })),
-        ("rollback", Command::Rollback(StubArgs { args: Vec::new() })),
-        (
-            "promote",
-            Command::Promote(StubArgs {
-                args: vec!["main".into(), "production".into()],
-            }),
-        ),
         ("run", Command::Run(StubArgs { args: Vec::new() })),
         ("broker", Command::Broker(StubArgs { args: Vec::new() })),
         ("pack", Command::Pack(StubArgs { args: Vec::new() })),
@@ -854,4 +845,785 @@ fn secret_metadata_never_shows_a_value_for_existing_secrets() {
     assert!(out.contains("revisions:   1"), "{out}");
     assert!(out.contains("fingerprint:"), "{out}");
     assert!(!out.contains("canary-hunter2"), "plaintext leaked:\n{out}");
+}
+
+// ---- merge / rollback / promote / doctor ----
+
+/// Opens the project services directly (for secret setup that would
+/// otherwise require stdin prompting).
+fn open_services(root: &Path) -> vaultx_core::VaultxServices {
+    vaultx_core::VaultxServices::open(root).expect("open")
+}
+
+fn store_secret(root: &Path, name: &str, value: &str) {
+    open_services(root)
+        .secrets()
+        .set_secret(
+            name,
+            &vaultx_core::SecretString::copy_from(value),
+            vaultx_types::model::VariableKind::Secret,
+            "development",
+            None,
+        )
+        .expect("set secret");
+}
+
+#[test]
+fn merge_clean_produces_two_parent_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["A=1".into()],
+        },
+    ))
+    .unwrap();
+    let base = commit_ok(root, "base", None);
+    dispatch(&cli(
+        root,
+        Command::Branch {
+            name: Some("feature".into()),
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "feature".into(),
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["B=2".into()],
+        },
+    ))
+    .unwrap();
+    let feature_tip = commit_ok(root, "feature work", None);
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "main".into(),
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["C=3".into()],
+        },
+    ))
+    .unwrap();
+    let main_tip = commit_ok(root, "main work", None);
+
+    let out = dispatch(&cli(
+        root,
+        Command::Merge {
+            branch: "feature".into(),
+            into: None,
+            strategy: None,
+            allow_weaker_protection: false,
+        },
+    ))
+    .unwrap();
+
+    assert!(out.starts_with("merged feature into main"), "{out}");
+    let merged_id = CommitId::parse(out.lines().nth(1).expect("id line")).unwrap();
+    assert_ne!(merged_id, main_tip);
+    assert_ne!(merged_id, feature_tip);
+
+    // Two parents: [ours tip, theirs tip].
+    let shown = dispatch(&cli(
+        root,
+        Command::Show {
+            prefix: merged_id.as_str()[4..16].into(),
+        },
+    ))
+    .unwrap();
+    let parents_line = shown
+        .lines()
+        .find(|line| line.starts_with("parents:"))
+        .expect("parents line");
+    assert!(
+        parents_line.contains(main_tip.as_str()) && parents_line.contains(feature_tip.as_str()),
+        "both tips must be parents: {shown}"
+    );
+    for name in ["A", "B", "C"] {
+        assert!(
+            shown.contains(name),
+            "merged manifest must contain {name}: {shown}"
+        );
+    }
+    let _ = base;
+}
+
+#[test]
+fn merge_config_conflict_exits_one_and_refs_unmoved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["PORT=8080".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "base", None);
+    dispatch(&cli(
+        root,
+        Command::Branch {
+            name: Some("feature".into()),
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "feature".into(),
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["PORT=7070".into()],
+        },
+    ))
+    .unwrap();
+    let feature_tip = commit_ok(root, "their change", None);
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "main".into(),
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["PORT=9090".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "our change", None);
+
+    let err = dispatch(&cli(
+        root,
+        Command::Merge {
+            branch: "feature".into(),
+            into: None,
+            strategy: None,
+            allow_weaker_protection: false,
+        },
+    ))
+    .unwrap_err();
+
+    match &err {
+        CliError::Conflicts(report) => {
+            assert!(report.contains("config conflicts"), "{report}");
+            assert!(report.contains("PORT"), "{report}");
+            assert!(report.contains("ours=9090"), "{report}");
+            assert!(report.contains("theirs=7070"), "{report}");
+        }
+        other => panic!("expected Conflicts, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 1);
+
+    // Refs unmoved: main HEAD is still "our change", feature still at its
+    // tip, and neither manifest changed.
+    let log = dispatch(&cli(root, Command::Log { limit: Some(1) })).unwrap();
+    assert!(log.contains("our change"), "{log}");
+    let value = dispatch(&cli(
+        root,
+        Command::Get {
+            name: "PORT".into(),
+        },
+    ))
+    .unwrap();
+    assert_eq!(value, "9090");
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "feature".into(),
+        },
+    ))
+    .unwrap();
+    let log = dispatch(&cli(root, Command::Log { limit: Some(1) })).unwrap();
+    assert!(log.contains("their change"), "{log}");
+    assert!(
+        head_is_at(root, feature_tip),
+        "feature tip must be untouched"
+    );
+}
+
+/// Whether the current branch's tip equals `expected` (via status).
+fn head_is_at(root: &Path, expected: CommitId) -> bool {
+    open_services(root)
+        .history()
+        .branches()
+        .into_iter()
+        .flatten()
+        .any(|(_, tip)| tip == expected)
+}
+
+#[test]
+fn merge_secret_conflict_blocked_without_plaintext_leak() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["A=1".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "base", None);
+    dispatch(&cli(
+        root,
+        Command::Branch {
+            name: Some("feature".into()),
+        },
+    ))
+    .unwrap();
+    store_secret(root, "DB_PASSWORD", "canary-ours-hunter2");
+    commit_ok(root, "ours rotate", None);
+    let ours_revision = open_services(root)
+        .secrets()
+        .secret_metadata("DB_PASSWORD", "development")
+        .unwrap()
+        .current_revision;
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "feature".into(),
+        },
+    ))
+    .unwrap();
+    store_secret(root, "DB_PASSWORD", "canary-theirs-hunter2");
+    commit_ok(root, "their rotate", None);
+    let theirs_revision = open_services(root)
+        .secrets()
+        .secret_metadata("DB_PASSWORD", "development")
+        .unwrap()
+        .current_revision;
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "main".into(),
+        },
+    ))
+    .unwrap();
+
+    let err = dispatch(&cli(
+        root,
+        Command::Merge {
+            branch: "feature".into(),
+            into: None,
+            strategy: Some(MergeStrategy::Theirs),
+            allow_weaker_protection: false,
+        },
+    ))
+    .unwrap_err();
+
+    match &err {
+        CliError::Conflicts(report) => {
+            assert!(
+                report.contains("secret conflicts (revision ids only)"),
+                "{report}"
+            );
+            assert!(
+                report.contains(ours_revision.as_str())
+                    && report.contains(theirs_revision.as_str()),
+                "revision ids must be shown: {report}"
+            );
+            assert!(
+                !report.contains("canary-ours") && !report.contains("canary-theirs"),
+                "plaintext leaked:\n{report}"
+            );
+        }
+        other => panic!("expected Conflicts, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 1, "secret conflicts block with exit 1");
+}
+
+#[test]
+fn merge_strategy_flags_pick_config_sides() {
+    for (strategy_flag, expected_value) in [
+        (MergeStrategy::Ours, "9090"),
+        (MergeStrategy::Theirs, "7070"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_in(root);
+
+        dispatch(&cli(
+            root,
+            Command::Set {
+                pairs: vec!["PORT=8080".into()],
+            },
+        ))
+        .unwrap();
+        commit_ok(root, "base", None);
+        dispatch(&cli(
+            root,
+            Command::Branch {
+                name: Some("feature".into()),
+            },
+        ))
+        .unwrap();
+        dispatch(&cli(
+            root,
+            Command::Checkout {
+                name: "feature".into(),
+            },
+        ))
+        .unwrap();
+        dispatch(&cli(
+            root,
+            Command::Set {
+                pairs: vec!["PORT=7070".into()],
+            },
+        ))
+        .unwrap();
+        commit_ok(root, "their change", None);
+        dispatch(&cli(
+            root,
+            Command::Checkout {
+                name: "main".into(),
+            },
+        ))
+        .unwrap();
+        dispatch(&cli(
+            root,
+            Command::Set {
+                pairs: vec!["PORT=9090".into()],
+            },
+        ))
+        .unwrap();
+        commit_ok(root, "our change", None);
+
+        let out = dispatch(&cli(
+            root,
+            Command::Merge {
+                branch: "feature".into(),
+                into: None,
+                strategy: Some(strategy_flag),
+                allow_weaker_protection: false,
+            },
+        ))
+        .unwrap_or_else(|err| panic!("strategy merge failed: {err}"));
+        assert!(out.contains("merged feature into main"), "{out}");
+
+        let value = dispatch(&cli(
+            root,
+            Command::Get {
+                name: "PORT".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(value, expected_value, "{strategy_flag:?}");
+    }
+}
+
+#[test]
+fn merge_refuses_protection_weakening_unless_overridden() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["KEEP=1".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "base", None);
+    dispatch(&cli(
+        root,
+        Command::Env {
+            command: EnvCommand::Create {
+                name: "staging".into(),
+            },
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Env {
+            command: EnvCommand::Protect {
+                name: "staging".into(),
+                unprotect: false,
+            },
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Branch {
+            name: Some("feature".into()),
+        },
+    ))
+    .unwrap();
+
+    // Feature removes the variable the protected environment pins.
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "feature".into(),
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Unset {
+            names: vec!["KEEP".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "drop KEEP", None);
+    dispatch(&cli(
+        root,
+        Command::Checkout {
+            name: "main".into(),
+        },
+    ))
+    .unwrap();
+
+    let err = dispatch(&cli(
+        root,
+        Command::Merge {
+            branch: "feature".into(),
+            into: None,
+            strategy: None,
+            allow_weaker_protection: false,
+        },
+    ))
+    .unwrap_err();
+    match &err {
+        CliError::Runtime(CoreError::ProtectionWeakening(msg)) => {
+            assert!(msg.contains("staging") && msg.contains("KEEP"), "{msg}");
+        }
+        other => panic!("expected ProtectionWeakening, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 1);
+
+    // Override path proceeds and lands the removal.
+    let out = dispatch(&cli(
+        root,
+        Command::Merge {
+            branch: "feature".into(),
+            into: None,
+            strategy: None,
+            allow_weaker_protection: true,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("merged feature into main"), "{out}");
+    match dispatch(&cli(
+        root,
+        Command::Get {
+            name: "KEEP".into(),
+        },
+    )) {
+        Err(CliError::Runtime(CoreError::VariableNotFound(_))) => {}
+        other => panic!("expected removed KEEP after override, got {other:?}"),
+    }
+}
+
+#[test]
+fn rollback_appends_commit_keeps_history_and_warns_destroyed_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["A=1".into()],
+        },
+    ))
+    .unwrap();
+    let c1 = commit_ok(root, "first", None);
+    store_secret(root, "TOKEN", "destroy-me-canary");
+    let c2 = commit_ok(root, "second with token", None);
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["B=2".into()],
+        },
+    ))
+    .unwrap();
+    let _c3 = commit_ok(root, "third", None);
+
+    // Real destroy: the value and recovery material are shredded.
+    dispatch(&cli(
+        root,
+        Command::Secret {
+            command: SecretCommand::Destroy {
+                name: "TOKEN".into(),
+                yes: true,
+                env: None,
+            },
+        },
+    ))
+    .unwrap();
+
+    let out = dispatch(&cli(root, Command::Rollback { to: None })).unwrap();
+    let mut lines = out.lines();
+    assert!(
+        lines.next().expect("line").starts_with("rolled back to "),
+        "{out}"
+    );
+    let new_id_line = lines.next().expect("new commit line");
+    assert!(new_id_line.starts_with("new commit: "), "{out}");
+    let warning = lines.next().expect("warning line");
+    assert!(
+        warning.contains("warning:") && warning.contains("TOKEN") && warning.contains("destroyed"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("destroy-me-canary"),
+        "plaintext leaked:\n{out}"
+    );
+    assert!(lines.next().is_none(), "no extra lines expected: {out}");
+
+    // The new commit references the HISTORICAL manifest (A + TOKEN
+    // present, B gone) while old commits remain intact.
+    let new_id = CommitId::parse(new_id_line.trim_start_matches("new commit: ")).unwrap();
+    let shown = dispatch(&cli(
+        root,
+        Command::Show {
+            prefix: new_id.as_str()[4..16].into(),
+        },
+    ))
+    .unwrap();
+    assert!(shown.contains("rollback to"), "{shown}");
+    assert!(
+        shown.contains("entries: 2"),
+        "restored manifest must hold A + TOKEN only:\n{shown}"
+    );
+    assert!(shown.contains("\n    A "), "{shown}");
+    assert!(shown.contains("\n    TOKEN "), "{shown}");
+    let old = dispatch(&cli(
+        root,
+        Command::Show {
+            prefix: c3_hex(&_c3),
+        },
+    ))
+    .unwrap();
+    assert!(
+        old.contains("entries: 3"),
+        "old commits must stay intact:\n{old}"
+    );
+    let first = dispatch(&cli(
+        root,
+        Command::Show {
+            prefix: c3_hex(&c1),
+        },
+    ))
+    .unwrap();
+    assert!(first.contains("message: first"), "{first}");
+    let second = dispatch(&cli(
+        root,
+        Command::Show {
+            prefix: c3_hex(&c2),
+        },
+    ))
+    .unwrap();
+    assert!(second.contains("message: second with token"), "{second}");
+
+    // History grew; nothing was rewritten.
+    let log = dispatch(&cli(root, Command::Log { limit: Some(10) })).unwrap();
+    assert!(log.lines().count() == 4, "{log}");
+}
+
+/// `cmt_`-stripped short hex used as a show prefix.
+fn c3_hex(id: &CommitId) -> String {
+    id.as_str()[4..16].to_owned()
+}
+
+#[test]
+fn rollback_requires_target_when_head_is_root_and_rejects_staged_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["A=1".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "root only", None);
+
+    let err = dispatch(&cli(root, Command::Rollback { to: None })).unwrap_err();
+    assert!(
+        matches!(err, CliError::Runtime(CoreError::UnsupportedOperation(ref msg)) if msg.contains("--to")),
+        "got: {err:?}"
+    );
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn promote_success_then_protected_refusal_exit_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["URL=https://prod".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "baseline", None);
+    dispatch(&cli(
+        root,
+        Command::Env {
+            command: EnvCommand::Create {
+                name: "production".into(),
+            },
+        },
+    ))
+    .unwrap();
+
+    // Unknown source is a plain failure (exit 1).
+    let err = dispatch(&cli(
+        root,
+        Command::Promote {
+            to: "production".into(),
+            from: Some("ghost".into()),
+            force: false,
+        },
+    ))
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+
+    // Success: current branch promoted onto production.
+    let out = dispatch(&cli(
+        root,
+        Command::Promote {
+            to: "production".into(),
+            from: None,
+            force: false,
+        },
+    ))
+    .unwrap();
+    assert_eq!(out, "promoted main -> production");
+
+    // Advance main; protect production; unforced move refused.
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["URL=https://v2".into()],
+        },
+    ))
+    .unwrap();
+    let newer_tip = commit_ok(root, "advance main", None);
+    dispatch(&cli(
+        root,
+        Command::Env {
+            command: EnvCommand::Protect {
+                name: "production".into(),
+                unprotect: false,
+            },
+        },
+    ))
+    .unwrap();
+    let err = dispatch(&cli(
+        root,
+        Command::Promote {
+            to: "production".into(),
+            from: None,
+            force: false,
+        },
+    ))
+    .unwrap_err();
+    match &err {
+        CliError::Runtime(CoreError::Repo(repo_err)) => {
+            assert!(
+                repo_err.to_string().contains("protected"),
+                "expected protected-ref refusal, got {repo_err}"
+            );
+        }
+        other => panic!("expected protected-ref refusal, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 1);
+
+    // Force overrides.
+    let out = dispatch(&cli(
+        root,
+        Command::Promote {
+            to: "production".into(),
+            from: None,
+            force: true,
+        },
+    ))
+    .unwrap();
+    assert_eq!(out, "promoted main -> production");
+    let inspect = dispatch(&cli(
+        root,
+        Command::Env {
+            command: EnvCommand::Inspect {
+                name: "production".into(),
+            },
+        },
+    ))
+    .unwrap();
+    assert!(inspect.contains(newer_tip.as_str()), "{inspect}");
+}
+
+#[test]
+fn doctor_fresh_repo_passes_and_tampered_object_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    let out = dispatch(&cli(root, Command::Doctor)).unwrap();
+    assert!(out.contains("PASS repository integrity"), "{out}");
+    assert!(out.contains("WARN broker"), "{out}");
+    assert!(out.contains("WARN remote"), "{out}");
+    assert!(out.contains("summary:"), "{out}");
+    assert!(!out.contains("FAIL"), "fresh repo must not fail: {out}");
+
+    // Tamper with an object on disk.
+    use vaultx_core::VaultxServices;
+    let services = VaultxServices::open(root).unwrap();
+    services.config().set_config("V", "1").unwrap();
+    let head = services.history().commit("seed", "user:t").unwrap();
+    let digest = &head.as_str()[4..];
+    let object_path = services
+        .context()
+        .repository()
+        .objects()
+        .root()
+        .join("sha256")
+        .join(&digest[..2])
+        .join(&digest[2..]);
+    std::fs::write(object_path, b"{\"tampered\":true}").unwrap();
+
+    let err = dispatch(&cli(root, Command::Doctor)).unwrap_err();
+    match &err {
+        CliError::Diagnostics(report) => {
+            assert!(report.contains("FAIL repository integrity"), "{report}");
+            assert!(
+                report.contains("summary: 6 passed, 2 warned, 1 failed")
+                    || report.contains("summary: "),
+                "{report}"
+            );
+        }
+        other => panic!("expected Diagnostics, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 1);
 }

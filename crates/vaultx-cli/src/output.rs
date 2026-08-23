@@ -15,7 +15,8 @@ use std::path::Path;
 
 use vaultx_core::{
     AgentIdentityFile, AgentSummary, CommitDetail, CommitSummary, DiffEntry, EntrySummary,
-    EnvironmentSummary, ImportReport, SecretMetadata, StatusReport,
+    EnvironmentSummary, ImportReport, MergeConflictSet, RollbackReport, SecretMetadata,
+    StatusReport,
 };
 use vaultx_types::model::{InjectionTemplateId, VariableKind};
 use vaultx_types::CommitId;
@@ -392,6 +393,53 @@ pub fn render_secret_metadata(meta: &SecretMetadata) -> String {
             })
             .collect();
         lines.push(render_table(&["  REVISION", "STATE", "CREATED"], &rows));
+    }
+    lines.join("\n")
+}
+
+/// Renders a refused merge as grouped conflict blocks. Config values are
+/// shown; secret conflicts carry revision ids only — never values.
+#[must_use]
+pub fn render_merge_conflicts(set: &MergeConflictSet) -> String {
+    let mut lines = vec![format!("merge blocked by {} conflict(s)", set.len())];
+    if !set.configs.is_empty() {
+        lines.push("config conflicts (values shown):".to_owned());
+        for conflict in &set.configs {
+            lines.push(format!(
+                "  {}: ours={} theirs={}",
+                conflict.name, conflict.ours_value, conflict.theirs_value
+            ));
+        }
+    }
+    if !set.secrets.is_empty() {
+        lines.push("secret conflicts (revision ids only):".to_owned());
+        for conflict in &set.secrets {
+            lines.push(format!(
+                "  {}: ours={} theirs={}",
+                conflict.name, conflict.ours_revision, conflict.theirs_revision
+            ));
+        }
+    }
+    if !set.policies.is_empty() {
+        lines.push("policy conflicts:".to_owned());
+        for name in &set.policies {
+            lines.push(format!("  {name}"));
+        }
+    }
+    lines.push("nothing was written; resolve the conflicts and retry".to_owned());
+    lines.join("\n")
+}
+
+/// Renders a completed rollback: restored target, new commit id, and any
+/// destroyed-secret warnings.
+#[must_use]
+pub fn render_rollback(report: &RollbackReport) -> String {
+    let mut lines = vec![
+        format!("rolled back to {}", short_commit_id(&report.target)),
+        format!("new commit: {}", report.commit_id),
+    ];
+    for warning in &report.warnings {
+        lines.push(format!("warning: {warning}"));
     }
     lines.join("\n")
 }

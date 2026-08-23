@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use thiserror::Error;
 
-use vaultx_core::{BrokeredBinding, CommitSummary, CoreError, SecretString, VaultxServices};
+use vaultx_core::{
+    BrokeredBinding, CommitSummary, CoreError, MergeOutcome, MergeStrategy, SecretString,
+    VaultxServices,
+};
 use vaultx_types::model::{InjectionTemplateId, VariableKind};
 use vaultx_types::{CommitId, CredentialRef, ProviderName, VariableName};
 
@@ -32,6 +35,9 @@ const DEFAULT_LOG_LIMIT: usize = 20;
 /// are branch-scoped), so the conventional development environment is the
 /// default; `--env <ENV>` overrides it per invocation.
 const DEFAULT_SECRET_ENV: &str = "development";
+
+/// Author identity used when a command does not take `--author`.
+const DEFAULT_AUTHOR: &str = "unknown";
 
 /// Errors surfaced by the CLI layer.
 #[derive(Debug, Error)]
@@ -49,6 +55,14 @@ pub enum CliError {
     /// assignments. Exit code 1.
     #[error("{0}")]
     Usage(String),
+    /// A merge was refused; the payload is the grouped conflict report.
+    /// Exit code 1 — refs and objects were left untouched.
+    #[error("{0}")]
+    Conflicts(String),
+    /// Diagnostics finished with failures; the payload is the rendered
+    /// report. Exit code 1.
+    #[error("{0}")]
+    Diagnostics(String),
     /// An underlying application service failed at runtime.
     /// Exit code 1.
     #[error(transparent)]
@@ -58,13 +72,14 @@ pub enum CliError {
 impl CliError {
     /// Process exit code for this error:
     ///
-    /// * 1 — runtime or usage failure,
+    /// * 1 — runtime or usage failure, merge conflicts, or failing
+    ///   diagnostics,
     /// * 2 — not-yet-implemented command group,
     /// * 3 — target directory is not a vaultx repository.
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::Runtime(_) | Self::Usage(_) => 1,
+            Self::Runtime(_) | Self::Usage(_) | Self::Conflicts(_) | Self::Diagnostics(_) => 1,
             Self::NotImplemented(_) => 2,
             Self::NotARepository(_) => 3,
         }
@@ -115,8 +130,8 @@ pub enum Command {
     Init,
     /// Show branch, head commit, and pending staged changes.
     Status,
-    /// Environment health checks (planned).
-    Doctor(StubArgs),
+    /// Run environment health checks.
+    Doctor,
 
     /// Set one or more non-secret config values.
     Set {
@@ -222,13 +237,41 @@ pub enum Command {
         command: SecretCommand,
     },
 
+    /// Merge another branch into the current branch (or `--into` target).
+    Merge {
+        /// Branch to merge in.
+        branch: String,
+        /// Target branch (default: the current branch).
+        #[arg(long, value_name = "BRANCH")]
+        into: Option<String>,
+        /// Auto-resolve non-secret conflicts by picking one side.
+        #[arg(long, value_parser = parse_merge_strategy, value_name = "theirs|ours")]
+        strategy: Option<MergeStrategy>,
+        /// Permit merges that would remove variables bound by protected
+        /// environments.
+        #[arg(long)]
+        allow_weaker_protection: bool,
+    },
+    /// Roll back to a historical state by appending a new commit
+    /// (history is never rewritten).
+    Rollback {
+        /// Commit id prefix to restore (default: HEAD's first parent).
+        #[arg(long, value_name = "COMMIT")]
+        to: Option<String>,
+    },
+    /// Move an environment onto a source ref's commit.
+    Promote {
+        /// Destination environment name (bare, e.g. `production`).
+        #[arg(long, value_name = "ENV")]
+        to: String,
+        /// Source branch or environment (default: the current branch).
+        #[arg(long, value_name = "REF")]
+        from: Option<String>,
+        /// Allow moving a protected environment.
+        #[arg(long)]
+        force: bool,
+    },
     // ---- planned groups (exit code 2 notices) ----
-    /// Merge branch histories (planned).
-    Merge(StubArgs),
-    /// Roll back variables to a past state (planned).
-    Rollback(StubArgs),
-    /// Promote a ref onto an environment (planned).
-    Promote(StubArgs),
     /// Run commands with resolved environment (planned).
     Run(StubArgs),
     /// Broker server/session operations (planned).
@@ -470,11 +513,28 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             }),
         },
 
+        // Implemented history/environment commands.
+        Command::Doctor => with_open(&cli.project, cmd_doctor),
+        Command::Merge {
+            branch,
+            into,
+            strategy,
+            allow_weaker_protection,
+        } => with_open(&cli.project, |s| {
+            cmd_merge(
+                s,
+                branch,
+                into.as_deref(),
+                *strategy,
+                *allow_weaker_protection,
+            )
+        }),
+        Command::Rollback { to } => with_open(&cli.project, |s| cmd_rollback(s, to.as_deref())),
+        Command::Promote { to, from, force } => with_open(&cli.project, |s| {
+            cmd_promote(s, to, from.as_deref(), *force)
+        }),
+
         // Planned groups: reserved names, clear notices, exit code 2.
-        Command::Doctor(_) => Err(CliError::NotImplemented("doctor")),
-        Command::Merge(_) => Err(CliError::NotImplemented("merge")),
-        Command::Rollback(_) => Err(CliError::NotImplemented("rollback")),
-        Command::Promote(_) => Err(CliError::NotImplemented("promote")),
         Command::Run(_) => Err(CliError::NotImplemented("run")),
         Command::Broker(_) => Err(CliError::NotImplemented("broker")),
         Command::Pack(_) => Err(CliError::NotImplemented("pack")),
@@ -723,6 +783,81 @@ fn cmd_env_inspect(services: &VaultxServices, name: &str) -> Result<String, CliE
     ))
 }
 
+fn cmd_merge(
+    services: &VaultxServices,
+    theirs_branch: &str,
+    into_target: Option<&str>,
+    strategy: Option<MergeStrategy>,
+    allow_weaker_protection: bool,
+) -> Result<String, CliError> {
+    match services.history().merge_branch(
+        theirs_branch,
+        into_target,
+        strategy,
+        allow_weaker_protection,
+        DEFAULT_AUTHOR,
+    )? {
+        MergeOutcome::AlreadyUpToDate { target_branch } => {
+            Ok(format!("merge: {target_branch} is already up to date"))
+        }
+        MergeOutcome::Committed {
+            commit_id,
+            target_branch,
+        } => Ok(format!(
+            "merged {theirs_branch} into {target_branch}\n{commit_id}"
+        )),
+        MergeOutcome::Conflicts(set) => Err(CliError::Conflicts(
+            crate::output::render_merge_conflicts(&set),
+        )),
+    }
+}
+
+fn cmd_rollback(services: &VaultxServices, to: Option<&str>) -> Result<String, CliError> {
+    let target = match to {
+        Some(prefix) => {
+            let log = services.history().log(usize::MAX)?;
+            Some(resolve_commit_prefix(prefix, &log)?)
+        }
+        None => None,
+    };
+    let report = services
+        .history()
+        .rollback(target.as_ref(), DEFAULT_AUTHOR)?;
+    Ok(crate::output::render_rollback(&report))
+}
+
+fn cmd_promote(
+    services: &VaultxServices,
+    to_env: &str,
+    from_ref: Option<&str>,
+    force: bool,
+) -> Result<String, CliError> {
+    let from = match from_ref {
+        Some(reference) => reference.to_owned(),
+        None => services
+            .staging()
+            .status()?
+            .branch
+            .ok_or_else(|| CliError::Usage("--from is required on a detached HEAD".into()))?,
+    };
+    services.environments().promote(&from, to_env, force)?;
+    Ok(format!("promoted {from} -> {to_env}"))
+}
+
+fn cmd_doctor(services: &VaultxServices) -> Result<String, CliError> {
+    use vaultx_core::CheckStatus;
+    let outcomes = services.doctor().run();
+    let rendered = vaultx_core::render_checks(&outcomes);
+    if outcomes
+        .iter()
+        .any(|outcome| outcome.status == CheckStatus::Fail)
+    {
+        Err(CliError::Diagnostics(rendered))
+    } else {
+        Ok(rendered)
+    }
+}
+
 fn cmd_agent_create(services: &VaultxServices, name: &str) -> Result<String, CliError> {
     let full_id = services.agents().create_agent(name)?;
     Ok(format!("created agent {name} ({full_id})"))
@@ -961,6 +1096,17 @@ fn parse_injection_template(raw: &str) -> Result<InjectionTemplateId, String> {
             "unknown injection template `{other}` (expected bearer, basic-password, \
              api-key-header, github-bearer, query-parameter, aws-sigv4, or \
              custom-static-header-plus-secret)"
+        )),
+    }
+}
+
+/// Parses the `--strategy` flag for merges (`theirs` or `ours`).
+fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy, String> {
+    match raw {
+        "theirs" => Ok(MergeStrategy::Theirs),
+        "ours" => Ok(MergeStrategy::Ours),
+        other => Err(format!(
+            "unknown merge strategy `{other}` (expected `theirs` or `ours`)"
         )),
     }
 }
