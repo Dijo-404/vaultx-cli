@@ -1,8 +1,8 @@
 //! The [`CoreError`] type surfaced by every vaultx-core service.
 //!
 //! No variant ever carries secret material: core services handle
-//! identifiers, config values, and metadata only (secret values are not
-//! stored in v1; see the crate-level docs for the deferral).
+//! identifiers, config values, and metadata, and secret *values* live
+//! only inside encrypted revision records (see [`crate::secrets`]).
 
 use std::path::PathBuf;
 
@@ -42,6 +42,27 @@ pub enum CoreError {
     /// An environment ref does not exist.
     #[error("environment `{0}` not found")]
     EnvironmentNotFound(String),
+    /// No encrypted secret value is bound to this name in the requested
+    /// environment.
+    #[error("no secret named `{0}` found")]
+    SecretNotFound(String),
+    /// A destroyed secret was used in a context that needs its value;
+    /// its recovery material was irreversibly shredded.
+    #[error("secret `{0}` is destroyed; its value is unrecoverable")]
+    SecretDestroyed(String),
+    /// An empty plaintext was supplied where a secret value is required.
+    #[error("secret value must not be empty")]
+    EmptySecretValue,
+    /// The secret kind flags and brokered binding data disagree (for
+    /// example `brokered` without an injection binding).
+    #[error("{0}")]
+    InconsistentBinding(String),
+    /// The persisted project vault keys
+    /// (`.vaultx/keys/project.json`) are unreadable, use an unsupported
+    /// format version, or cannot be unwrapped with the configured root
+    /// key. The file is never overwritten automatically.
+    #[error("project vault keys at .vaultx/keys/project.json are unusable: {0}")]
+    ProjectKey(String),
     /// The operation is intentionally unavailable in this build of the
     /// services (e.g. blocked on a deferred integration).
     #[error("unsupported operation: {0}")]
@@ -98,6 +119,11 @@ mod tests {
             CoreError::PolicyLoadFailed("parse error".to_owned()),
             CoreError::AgentNotFound("ghost".to_owned()),
             CoreError::EnvironmentNotFound("production".to_owned()),
+            CoreError::SecretNotFound("DB_PASSWORD".to_owned()),
+            CoreError::SecretDestroyed("DB_PASSWORD".to_owned()),
+            CoreError::EmptySecretValue,
+            CoreError::InconsistentBinding("brokered requires --injection".to_owned()),
+            CoreError::ProjectKey("wrong root key".to_owned()),
             CoreError::UnsupportedOperation("not yet".to_owned()),
             CoreError::AlreadyExists("agent `ci`".to_owned()),
             CoreError::DeviceKey("not hex".to_owned()),

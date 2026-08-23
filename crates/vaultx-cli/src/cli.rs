@@ -18,12 +18,20 @@ use std::path::{Path, PathBuf};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use thiserror::Error;
 
-use vaultx_core::{CommitSummary, CoreError, VaultxServices};
-use vaultx_types::CommitId;
+use vaultx_core::{BrokeredBinding, CommitSummary, CoreError, SecretString, VaultxServices};
+use vaultx_types::model::{InjectionTemplateId, VariableKind};
+use vaultx_types::{CommitId, CredentialRef, ProviderName};
 
 /// Default number of entries printed by `vaultx log` when `--limit` is
 /// not given.
 const DEFAULT_LOG_LIMIT: usize = 20;
+
+/// Bare environment name used by secret commands when `--env` is omitted.
+///
+/// There is no persisted "current environment" concept yet (config values
+/// are branch-scoped), so the conventional development environment is the
+/// default; `--env <ENV>` overrides it per invocation.
+const DEFAULT_SECRET_ENV: &str = "development";
 
 /// Errors surfaced by the CLI layer.
 #[derive(Debug, Error)]
@@ -208,10 +216,13 @@ pub enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Store, rotate, inspect, or destroy encrypted secret values.
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
 
     // ---- planned groups (exit code 2 notices) ----
-    /// Secret value operations (planned).
-    Secret(StubArgs),
     /// Merge branch histories (planned).
     Merge(StubArgs),
     /// Roll back variables to a past state (planned).
@@ -298,6 +309,71 @@ pub enum PolicyCommand {
     List,
 }
 
+/// `vaultx secret <subcommand>`.
+///
+/// Plaintext is never accepted as a command-line argument: commands read
+/// it from stdin when the trailing `-` positional is given (exactly one
+/// trailing newline is stripped), or via a hidden double prompt otherwise.
+#[derive(Subcommand, Debug)]
+pub enum SecretCommand {
+    /// Store a new value for NAME, creating or replacing its binding.
+    Set {
+        /// Variable name.
+        name: String,
+        /// Read the plaintext from stdin instead of prompting.
+        #[arg(value_name = "-")]
+        stdin: Option<String>,
+        /// Bind as a brokered credential instead of a plain secret.
+        #[arg(long)]
+        brokered: bool,
+        /// Injection template (required with `--brokered`).
+        #[arg(long, value_parser = parse_injection_template, value_name = "TEMPLATE")]
+        injection: Option<InjectionTemplateId>,
+        /// Optional provider hint for brokered credentials.
+        #[arg(long, value_name = "NAME")]
+        provider: Option<String>,
+        /// Target environment (default: development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+        /// Reserved annotation for future audit-event correlation.
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+    },
+    /// Replace the value of NAME with a fresh revision (old one revoked).
+    Rotate {
+        /// Variable name.
+        name: String,
+        /// Read the plaintext from stdin instead of prompting.
+        #[arg(value_name = "-")]
+        stdin: Option<String>,
+        /// Target environment (default: development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+        /// Reserved annotation for future audit-event correlation.
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+    },
+    /// Show metadata about NAME (never its value).
+    Metadata {
+        /// Variable name.
+        name: String,
+        /// Target environment (default: development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+    },
+    /// Irreversibly destroy NAME's current value and recovery material.
+    Destroy {
+        /// Variable name.
+        name: String,
+        /// Explicit confirmation; destruction cannot be undone.
+        #[arg(long)]
+        yes: bool,
+        /// Target environment (default: development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+    },
+}
+
 /// Executes an already-parsed invocation against the application
 /// services selected by `cli.project`, returning the rendered output.
 ///
@@ -358,9 +434,49 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             PolicyCommand::List => with_open(&cli.project, cmd_policy_list),
         },
 
+        Command::Secret { command } => match command {
+            SecretCommand::Set {
+                name,
+                stdin,
+                brokered,
+                injection,
+                provider,
+                env,
+                message: _,
+            } => with_open(&cli.project, |s| {
+                cmd_secret_set(
+                    s,
+                    name,
+                    stdin.as_deref(),
+                    *brokered,
+                    *injection,
+                    provider.as_deref(),
+                    env.as_deref(),
+                )
+            }),
+            SecretCommand::Rotate {
+                name,
+                stdin,
+                env,
+                message: _,
+            } => with_open(&cli.project, |s| {
+                cmd_secret_rotate(
+                    s,
+                    name,
+                    stdin.as_deref(),
+                    env.as_deref().unwrap_or(DEFAULT_SECRET_ENV),
+                )
+            }),
+            SecretCommand::Metadata { name, env } => with_open(&cli.project, |s| {
+                cmd_secret_metadata(s, name, env.as_deref().unwrap_or(DEFAULT_SECRET_ENV))
+            }),
+            SecretCommand::Destroy { name, yes, env } => with_open(&cli.project, |s| {
+                cmd_secret_destroy(s, name, *yes, env.as_deref().unwrap_or(DEFAULT_SECRET_ENV))
+            }),
+        },
+
         // Planned groups: reserved names, clear notices, exit code 2.
         Command::Doctor(_) => Err(CliError::NotImplemented("doctor")),
-        Command::Secret(_) => Err(CliError::NotImplemented("secret")),
         Command::Merge(_) => Err(CliError::NotImplemented("merge")),
         Command::Rollback(_) => Err(CliError::NotImplemented("rollback")),
         Command::Promote(_) => Err(CliError::NotImplemented("promote")),
@@ -663,6 +779,167 @@ fn cmd_policy_list(services: &VaultxServices) -> Result<String, CliError> {
     ))
 }
 
+fn cmd_secret_set(
+    services: &VaultxServices,
+    name: &str,
+    stdin_flag: Option<&str>,
+    brokered: bool,
+    injection: Option<InjectionTemplateId>,
+    provider: Option<&str>,
+    env: Option<&str>,
+) -> Result<String, CliError> {
+    let (kind, binding) = build_secret_binding(name, brokered, injection, provider)?;
+    let plaintext = acquire_plaintext(stdin_flag)?;
+    let revision = services.secrets().set_secret(
+        name,
+        &plaintext,
+        kind,
+        env.unwrap_or(DEFAULT_SECRET_ENV),
+        binding,
+    )?;
+    Ok(format!("set {name} ({revision})"))
+}
+
+fn cmd_secret_rotate(
+    services: &VaultxServices,
+    name: &str,
+    stdin_flag: Option<&str>,
+    env: &str,
+) -> Result<String, CliError> {
+    let plaintext = acquire_plaintext(stdin_flag)?;
+    let revision = services.secrets().rotate_secret(name, &plaintext, env)?;
+    Ok(format!("rotated {name} ({revision})"))
+}
+
+fn cmd_secret_metadata(
+    services: &VaultxServices,
+    name: &str,
+    env: &str,
+) -> Result<String, CliError> {
+    let metadata = services.secrets().secret_metadata(name, env)?;
+    Ok(crate::output::render_secret_metadata(&metadata))
+}
+
+fn cmd_secret_destroy(
+    services: &VaultxServices,
+    name: &str,
+    yes: bool,
+    env: &str,
+) -> Result<String, CliError> {
+    if !yes {
+        return Err(CliError::Usage(
+            "refusing to destroy without --yes; destruction irreversibly shreds the secret's \
+             recovery material"
+                .into(),
+        ));
+    }
+    services.secrets().destroy_secret(name, env)?;
+    Ok(format!(
+        "destroyed {name}: its value and recovery material are irreversibly gone"
+    ))
+}
+
+/// Translates `--brokered`/`--injection`/`--provider` flags into the
+/// service-level kind + binding pair. Brokered credentials derive their
+/// credential ref from the lowercased variable name (the CLI exposes no
+/// separate credential namespace in v1).
+fn build_secret_binding(
+    name: &str,
+    brokered: bool,
+    injection: Option<InjectionTemplateId>,
+    provider: Option<&str>,
+) -> Result<(VariableKind, Option<BrokeredBinding>), CliError> {
+    if !brokered {
+        if injection.is_some() || provider.is_some() {
+            return Err(CliError::Usage(
+                "--injection/--provider require --brokered".into(),
+            ));
+        }
+        return Ok((VariableKind::Secret, None));
+    }
+    let injection = injection
+        .ok_or_else(|| CliError::Usage("--brokered requires --injection <TEMPLATE>".into()))?;
+    let hint = match provider {
+        None => None,
+        Some(raw) => Some(ProviderName::parse(raw).map_err(|_| {
+            CliError::Usage(format!(
+                "`{raw}` is not a valid provider name (lowercase letters, digits, `-`)"
+            ))
+        })?),
+    };
+    let credential_ref = CredentialRef::parse(&name.to_ascii_lowercase()).map_err(|_| {
+        CliError::Usage(format!(
+            "variable name `{name}` cannot form a credential ref"
+        ))
+    })?;
+    Ok((
+        VariableKind::Brokered,
+        Some(BrokeredBinding {
+            credential_ref,
+            injection,
+            provider_hint: hint,
+        }),
+    ))
+}
+
+/// Obtains the secret plaintext either from stdin (`-`) or a hidden
+/// double prompt. Command-line arguments are deliberately refused.
+fn acquire_plaintext(stdin_flag: Option<&str>) -> Result<SecretString, CliError> {
+    match stdin_flag {
+        Some("-") => read_stdin_plaintext(),
+        Some(other) => Err(CliError::Usage(format!(
+            "unexpected positional `{other}`; only `-` (read the value from stdin) is accepted"
+        ))),
+        None => prompt_plaintext_twice(),
+    }
+}
+
+fn read_stdin_plaintext() -> Result<SecretString, CliError> {
+    use std::io::Read as _;
+    let mut raw = String::new();
+    std::io::stdin()
+        .lock()
+        .read_to_string(&mut raw)
+        .map_err(|err| CliError::Usage(format!("cannot read stdin: {err}")))?;
+    // Strip exactly one trailing newline so `echo pw | vaultx ...` stores
+    // the value without the echo's line terminator.
+    let trimmed = raw
+        .strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .unwrap_or(&raw);
+    Ok(SecretString::new(trimmed.to_owned()))
+}
+
+fn prompt_plaintext_twice() -> Result<SecretString, CliError> {
+    let first = rpassword::prompt_password("Enter secret value: ")
+        .map_err(|err| CliError::Usage(format!("cannot read password: {err}")))?;
+    let second = rpassword::prompt_password("Confirm secret value: ")
+        .map_err(|err| CliError::Usage(format!("cannot read password: {err}")))?;
+    if first != second {
+        return Err(CliError::Usage("Passwords do not match".into()));
+    }
+    Ok(SecretString::new(first))
+}
+
+/// Parses an injection-template flag value (kebab-case, matching the
+/// serde representation of [`InjectionTemplateId`]).
+fn parse_injection_template(raw: &str) -> Result<InjectionTemplateId, String> {
+    match raw {
+        "bearer" => Ok(InjectionTemplateId::Bearer),
+        "basic-password" => Ok(InjectionTemplateId::BasicPassword),
+        "api-key-header" => Ok(InjectionTemplateId::ApiKeyHeader),
+        "github-bearer" => Ok(InjectionTemplateId::GithubBearer),
+        "query-parameter" => Ok(InjectionTemplateId::QueryParameter),
+        "aws-sigv4" => Ok(InjectionTemplateId::AwsSigv4),
+        "custom-static-header-plus-secret" => Ok(InjectionTemplateId::CustomStaticHeaderPlusSecret),
+        other => Err(format!(
+            "unknown injection template `{other}` (expected bearer, basic-password, \
+             api-key-header, github-bearer, query-parameter, aws-sigv4, or \
+             custom-static-header-plus-secret)"
+        )),
+    }
+}
+
 /// Splits one `NAME=VALUE` assignment; the value may be empty but the
 /// name must not be.
 fn parse_assignment(raw: &str) -> Result<(&str, &str), CliError> {
@@ -801,6 +1078,29 @@ mod helper_tests {
                 ("D".to_owned(), "single".to_owned()),
                 ("E".to_owned(), String::new()),
             ]
+        );
+    }
+
+    #[test]
+    fn injection_template_parsing_covers_all_templates_and_rejects_unknown() {
+        for (raw, expected) in [
+            ("bearer", InjectionTemplateId::Bearer),
+            ("basic-password", InjectionTemplateId::BasicPassword),
+            ("api-key-header", InjectionTemplateId::ApiKeyHeader),
+            ("github-bearer", InjectionTemplateId::GithubBearer),
+            ("query-parameter", InjectionTemplateId::QueryParameter),
+            ("aws-sigv4", InjectionTemplateId::AwsSigv4),
+            (
+                "custom-static-header-plus-secret",
+                InjectionTemplateId::CustomStaticHeaderPlusSecret,
+            ),
+        ] {
+            assert_eq!(parse_injection_template(raw), Ok(expected), "{raw}");
+        }
+        let err = parse_injection_template("mystery-header").unwrap_err();
+        assert!(
+            err.contains("unknown injection template `mystery-header`"),
+            "{err}"
         );
     }
 

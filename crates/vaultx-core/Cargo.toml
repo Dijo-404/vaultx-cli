@@ -5,14 +5,17 @@ edition.workspace = true
 
 [dependencies]
 hex = { workspace = true }
+rand_core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 vaultx-audit = { path = "../vaultx-audit" }
 vaultx-crypto = { path = "../vaultx-crypto" }
+vaultx-keyring = { path = "../vaultx-keyring" }
 vaultx-policy = { path = "../vaultx-policy" }
 vaultx-repository = { path = "../vaultx-repository" }
 vaultx-types = { path = "../vaultx-types" }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

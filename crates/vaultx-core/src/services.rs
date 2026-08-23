@@ -117,6 +117,12 @@ impl VaultxServices {
     pub const fn policies(&self) -> PolicyOpsService<'_> {
         PolicyOpsService::new(&self.ctx)
     }
+
+    /// Encrypted secret-value operations.
+    #[must_use]
+    pub fn secrets(&self) -> crate::secrets::SecretService<'_> {
+        crate::secrets::SecretService::new(&self.ctx)
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +148,7 @@ mod tests {
         let _ = services.environments();
         let _ = services.agents();
         let _ = services.policies();
+        let _ = services.secrets();
         assert_eq!(services.context().root(), root);
         drop(services);
 

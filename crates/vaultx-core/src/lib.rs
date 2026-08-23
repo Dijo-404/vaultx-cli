@@ -18,6 +18,10 @@
 //!   attachment, inspection.
 //! - `policies`: YAML persistence, engine building, per-file validation,
 //!   dry-run authorization checks.
+//! - `secrets`: encrypted secret-value storage under the
+//!   `root → project → DEK` envelope hierarchy, kept outside the
+//!   content-addressed object store (see the module docs for the
+//!   invariant list).
 //! - `services`: [`VaultxServices`], the facade CLI/TUI construct.
 //!
 //! # Synchronous v1 (async deferred)
@@ -26,16 +30,6 @@
 //! trait surface is intentionally not defined here: it arrives together
 //! with the IPC/server tasks as a thin tokio wrapper over these same
 //! structs. Signatures map 1:1; no service logic will move.
-//!
-//! # Deferred: secret value storage / encryption
-//!
-//! Secret *values* are never handled by this crate. Manifest entries of
-//! kind `Secret`/`Brokered` reference `SecretRevisionId`s that a later
-//! vault layer will materialize through envelope encryption. Until then:
-//!
-//! - config operations only ever write plain `ConfigValue` objects;
-//! - `import_env_pairs` reports likely secrets instead of storing them;
-//! - no API accepts or returns plaintext secret material.
 //!
 //! # Deferred: broker wiring
 //!
@@ -55,6 +49,7 @@ mod error;
 mod history;
 mod policies;
 mod project;
+mod secrets;
 mod services;
 mod staging;
 
@@ -65,12 +60,20 @@ pub use error::{CoreError, CoreResult};
 pub use history::{CommitDetail, CommitSummary, EntrySummary, HistoryService};
 pub use policies::PolicyOpsService;
 pub use project::ProjectContext;
+pub use secrets::{
+    BrokeredBinding, EncryptedSecretRevision, SecretListEntry, SecretMetadata, SecretRevisionAad,
+    SecretRevisionInfo, SecretRevisionState, SecretService,
+};
 pub use services::{version, VaultxServices};
 pub use staging::{StagedChangeKind, StagingService, StatusReport};
 
 /// Re-exported so consumers can name diff entries without depending on
 /// `vaultx-repository` directly.
 pub use vaultx_repository::DiffEntry;
+
+/// Re-exported so CLI/TUI surfaces handle secret values without depending
+/// on `vaultx-crypto` directly.
+pub use vaultx_crypto::secret::SecretString;
 
 #[cfg(test)]
 mod tests {

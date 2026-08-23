@@ -15,8 +15,9 @@ use std::path::Path;
 
 use vaultx_core::{
     AgentIdentityFile, AgentSummary, CommitDetail, CommitSummary, DiffEntry, EntrySummary,
-    EnvironmentSummary, ImportReport, StatusReport,
+    EnvironmentSummary, ImportReport, SecretMetadata, StatusReport,
 };
+use vaultx_types::model::{InjectionTemplateId, VariableKind};
 use vaultx_types::CommitId;
 
 /// Number of hex characters kept in short commit ids.
@@ -343,6 +344,79 @@ pub fn render_policy_validation(results: Vec<Result<String, String>>) -> String 
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Renders `vaultx secret metadata`: identity, state, binding, keyed
+/// fingerprint, and revision history. Never renders the secret value.
+#[must_use]
+pub fn render_secret_metadata(meta: &SecretMetadata) -> String {
+    let binding = meta.brokered.as_ref().map_or_else(
+        || "-".to_owned(),
+        |b| {
+            let provider = b
+                .provider_hint
+                .as_ref()
+                .map_or_else(String::new, |p| format!(" ({p})"));
+            format!(
+                "{}@{}{}",
+                b.credential_ref,
+                injection_label(b.injection),
+                provider
+            )
+        },
+    );
+    let mut lines = vec![
+        format!("secret:      {}", meta.name),
+        format!("id:          {}", meta.secret_id),
+        format!("environment: {}", meta.environment),
+        format!("state:       {}", meta.state),
+        format!("kind:        {}", kind_label(meta.kind)),
+        format!("binding:     {binding}"),
+        // Keyed + non-invertible: fingerprints are safe to display.
+        format!("fingerprint: {}", meta.fingerprint_hex),
+        format!("created:     {}", meta.created_at),
+    ];
+    if meta.history.is_empty() {
+        lines.push("revisions:   (none)".to_owned());
+    } else {
+        lines.push(format!("revisions:   {}", meta.history.len()));
+        let rows: Vec<Vec<String>> = meta
+            .history
+            .iter()
+            .map(|revision| {
+                vec![
+                    format!("  {}", revision.id),
+                    revision.state.to_string(),
+                    revision.created_at.to_string(),
+                ]
+            })
+            .collect();
+        lines.push(render_table(&["  REVISION", "STATE", "CREATED"], &rows));
+    }
+    lines.join("\n")
+}
+
+/// Kebab-case label for an injection template (matches its serde form).
+fn injection_label(template: InjectionTemplateId) -> &'static str {
+    match template {
+        InjectionTemplateId::Bearer => "bearer",
+        InjectionTemplateId::BasicPassword => "basic-password",
+        InjectionTemplateId::ApiKeyHeader => "api-key-header",
+        InjectionTemplateId::GithubBearer => "github-bearer",
+        InjectionTemplateId::QueryParameter => "query-parameter",
+        InjectionTemplateId::AwsSigv4 => "aws-sigv4",
+        InjectionTemplateId::CustomStaticHeaderPlusSecret => "custom-static-header-plus-secret",
+    }
+}
+
+/// Lowercase label for a variable kind (matches the serde form).
+fn kind_label(kind: VariableKind) -> &'static str {
+    match kind {
+        VariableKind::Config => "config",
+        VariableKind::Secret => "secret",
+        VariableKind::Brokered => "brokered",
+        VariableKind::Dynamic => "dynamic",
+    }
 }
 
 /// `"yes"` / `"no"` helper for boolean columns.

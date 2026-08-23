@@ -8,6 +8,8 @@
 //! <root>/.vaultx/audit/            local append-only audit log directory
 //! <root>/.vaultx/policies/         human-editable policy YAML documents
 //! <root>/.vaultx/agents/<name>.json  agent identity files
+//! <root>/.vaultx/keys/             wrapped project vault keys
+//! <root>/.vaultx/secrets/          encrypted secret revision records
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -22,7 +24,6 @@ pub(crate) const POLICIES_DIR_NAME: &str = "policies";
 pub(crate) const AUDIT_DIR_NAME: &str = "audit";
 /// File name of the local JSONL audit store inside the audit directory.
 pub(crate) const AUDIT_STORE_FILE: &str = "events.jsonl";
-
 /// An opened vaultx project: the working-directory anchor every service
 /// operates against.
 ///
@@ -38,6 +39,10 @@ pub struct ProjectContext {
     /// [`crate::history`] for the dev-mode key-management contract.
     pub(crate) device_pair_slot:
         std::sync::Mutex<Option<std::sync::Arc<vaultx_crypto::signature::SigningKeyPair>>>,
+    /// Lazily-initialized per-process project vault keys (project key +
+    /// fingerprint key); see [`crate::secrets`] for the loading contract.
+    pub(crate) project_key_slot:
+        std::sync::Mutex<Option<std::sync::Arc<crate::secrets::ProjectKeys>>>,
 }
 
 impl ProjectContext {
@@ -60,6 +65,7 @@ impl ProjectContext {
             root: root.to_path_buf(),
             repository,
             device_pair_slot: std::sync::Mutex::new(None),
+            project_key_slot: std::sync::Mutex::new(None),
         };
         ctx.ensure_service_dirs()?;
         Ok(ctx)
@@ -83,6 +89,7 @@ impl ProjectContext {
             root: root.to_path_buf(),
             repository,
             device_pair_slot: std::sync::Mutex::new(None),
+            project_key_slot: std::sync::Mutex::new(None),
         };
         // Self-healing for projects created before the service directories
         // existed; missing directories are recreated rather than fatal.
@@ -93,6 +100,8 @@ impl ProjectContext {
     fn ensure_service_dirs(&self) -> CoreResult<()> {
         std::fs::create_dir_all(self.vault_dir().join(POLICIES_DIR_NAME))?;
         std::fs::create_dir_all(self.vault_dir().join(AUDIT_DIR_NAME))?;
+        std::fs::create_dir_all(self.vault_dir().join(crate::secrets::KEYS_DIR_NAME))?;
+        std::fs::create_dir_all(self.vault_dir().join(crate::secrets::SECRETS_DIR_NAME))?;
         Ok(())
     }
 

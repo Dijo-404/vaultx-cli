@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+rpassword = { workspace = true }
 thiserror = { workspace = true }
 vaultx-core = { path = "../vaultx-core" }
 vaultx-types = { path = "../vaultx-types" }

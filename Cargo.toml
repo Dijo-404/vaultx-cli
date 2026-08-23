@@ -58,3 +58,5 @@ subtle = "2"
 zeroize = "1"
 # Used by `vaultx-broker` for HTTP Basic credential injection.
 base64 = "0.22"
+# Used by `vaultx-cli` only for no-echo secret-value prompts.
+rpassword = "7"

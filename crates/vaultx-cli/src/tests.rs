@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use vaultx_core::CoreError;
 use vaultx_types::CommitId;
 
-use crate::{dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, PolicyCommand, StubArgs};
+use crate::{
+    dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, PolicyCommand, SecretCommand,
+    StubArgs,
+};
 
 /// Builds a `Cli` pointing at `project` with the given command.
 fn cli(project: &Path, command: Command) -> Cli {
@@ -354,12 +357,6 @@ fn unsupported_groups_return_not_implemented_with_exit_two() {
     let dir = tempfile::tempdir().unwrap();
     let stubs = [
         ("doctor", Command::Doctor(StubArgs { args: Vec::new() })),
-        (
-            "secret",
-            Command::Secret(StubArgs {
-                args: vec!["set".into(), "FOO=bar".into()],
-            }),
-        ),
         ("merge", Command::Merge(StubArgs { args: Vec::new() })),
         ("rollback", Command::Rollback(StubArgs { args: Vec::new() })),
         (
@@ -666,4 +663,166 @@ fn commit_ok(root: &Path, message: &str, author: Option<&str>) -> CommitId {
     .unwrap_or_else(|err| panic!("commit `{message}` failed: {err}"));
     let id = out.strip_prefix("committed ").expect("commit prints id");
     vaultx_types::CommitId::parse(id).unwrap()
+}
+
+#[test]
+fn secret_destroy_requires_explicit_yes_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    let err = dispatch(&cli(
+        root,
+        Command::Secret {
+            command: SecretCommand::Destroy {
+                name: "FOO".into(),
+                yes: false,
+                env: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("--yes")),
+        "got: {err:?}"
+    );
+    // Usage-class failure, not the exit-2 "planned" bucket.
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn secret_set_rejects_inconsistent_broker_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    // --brokered without --injection is a usage error before any prompt.
+    let err = dispatch(&cli(
+        root,
+        Command::Secret {
+            command: SecretCommand::Set {
+                name: "TOKEN".into(),
+                stdin: Some("-".into()),
+                brokered: true,
+                injection: None,
+                provider: None,
+                env: None,
+                message: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("--brokered requires --injection"))
+    );
+
+    // --provider without --brokered is refused too.
+    let err = dispatch(&cli(
+        root,
+        Command::Secret {
+            command: SecretCommand::Set {
+                name: "PLAIN".into(),
+                stdin: Some("-".into()),
+                brokered: false,
+                injection: None,
+                provider: Some("github".into()),
+                env: None,
+                message: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(matches!(&err, CliError::Usage(text) if text.contains("require --brokered")));
+}
+
+#[test]
+fn secret_positional_must_be_the_stdin_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    let err = dispatch(&cli(
+        root,
+        Command::Secret {
+            command: SecretCommand::Set {
+                name: "FOO".into(),
+                // Plaintext arguments are never accepted.
+                stdin: Some("hunter2".into()),
+                brokered: false,
+                injection: None,
+                provider: None,
+                env: None,
+                message: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("only `-`")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn secret_metadata_unknown_name_is_a_runtime_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    match dispatch(&cli(
+        root,
+        Command::Secret {
+            command: SecretCommand::Metadata {
+                name: "MISSING".into(),
+                env: None,
+            },
+        },
+    )) {
+        Err(CliError::Runtime(CoreError::SecretNotFound(name))) => assert_eq!(name, "MISSING"),
+        other => panic!("expected SecretNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn secret_metadata_never_shows_a_value_for_existing_secrets() {
+    // Drives set via the service layer (stdin is a process concern; the
+    // end-to-end stdin path is covered by tests/secret_cli.rs).
+    use vaultx_core::{BrokeredBinding, SecretString, VaultxServices};
+    use vaultx_types::model::{InjectionTemplateId, VariableKind};
+    use vaultx_types::CredentialRef;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let services = VaultxServices::init(root).expect("init");
+    services
+        .secrets()
+        .set_secret(
+            "GITHUB_TOKEN",
+            &SecretString::copy_from("canary-hunter2"),
+            VariableKind::Brokered,
+            "development",
+            Some(BrokeredBinding {
+                credential_ref: CredentialRef::parse("github-token").unwrap(),
+                injection: InjectionTemplateId::GithubBearer,
+                provider_hint: Some(vaultx_types::ProviderName::parse("github").unwrap()),
+            }),
+        )
+        .expect("set");
+
+    let out = dispatch(&cli(
+        root,
+        Command::Secret {
+            command: SecretCommand::Metadata {
+                name: "GITHUB_TOKEN".into(),
+                env: None,
+            },
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("state:       active"), "{out}");
+    assert!(out.contains("kind:        brokered"), "{out}");
+    assert!(out.contains("github-token@github-bearer (github)"), "{out}");
+    assert!(out.contains("revisions:   1"), "{out}");
+    assert!(out.contains("fingerprint:"), "{out}");
+    assert!(!out.contains("canary-hunter2"), "plaintext leaked:\n{out}");
 }
