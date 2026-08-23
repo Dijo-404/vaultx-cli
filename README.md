@@ -155,38 +155,33 @@ vaultx
 Running `vaultx` without a subcommand opens the terminal UI.
 
 ```text
-┌─ vaultx-cli ─ acme/backend ───────────── development ─ main ─ * clean ┐
-│                                                                       │
-├─ Environments ─────┬─ Variables ──────────────────┬─ History ─────────┤
-│                    │                               │                    │
-│ > development      │ NAME                 TYPE     │ * 71ad92f          │
-│   staging          │───────────────────────────────│   rotate db secret │
-│   production !     │ API_URL              config   │                    │
-│                    │ DATABASE_URL         secret * │ * f32ac11          │
-│ Branches           │ GITHUB_TOKEN       brokered + │   agent policy     │
-│                    │ OPENAI_API_KEY     brokered + │                    │
-│ > main             │ LOG_LEVEL            config   │ * 991ab02          │
-│   feature/auth     │                               │   initial config   │
-├────────────────────┴───────────────────────┴────────────────────────────┤
-│ Selected: GITHUB_TOKEN                                                  │
-│                                                                         │
-│ Type          Brokered credential                                       │
-│ Value         NEVER EXPOSED                                             │
-│ Credential    github-work-token                                         │
-│ Environment   development                                               │
-├─ Agent Policy ───────────────────────────────────────────────────────────┤
-│ coding-agent                                                            │
-│ + api.github.com  GET  /repos/acme/backend/*                            │
-│ + api.github.com  POST /repos/acme/backend/pulls                        │
-│ - api.github.com  DELETE *                                              │
-│ - secrets.read                                                           │
-├──────────────────────────────────────────────────────────────────────────┤
-│ 1 Env  2 Vars  3 History  4 Agents  5 Audit │ a Add │ c Commit │ ? Help │
-└──────────────────────────────────────────────────────────────────────────┘
+┌─ vaultx · acme/backend ───────────────────── development · main · clean ┐
+│ Environments       │ Variables                    │ History             │
+│                    │                              │                     │
+│ › development      │ NAME            TYPE         │ * 71ad92f           │
+│   staging          │                              │   rotate db secret  │
+│   production !     │ API_URL         config       │ * f32ac11           │
+│                    │ DATABASE_URL    secret *     │   agent policy      │
+│ Branches           │ GITHUB_TOKEN    brokered +   │ * 991ab02           │
+│ › main             │ OPENAI_API_KEY  brokered +   │   initial config    │
+│   feature/auth     │ LOG_LEVEL       config       │                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│ GITHUB_TOKEN                                                            │
+│ type         brokered credential                                        │
+│ value        never exposed                                              │
+│ credential   github-work-token                                          │
+│ environment  development                                                │
+├─ Agent Policy · coding-agent ───────────────────────────────────────────┤
+│ + api.github.com   GET   /repos/acme/backend/*                          │
+│ + api.github.com   POST  /repos/acme/backend/pulls                      │
+│ - api.github.com   DELETE *                                             │
+│ - secrets.read                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 1 Env  2 Vars  3 History  4 Agents  5 Audit     a Add  c Commit  ? Help │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Markers in the mockup: `*` commit/change indicator, `+` brokered credential,
-`!` protected environment, `+`/`-` allowed/denied agent policy rule.
+Markers in the mockup: `›` selection, `*` change/latest-commit indicator, `+` brokered credential, `!` protected environment, `+`/`-` allowed/denied agent policy rule.
 
 ### Navigation
 
