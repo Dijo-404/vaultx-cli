@@ -56,23 +56,19 @@ Prompt instructions such as "never print environment variables" are not a securi
 
 `vaultx-cli` changes that model:
 
-```text
-Agent
-  │
-  │ session capability
-  ▼
-vaultx-cli broker
-  │
-  ├─ authenticate caller
-  ├─ authorize destination + operation
-  ├─ load encrypted credential
-  ├─ inject credential into outbound request
-  ├─ execute request
-  ├─ sanitize response
-  └─ write audit event
-  │
-  ▼
-External API
+```mermaid
+flowchart TD
+    A["Agent"] -- "session capability" --> B["vaultx-cli broker"]
+    B --> C["authenticate caller"]
+    C --> D["authorize destination + operation"]
+    D --> E["load encrypted credential"]
+    E --> F["inject credential into outbound request"]
+    F --> G["execute request"]
+    G --> H["sanitize response"]
+    H --> I["write audit event"]
+    I --> J["External API"]
+
+    style A fill:#f9f,stroke:#333
 ```
 
 The agent receives the result of the approved request, not the upstream secret.
@@ -114,21 +110,14 @@ This means `vaultx-cli` does **not** require a custom Rust adapter for every API
 
 Example:
 
-```text
-github.pull_request.create
-            │
-            ▼
-Policy Pack
-            │
-            ▼
-Host: api.github.com
-Method: POST
-Path: /repos/{owner}/{repo}/pulls
-Credential: github-work-token
-Body schema: GitHubCreatePullRequest
-            │
-            ▼
-Generic Broker
+```mermaid
+flowchart LR
+    A["github.pull_request.create"] --> B["Policy Pack"]
+    B --> C["Host: api.github.com<br/>Method: POST<br/>Path: /repos/{owner}/{repo}/pulls<br/>Credential: github-work-token<br/>Body schema: GitHubCreatePullRequest"]
+    C --> D["Generic Broker"]
+
+    style A fill:#bbf,stroke:#333
+    style D fill:#bfb,stroke:#333
 ```
 
 Semantic packs improve ergonomics. The generic broker remains the security primitive.
@@ -166,19 +155,19 @@ vaultx
 Running `vaultx` without a subcommand opens the terminal UI.
 
 ```text
-┌─ vaultx-cli ─ acme/backend ───────────── development ─ main ─ ● clean ┐
+┌─ vaultx-cli ─ acme/backend ───────────── development ─ main ─ * clean ┐
 │                                                                       │
 ├─ Environments ─────┬─ Variables ──────────────────┬─ History ─────────┤
 │                    │                               │                    │
-│ > development      │ NAME                 TYPE     │ ● 71ad92f          │
+│ > development      │ NAME                 TYPE     │ * 71ad92f          │
 │   staging          │───────────────────────────────│   rotate db secret │
-│   production 🔒    │ API_URL              config   │                    │
-│                    │ DATABASE_URL         secret ● │ ● f32ac11          │
-│ Branches           │ GITHUB_TOKEN       brokered ◆ │   agent policy     │
-│                    │ OPENAI_API_KEY     brokered ◆ │                    │
-│ > main             │ LOG_LEVEL            config   │ ● 991ab02          │
+│   production !     │ API_URL              config   │                    │
+│                    │ DATABASE_URL         secret * │ * f32ac11          │
+│ Branches           │ GITHUB_TOKEN       brokered + │   agent policy     │
+│                    │ OPENAI_API_KEY     brokered + │                    │
+│ > main             │ LOG_LEVEL            config   │ * 991ab02          │
 │   feature/auth     │                               │   initial config   │
-├────────────────────┴───────────────────────────────┴────────────────────┤
+├────────────────────┴───────────────────────┴────────────────────────────┤
 │ Selected: GITHUB_TOKEN                                                  │
 │                                                                         │
 │ Type          Brokered credential                                       │
@@ -187,14 +176,17 @@ Running `vaultx` without a subcommand opens the terminal UI.
 │ Environment   development                                               │
 ├─ Agent Policy ───────────────────────────────────────────────────────────┤
 │ coding-agent                                                            │
-│ ✓ api.github.com  GET  /repos/acme/backend/*                            │
-│ ✓ api.github.com  POST /repos/acme/backend/pulls                        │
-│ ✕ api.github.com  DELETE *                                              │
-│ ✕ secrets.read                                                           │
+│ + api.github.com  GET  /repos/acme/backend/*                            │
+│ + api.github.com  POST /repos/acme/backend/pulls                        │
+│ - api.github.com  DELETE *                                              │
+│ - secrets.read                                                           │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ 1 Env  2 Vars  3 History  4 Agents  5 Audit │ a Add │ c Commit │ ? Help │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+Markers in the mockup: `*` commit/change indicator, `+` brokered credential,
+`!` protected environment, `+`/`-` allowed/denied agent policy rule.
 
 ### Navigation
 
@@ -446,52 +438,19 @@ Examples include dynamically created cloud/database credentials or provider-issu
 
 # Architecture
 
-```text
-                           ┌──────────────────────────┐
-                           │       vaultx-cli         │
-                           │      CLI + Ratatui       │
-                           └────────────┬─────────────┘
-                                        │
-                           ┌────────────▼─────────────┐
-                           │   Application Services   │
-                           │ config / history / auth  │
-                           └───────┬────────┬─────────┘
-                                   │        │
-                     ┌─────────────┘        └──────────────┐
-                     ▼                                     ▼
-          ┌────────────────────┐                ┌─────────────────────┐
-          │ Repository Engine  │                │ Policy Engine       │
-          │ objects / commits  │                │ principal/action/   │
-          │ refs / diff / merge│                │ resource/context    │
-          └─────────┬──────────┘                └─────────┬───────────┘
-                    │                                     │
-                    ▼                                     │
-          ┌────────────────────┐                           │
-          │ Encrypted Vault    │                           │
-          │ SQLite + objects   │                           │
-          │ OS key store / KMS │                           │
-          └─────────┬──────────┘                           │
-                    │                                      │
-                    └────────────────┬─────────────────────┘
-                                     ▼
-                           ┌─────────────────────┐
-                           │ Credential Broker   │
-                           │ generic HTTP engine │
-                           │ credential injector │
-                           │ response sanitizer  │
-                           └──────────┬──────────┘
-                                      │
-                                      ▼
-                           ┌─────────────────────┐
-                           │ External Providers  │
-                           │ GitHub/OpenAI/AWS…  │
-                           └─────────────────────┘
+```mermaid
+flowchart TB
+    CLI["vaultx-cli<br/>CLI + Ratatui"] --> SVC["Application Services<br/>config / history / auth"]
+    SVC --> REPO["Repository Engine<br/>objects / commits<br/>refs / diff / merge"]
+    SVC --> POLICY["Policy Engine<br/>principal/action/<br/>resource/context"]
+    REPO --> VAULT["Encrypted Vault<br/>SQLite + objects<br/>OS key store / KMS"]
+    VAULT --> BROKER["Credential Broker<br/>generic HTTP engine<br/>credential injector<br/>response sanitizer"]
+    POLICY --> BROKER
+    BROKER --> EXT["External Providers<br/>GitHub/OpenAI/AWS..."]
+    CP["Team Sync / Control Plane<br/>Postgres + encrypted object sync<br/>identities / refs / policy metadata"]
 
-                 ┌─────────────────────────────────────┐
-                 │ Team Sync / Control Plane           │
-                 │ Postgres + encrypted object sync    │
-                 │ identities / refs / policy metadata │
-                 └─────────────────────────────────────┘
+    style CLI fill:#eef,stroke:#333
+    style BROKER fill:#fee,stroke:#333
 ```
 
 ---
@@ -569,44 +528,22 @@ A semantic capability therefore cannot bypass low-level host/path/method checks.
 
 ## Request pipeline
 
-```text
-Agent/MCP/CLI
-     │
-     ▼
-Parse structured request
-     │
-     ▼
-Authenticate session
-     │
-     ▼
-Canonicalize URL
-     │
-     ▼
-Resolve DNS + enforce network policy
-     │
-     ▼
-Evaluate authorization policy
-     │
-     ▼
-Resolve credential reference
-     │
-     ▼
-Decrypt in broker memory
-     │
-     ▼
-Inject auth material
-     │
-     ▼
-Execute outbound request
-     │
-     ▼
-Sanitize/redact response
-     │
-     ▼
-Write audit record
-     │
-     ▼
-Return safe response
+```mermaid
+flowchart TD
+    A["Agent/MCP/CLI"] --> B["Parse structured request"]
+    B --> C["Authenticate session"]
+    C --> D["Canonicalize URL"]
+    D --> E["Resolve DNS + enforce network policy"]
+    E --> F["Evaluate authorization policy"]
+    F --> G["Resolve credential reference"]
+    G --> H["Decrypt in broker memory"]
+    H --> I["Inject auth material"]
+    I --> J["Execute outbound request"]
+    J --> K["Sanitize/redact response"]
+    K --> L["Write audit record"]
+    L --> M["Return safe response"]
+
+    style M fill:#bfb,stroke:#333
 ```
 
 ## Credential injection templates
@@ -843,17 +780,13 @@ Each encrypted secret revision uses a unique nonce and authenticated metadata.
 
 ## Envelope hierarchy
 
-```text
-Root wrapping key
-      │
-      ▼
-Project key
-      │
-      ▼
-Secret revision data key
-      │
-      ▼
-AES-GCM ciphertext
+```mermaid
+flowchart TD
+    A["Root wrapping key"] --> B["Project key"]
+    B --> C["Secret revision data key"]
+    C --> D["AES-GCM ciphertext"]
+
+    style A fill:#fee,stroke:#333
 ```
 
 Local root material is stored through the native OS secure credential facility where available.
@@ -945,16 +878,16 @@ Rules:
 
 The team service synchronizes project state while keeping cryptographic boundaries explicit.
 
-```text
-Developer A ─┐
-             │
-Developer B ─┼── encrypted object sync ── Control Plane ── encrypted objects
-             │                               │
-CI Identity ─┘                               ├─ workspace membership
-                                             ├─ refs
-                                             ├─ policy metadata
-                                             ├─ audit ingestion
-                                             └─ device/public keys
+```mermaid
+flowchart LR
+    A["Developer A"] --> S["encrypted object sync"]
+    B["Developer B"] --> S
+    C["CI Identity"] --> S
+    S --> CP["Control Plane"]
+    CP --> O["encrypted objects"]
+    CP --> M["workspace membership<br/>refs<br/>policy metadata<br/>audit ingestion<br/>device/public keys"]
+
+    style CP fill:#ffe,stroke:#333
 ```
 
 Server responsibilities:
@@ -1283,17 +1216,13 @@ The implementation must preserve all of the following:
 
 The npm package is a launcher/distribution package, not the security implementation.
 
-```text
-npm install -g vaultx-cli
-           │
-           ▼
-platform detection
-           │
-           ▼
-verified native binary
-           │
-           ▼
-vaultx
+```mermaid
+flowchart LR
+    A["npm install -g vaultx-cli"] --> B["platform detection"]
+    B --> C["verified native binary"]
+    C --> D["vaultx executable"]
+
+    style D fill:#bfb,stroke:#333
 ```
 
 Platform artifacts should be checksummed and signed. The installer verifies the artifact metadata it consumes.
