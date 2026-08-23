@@ -26,9 +26,10 @@ pub(crate) const AUDIT_STORE_FILE: &str = "events.jsonl";
 /// An opened vaultx project: the working-directory anchor every service
 /// operates against.
 ///
-/// The context owns the [`Repository`] facade and exposes the derived
-/// paths (`policies_dir`, audit store). Services are constructed against
-/// `&ProjectContext`; see [`crate::VaultxServices`] for the facade.
+/// The context owns the [`Repository`](vaultx_repository::Repository)
+/// facade and exposes the derived paths (`policies_dir`, audit store).
+/// Services are constructed against `&ProjectContext`; see
+/// [`crate::VaultxServices`] for the facade.
 #[derive(Debug)]
 pub struct ProjectContext {
     root: PathBuf,

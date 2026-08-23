@@ -348,6 +348,14 @@ impl BrokerEngine {
         let mut metadata = SafeAuditMetadata::default();
         let _ = metadata.try_insert("http.method", method);
         let _ = metadata.try_insert("stage.reason", reason);
+        // Attribute the deciding policy when the authorization stage
+        // identified one. "policy" passes the metadata key rules (it is
+        // neither sensitive nor malformed); a foreign policy name that
+        // somehow fails validation is dropped rather than failing the
+        // audit write of an already-made decision.
+        if let Some(name) = &policy {
+            let _ = metadata.try_insert("policy", name);
+        }
         let event = NewAuditEvent {
             correlation_id: correlation_id.clone(),
             actor,
@@ -499,8 +507,12 @@ impl BrokerEngine {
                 );
             }
         };
-        let actor = Principal::parse(&format!("session:{}", record.session_id))
-            .expect("session principals always parse");
+        // Authorization identity is the *agent* principal carried by the
+        // validated session record, not the session id: policies are
+        // authored against agent identities (plan §23) and the session
+        // proves possession of the agent's identity.
+        let actor = Principal::parse(&format!("agent:{}", record.agent))
+            .expect("agent principals always parse");
         let environment = record.environment;
 
         // Stage 3 — canonicalization (scheme/host/port/path normalization;
@@ -547,23 +559,24 @@ impl BrokerEngine {
         // Stage 5 — authorization against the canonical request plus
         // policy context (capability_hint deliberately absent).
         let authz = self.authorization_request(&req, &actor, &canonical, Some(environment.clone()));
-        match self.authorizer.authorize(&authz) {
-            AuthorizationDecision::Allow { .. } => {}
-            AuthorizationDecision::Deny { reason, policy } => {
-                return self.deny(
-                    request_id,
-                    &correlation_id,
-                    actor,
-                    Some(environment),
-                    Some(req.credential),
-                    destination,
-                    capability,
-                    req.method.as_str(),
-                    &reason.to_string(),
-                    policy.map(|name| name.to_string()),
-                );
-            }
-        }
+        let allowed_policy: Option<vaultx_types::PolicyName> =
+            match self.authorizer.authorize(&authz) {
+                AuthorizationDecision::Allow { policy } => Some(policy),
+                AuthorizationDecision::Deny { reason, policy } => {
+                    return self.deny(
+                        request_id,
+                        &correlation_id,
+                        actor,
+                        Some(environment),
+                        Some(req.credential),
+                        destination,
+                        capability,
+                        req.method.as_str(),
+                        &reason.to_string(),
+                        policy.map(|name| name.to_string()),
+                    );
+                }
+            };
 
         // Stage 6 — resolve credential (template, metadata, plaintext).
         let (template, metadata, secret) =
@@ -668,6 +681,9 @@ impl BrokerEngine {
         let mut audit_metadata = SafeAuditMetadata::default();
         let _ = audit_metadata.try_insert("http.method", req.method.as_str());
         let _ = audit_metadata.try_insert("http.status", &executed.status.to_string());
+        if let Some(policy) = &allowed_policy {
+            let _ = audit_metadata.try_insert("policy", policy.as_str());
+        }
         let appended = self.audit.append(NewAuditEvent {
             correlation_id: correlation_id.clone(),
             actor: actor.clone(),
@@ -723,6 +739,9 @@ mod tests {
     /// A `ghp_`-shaped token that appears in an upstream response body and
     /// must be scrubbed before delivery (36+ alnum chars after the prefix).
     const RESPONSE_TOKEN: &str = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ab";
+    /// Agent identity every standard-fixture session is created for;
+    /// policies are authored against this principal (plan §23).
+    const FIXTURE_AGENT_ID: &str = "agent_coding";
 
     // -- fixtures ------------------------------------------------------------
 
@@ -874,11 +893,11 @@ mod tests {
 
         let (session_id, raw_token) = sessions
             .create(
-                &AgentId::parse("agent_coding").unwrap(),
+                &AgentId::parse(FIXTURE_AGENT_ID).unwrap(),
                 &EnvironmentId::parse("env_development").unwrap(),
             )
             .expect("session created");
-        let principal = format!("session:{session_id}");
+        let principal = format!("agent:{FIXTURE_AGENT_ID}");
         let documents = [
             ("coding-agent-github", "github-work-token"),
             ("ghost-cred-policy", "ghost-token"),
@@ -1012,10 +1031,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.decision, AuditDecision::Allow);
-        assert_eq!(
-            event.actor.as_str(),
-            &format!("session:{}", fixture.session_id)
-        );
+        assert_eq!(event.actor.as_str(), &format!("agent:{FIXTURE_AGENT_ID}"));
         let destination = event.destination.as_ref().expect("destination recorded");
         assert_eq!(destination.host(), "api.github.com");
         assert_eq!(destination.port(), 443);
@@ -1026,6 +1042,12 @@ mod tests {
                 .as_ref()
                 .map(vaultx_types::CredentialRef::as_str),
             Some("github-work-token")
+        );
+        // The deciding policy is attributed in audit metadata.
+        assert_eq!(
+            event.metadata.get("policy"),
+            Some("coding-agent-github"),
+            "allow events record the deciding policy"
         );
 
         // The audit record never contains secret material.
@@ -1107,6 +1129,11 @@ mod tests {
         let events = audit_events(&fixture);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0].decision, AuditDecision::Deny { .. }));
+        // Deny events attribute the policy that produced the denial.
+        assert_eq!(
+            events[0].metadata.get("policy"),
+            Some("coding-agent-github")
+        );
     }
 
     #[test]
@@ -1119,6 +1146,11 @@ mod tests {
         let (reason, policy) = deny_reason(&response);
         assert_eq!(reason, "explicit_deny");
         assert_eq!(policy.as_deref(), Some("coding-agent-github"));
+        let events = audit_events(&fixture);
+        assert_eq!(
+            events[0].metadata.get("policy"),
+            Some("coding-agent-github")
+        );
         assert!(fixture.captured_empty(), "nothing reached transport");
     }
 
@@ -1203,7 +1235,7 @@ mod tests {
         let lax = standard_fixture(happy_transport(), true);
         let mut doc = parse_policy_yaml(&policy_yaml(
             "private-host-agent",
-            &format!("session:{}", lax.session_id),
+            &format!("agent:{FIXTURE_AGENT_ID}"),
             "github-work-token",
         ))
         .unwrap();
@@ -1212,7 +1244,7 @@ mod tests {
         engine_docs.push(
             parse_policy_yaml(&policy_yaml(
                 "coding-agent-github",
-                &format!("session:{}", lax.session_id),
+                &format!("agent:{FIXTURE_AGENT_ID}"),
                 "github-work-token",
             ))
             .unwrap(),
@@ -1420,6 +1452,71 @@ mod tests {
     }
 
     #[test]
+    fn authorization_matches_agent_principal_from_validated_session() {
+        // F-1: the engine authorizes as `agent:<record.agent>` — a policy
+        // written against that agent principal must allow, and one written
+        // for a different agent must default-deny.
+        let build = |policy_principal: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let audit = Arc::new(JsonlAppendStore::open(dir.path().join("audit.jsonl")));
+            let sessions = Arc::new(InMemorySessionStore::new());
+            let credentials = InMemoryCredentialSource::new();
+            credentials.insert(
+                CredentialRef::parse("github-work-token").unwrap(),
+                SecretBytes::from_bytes(SECRET_CANARY.as_bytes()),
+                InjectionTemplateId::GithubBearer,
+                CredentialMetadata::default(),
+            );
+            let (_, raw_token) = sessions
+                .create(
+                    &AgentId::parse("agent_test_agent").unwrap(),
+                    &EnvironmentId::parse("env_development").unwrap(),
+                )
+                .unwrap();
+            let document = parse_policy_yaml(&policy_yaml(
+                "agent-policy",
+                policy_principal,
+                "github-work-token",
+            ))
+            .unwrap();
+            let transport = happy_transport();
+            let engine = BrokerEngine::new(BrokerDependencies {
+                authorizer: Arc::new(RuleEngine::from_documents([document]).unwrap()),
+                sessions,
+                credentials: Arc::new(credentials),
+                injectors: Arc::new(InjectorRegistry::new()),
+                transport: Arc::new(transport.clone()),
+                audit,
+                project: ProjectId::parse("proj_core").unwrap(),
+                egress_allow_private: false,
+            });
+            (engine, raw_token, dir)
+        };
+
+        let request_for = |raw_token: &str| BrokerRequest {
+            protocol: PROTOCOL_VERSION,
+            session_token: raw_token.to_owned(),
+            credential: CredentialRef::parse("github-work-token").unwrap(),
+            method: HttpMethod::GET,
+            url: "https://api.github.com/repos/acme/backend/issues".to_owned(),
+            headers: Vec::new(),
+            body: BrokerBody::None,
+            capability_hint: None,
+        };
+
+        // Matching principal: allowed end-to-end.
+        let (engine, token, _dir) = build("agent:agent_test_agent");
+        let response = engine.execute_broker_request(request_for(&token));
+        assert_eq!(response.decision, Decision::Allow);
+
+        // Mismatched principal: silently default-denied by policy.
+        let (engine, token, _dir) = build("agent:mismatch");
+        let response = engine.execute_broker_request(request_for(&token));
+        let (reason, _) = deny_reason(&response);
+        assert_eq!(reason, "no_matching_policy");
+    }
+
+    #[test]
     fn unauthenticated_actor_falls_back_without_echoing_tokens() {
         // A syntactically session-shaped token gets used as the actor id
         // (it is an identifier); arbitrary garbage falls back to the
@@ -1621,7 +1718,7 @@ mod tests {
             InjectionTemplateId::GithubBearer,
             CredentialMetadata::default(),
         );
-        let (session_id, raw_token) = sessions
+        let (_, raw_token) = sessions
             .create(
                 &AgentId::parse("agent_coding").unwrap(),
                 &EnvironmentId::parse("env_development").unwrap(),
@@ -1629,7 +1726,7 @@ mod tests {
             .unwrap();
         let document = parse_policy_yaml(&policy_yaml(
             "coding-agent-github",
-            &format!("session:{session_id}"),
+            &format!("agent:{FIXTURE_AGENT_ID}"),
             "github-work-token",
         ))
         .unwrap();
@@ -1689,7 +1786,7 @@ mod tests {
             InjectionTemplateId::GithubBearer,
             CredentialMetadata::default(),
         );
-        let (session_id, raw_token) = sessions
+        let (_, raw_token) = sessions
             .create(
                 &AgentId::parse("agent_coding").unwrap(),
                 &EnvironmentId::parse("env_development").unwrap(),
@@ -1697,7 +1794,7 @@ mod tests {
             .unwrap();
         let document = parse_policy_yaml(&policy_yaml(
             "coding-agent-github",
-            &format!("session:{session_id}"),
+            &format!("agent:{FIXTURE_AGENT_ID}"),
             "github-work-token",
         ))
         .unwrap();

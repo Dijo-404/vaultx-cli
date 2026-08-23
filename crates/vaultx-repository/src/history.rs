@@ -30,7 +30,8 @@ impl<'a> History<'a> {
 
     /// Loads and decodes the commit identified by `id`.
     ///
-    /// Because [`CommitId`] and the backing object's [`ObjectId`] share one
+    /// Because [`CommitId`] and the backing object's
+    /// [`ObjectId`](vaultx_types::ObjectId) share one
     /// digest (see `commit` module docs), resolution needs no indirection.
     ///
     /// # Errors

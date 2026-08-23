@@ -1,10 +1,10 @@
 //! Clap command surface for the `vaultx` binary (plan §14).
 //!
-//! - [`cli`]: the derive structs ([`Cli`], [`Command`]), the CLI error
+//! - `cli`: the derive structs ([`Cli`], [`Command`]), the CLI error
 //!   type ([`CliError`]) with its exit-code contract, and [`dispatch`],
 //!   which executes an already-parsed invocation against the
 //!   application services in `vaultx-core`.
-//! - [`output`]: presentation helpers rendering service results as
+//! - `output`: presentation helpers rendering service results as
 //!   aligned, secret-free text.
 //!
 //! Handlers contain parsing and presentation logic only (INV-016):

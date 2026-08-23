@@ -126,8 +126,9 @@ impl<'a> EnvironmentService<'a> {
     /// # Errors
     /// * Unknown sources surface as ref-not-found repository errors.
     /// * [`CoreError::EnvironmentNotFound`] for unknown targets.
-    /// * [`CoreError::Repo::ProtectedRef`] when the target is protected
-    ///   and `force` is false.
+    /// * [`CoreError::Repo`] wrapping
+    ///   [`vaultx_repository::RepoError::ProtectedRef`] when the target is
+    ///   protected and `force` is false.
     /// * Propagates ref-write and audit-store failures.
     pub fn promote(&self, from_ref: &str, to_env: &str, force: bool) -> CoreResult<()> {
         let refs = self.ctx.repository().refs();

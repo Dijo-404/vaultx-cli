@@ -21,7 +21,7 @@
 //! [`canonical::CanonicalUrl`]. Callers parse once and pass the value
 //! onward; re-parsing raw strings after validation is forbidden because
 //! normalization drift between policy and wire form is a deny-evasion
-//! vector. See [`canonical`] for the exact rules.
+//! vector. See the `canonical` module for the exact rules.
 //!
 //! # DNS rebinding contract
 //!

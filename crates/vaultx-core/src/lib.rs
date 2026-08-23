@@ -3,22 +3,22 @@
 //! This crate wires the repository, crypto, policy, and audit layers into
 //! coherent service objects with a clean API surface:
 //!
-//! - [`error`]: [`CoreError`], the single error type every service
+//! - `error`: [`CoreError`], the single error type every service
 //!   returns (via [`CoreResult`]).
-//! - [`project`]: [`ProjectContext`] — init/open a project and reach its
+//! - `project`: [`ProjectContext`] — init/open a project and reach its
 //!   paths and underlying [`Repository`](vaultx_repository::Repository).
-//! - [`config`]: set/get/unset/list non-secret config values plus the
+//! - `config`: set/get/unset/list non-secret config values plus the
 //!   conservative `.env` import classifier.
-//! - [`staging`]: idempotent add/confirm, restore, and status reporting.
-//! - [`history`]: commits, log/show, staged and commit diffs, branch
+//! - `staging`: idempotent add/confirm, restore, and status reporting.
+//! - `history`: commits, log/show, staged and commit diffs, branch
 //!   operations, head-signature verification.
-//! - [`envs`]: environment creation, protection, promotion (with local
+//! - `envs`: environment creation, protection, promotion (with local
 //!   audit events), and listing.
-//! - [`agents`]: agent identity files — create, enable/disable, policy
+//! - `agents`: agent identity files — create, enable/disable, policy
 //!   attachment, inspection.
-//! - [`policies`]: YAML persistence, engine building, per-file validation,
+//! - `policies`: YAML persistence, engine building, per-file validation,
 //!   dry-run authorization checks.
-//! - [`services`]: [`VaultxServices`], the facade CLI/TUI construct.
+//! - `services`: [`VaultxServices`], the facade CLI/TUI construct.
 //!
 //! # Synchronous v1 (async deferred)
 //!
@@ -30,7 +30,7 @@
 //! # Deferred: secret value storage / encryption
 //!
 //! Secret *values* are never handled by this crate. Manifest entries of
-//! kind `Secret`/`Brokered` reference [`SecretRevisionId`]s that a later
+//! kind `Secret`/`Brokered` reference `SecretRevisionId`s that a later
 //! vault layer will materialize through envelope encryption. Until then:
 //!
 //! - config operations only ever write plain `ConfigValue` objects;

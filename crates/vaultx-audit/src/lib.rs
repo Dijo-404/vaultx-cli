@@ -11,11 +11,10 @@
 //!
 //! # Layout
 //!
-//! - [`event`]: [`AuditEvent`](event::AuditEvent) schema, safe summary
-//!   types, redaction-checked metadata, hash computation, id generation.
-//! - [`store`]: [`AppendStore`](store::AppendStore) /
-//!   [`RemoteIngest`](store::RemoteIngest) traits, filters, and the
-//!   [`NoopRemoteIngest`](store::NoopRemoteIngest) placeholder.
+//! - [`event`]: [`AuditEvent`] schema, safe summary types,
+//!   redaction-checked metadata, hash computation, id generation.
+//! - [`store`]: [`AppendStore`] / [`RemoteIngest`] traits, filters, and
+//!   the [`NoopRemoteIngest`] placeholder.
 //! - [`jsonl`]: append-only JSONL store implementation and export helper.
 
 pub mod error;

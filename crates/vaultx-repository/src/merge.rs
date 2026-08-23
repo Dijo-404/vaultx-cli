@@ -77,8 +77,8 @@ impl Conflict {
 /// Merges `ours` and `theirs` against their common ancestor `base`.
 ///
 /// # Errors
-/// [`Err(Vec<Conflict>)`] lists every unresolved disagreement, sorted
-/// deterministically (conflict kind first, then subject); nothing is
+/// Returns `Err(Vec<Conflict>)` listing every unresolved disagreement,
+/// sorted deterministically (conflict kind first, then subject); nothing is
 /// partially applied — callers get either a fully merged manifest or the
 /// complete conflict set.
 pub fn three_way_merge(

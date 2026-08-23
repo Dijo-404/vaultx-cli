@@ -334,7 +334,7 @@ pub struct ResponseConstraints {
 pub struct MethodPathRule {
     /// Methods the rule applies to.
     pub methods: Vec<HttpMethod>,
-    /// Path patterns the rule applies to (see [`crate::matcher`]).
+    /// Path patterns the rule applies to (see the `matcher` module).
     pub paths: Vec<String>,
 }
 

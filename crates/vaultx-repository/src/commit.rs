@@ -20,7 +20,7 @@
 //! Because the envelope's content hash **is** the commit ID's digest, the
 //! two identifiers are bijective (`obj_<hex>` ⇄ `cmt_<hex>`); refs store
 //! `CommitId`s and resolve directly to object-store entries without an
-//! indirection table. See [`commit_object_id`] / [`commit_id`].
+//! indirection table. See [`commit_object_id`] / [`Commit::commit_id`].
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
