@@ -1,0 +1,18 @@
+# Creates model responses against the OpenAI API.
+format: 1
+name: openai.responses.create
+provider: openai
+request:
+  hosts: [api.openai.com]
+  methods: [POST]
+  paths:
+    - "/v1/responses"
+credential:
+  credential_ref: openai-platform-key
+  injection: bearer
+constraints:
+  max_body_bytes: 131072
+  content_types: [application/json]
+response:
+  max_body_bytes: 524288
+  redact_headers: [set-cookie]

@@ -1,0 +1,17 @@
+# Read-only repository access: any path under /repos/{owner}/{repo}.
+format: 1
+name: github.repository.read
+provider: github
+request:
+  hosts: [api.github.com]
+  methods: [GET]
+  paths:
+    - "/repos/{owner}/{repo}/**"
+  variables:
+    owner: string
+    repo: string
+credential:
+  credential_ref: github-work-token
+  injection: github-bearer
+response:
+  max_body_bytes: 524288

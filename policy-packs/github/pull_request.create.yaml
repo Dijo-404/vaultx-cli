@@ -1,0 +1,22 @@
+# Creates pull requests against the GitHub API.
+# Placeholders are documented in `request.variables` and validated at load.
+format: 1
+name: github.pull_request.create
+provider: github
+request:
+  hosts: [api.github.com]
+  methods: [POST]
+  paths:
+    - "/repos/{owner}/{repo}/pulls"
+  variables:
+    owner: string
+    repo: string
+credential:
+  credential_ref: github-work-token
+  injection: github-bearer
+constraints:
+  max_body_bytes: 65536
+  content_types: [application/json]
+response:
+  max_body_bytes: 262144
+  redact_headers: [set-cookie]

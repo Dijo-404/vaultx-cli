@@ -990,6 +990,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "vaultx-core",
+ "vaultx-policy-packs",
  "vaultx-types",
  "zeroize",
 ]
@@ -1071,6 +1072,15 @@ dependencies = [
 [[package]]
 name = "vaultx-policy-packs"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "thiserror",
+ "vaultx-http",
+ "vaultx-policy",
+ "vaultx-types",
+]
 
 [[package]]
 name = "vaultx-repository"

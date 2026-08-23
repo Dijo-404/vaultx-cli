@@ -1,0 +1,24 @@
+# Reads one Stripe customer record.
+#
+# Note: `bearer` injects `Authorization: Bearer <secret>`, which Stripe
+# accepts for secret keys. If the credential is stored as a publishable/
+# header-style key instead, switch to:
+#   injection: api-key-header
+# and set the credential metadata `header_name: authorization`.
+format: 1
+name: stripe.customer.read
+provider: stripe
+request:
+  hosts: [api.stripe.com]
+  methods: [GET]
+  paths:
+    - "/v1/customers/{id}"
+  variables:
+    id: string
+credential:
+  credential_ref: stripe-secret-key
+  injection: bearer
+constraints:
+  max_body_bytes: 4096
+response:
+  max_body_bytes: 131072
