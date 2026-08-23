@@ -72,6 +72,10 @@ pub enum CliError {
     /// from transport/usage failures so agents can branch on it.
     #[error("denied by policy: {0}")]
     Denied(String),
+    /// A spawned child process exited nonzero under `vaultx run`.
+    /// The exit code is the child's, clamped to 1..=255.
+    #[error("child process exited with code {0}")]
+    ChildExit(i32),
     /// An underlying application service failed at runtime.
     /// Exit code 1.
     #[error(transparent)]
@@ -91,7 +95,7 @@ impl CliError {
     /// * 3 — target directory is not a vaultx repository,
     /// * 4 — brokered request denied by policy.
     #[must_use]
-    pub const fn exit_code(&self) -> i32 {
+    pub fn exit_code(&self) -> i32 {
         match self {
             Self::Runtime(_)
             | Self::Usage(_)
@@ -101,6 +105,9 @@ impl CliError {
             Self::Denied(_) => 4,
             Self::NotImplemented(_) => 2,
             Self::NotARepository(_) => 3,
+            // The child's own status, clamped so it always fits the
+            // process-exit contract (and never reports success).
+            Self::ChildExit(code) => (*code).clamp(1, 255),
         }
     }
 }
@@ -291,9 +298,25 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    // ---- planned groups (exit code 2 notices) ----
-    /// Run commands with resolved environment (planned).
-    Run(StubArgs),
+    // ---- implemented groups ----
+    /// Run a command with committed config values injected as
+    /// environment variables (secrets are never decrypted).
+    Run {
+        /// Environment whose pinned commit supplies the values (default:
+        /// development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+        /// Permit execution when the resolved variable set is empty.
+        #[arg(long)]
+        allow_empty: bool,
+        /// Command to execute and its arguments, after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
     /// Local broker process operations.
     Broker {
         #[command(subcommand)]
@@ -704,8 +727,14 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             cmd_promote(s, to, from.as_deref(), *force)
         }),
 
-        // Planned groups: reserved names, clear notices, exit code 2.
-        Command::Run(_) => Err(CliError::NotImplemented("run")),
+        // Trusted workload execution (plan §16).
+        Command::Run {
+            env,
+            allow_empty,
+            command,
+        } => with_open(&cli.project, |s| {
+            cmd_run(s, env.as_deref(), *allow_empty, command)
+        }),
         Command::Broker { command } => match command {
             BrokerCommand::Serve { socket } => {
                 let services = VaultxServices::open(&cli.project).map_err(|err| match err {
@@ -1189,6 +1218,60 @@ fn cmd_promote(
     };
     services.environments().promote(&from, to_env, force)?;
     Ok(format!("promoted {from} -> {to_env}"))
+}
+
+/// Executes `COMMAND` (plan §16) with committed config values from the
+/// environment's pinned commit injected as extra environment variables.
+///
+/// Secrets, brokered credentials, and dynamic providers are skipped
+/// entirely — they are never decrypted into a child environment. The
+/// child inherits the parent environment; its exit status becomes the
+/// dispatch outcome: zero prints nothing extra, nonzero maps onto
+/// [`CliError::ChildExit`].
+fn cmd_run(
+    services: &VaultxServices,
+    env: Option<&str>,
+    allow_empty: bool,
+    command: &[String],
+) -> Result<String, CliError> {
+    let bare = env.unwrap_or(DEFAULT_SECRET_ENV);
+    let summary = services
+        .environments()
+        .list_environments()?
+        .into_iter()
+        .find(|candidate| candidate.name == bare)
+        .ok_or_else(|| CliError::Usage(format!("unknown environment `{bare}`")))?;
+    let Some(commit) = summary.commit else {
+        return Err(CliError::Usage(format!(
+            "environment `{bare}` has no pinned commit"
+        )));
+    };
+    let values = services.history().committed_config_values(&commit)?;
+    if values.is_empty() && !allow_empty {
+        return Err(CliError::Usage(format!(
+            "environment `{bare}` resolves no config variables; pass --allow-empty to run anyway"
+        )));
+    }
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| CliError::Usage("run requires a command after `--`".into()))?;
+
+    let mut child = std::process::Command::new(program);
+    child.args(args);
+    for (name, value) in values {
+        child.env(name, value);
+    }
+    let status = child.status().map_err(|err| {
+        CliError::Runtime(CoreError::Io(std::io::Error::other(format!(
+            "cannot execute {program}: {err}"
+        ))))
+    })?;
+    match status.code() {
+        Some(0) => Ok(String::new()),
+        Some(code) => Err(CliError::ChildExit(code)),
+        // Terminated by signal: no exit code exists to forward.
+        None => Err(CliError::ChildExit(1)),
+    }
 }
 
 fn cmd_doctor(services: &VaultxServices) -> Result<String, CliError> {

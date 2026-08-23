@@ -313,6 +313,37 @@ impl<'a> HistoryService<'a> {
         })
     }
 
+    /// Decodes every plain config binding captured by `commit_id` into
+    /// `(name, value)` pairs, sorted by name.
+    ///
+    /// Secret, brokered, and dynamic entries are skipped by design: this
+    /// feeds trusted-workload execution (plan §16) and must never decrypt
+    /// or otherwise materialize non-config values.
+    ///
+    /// # Errors
+    /// * Propagates lookup/decode failures.
+    pub fn committed_config_values(
+        &self,
+        commit_id: &CommitId,
+    ) -> CoreResult<Vec<(String, String)>> {
+        let (_, manifest) = self.ctx.repository().show(commit_id)?;
+        let mut values = Vec::new();
+        for (name, entry) in &manifest.entries {
+            let ManifestEntry::Config { object } = entry else {
+                continue;
+            };
+            let envelope = self.ctx.repository().objects().get(object)?;
+            let payload: serde_json::Value = envelope.decode_payload()?;
+            if let Some(value) = payload
+                .get(crate::config::VALUE_KEY)
+                .and_then(serde_json::Value::as_str)
+            {
+                values.push((name.to_string(), value.to_owned()));
+            }
+        }
+        Ok(values)
+    }
+
     /// Metadata-only diff between the HEAD manifest and the manifest that
     /// committing the current staging index would produce.
     ///

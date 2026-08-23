@@ -356,10 +356,8 @@ fn import_file_classification_output() {
 fn unsupported_groups_return_not_implemented_with_exit_two() {
     let dir = tempfile::tempdir().unwrap();
     let stubs = [
-        ("run", Command::Run(StubArgs { args: Vec::new() })),
-        // `broker` is implemented now; its subcommands are exercised in
-        // the dedicated broker tests below.
-        ("mcp", Command::Mcp(StubArgs { args: Vec::new() })),
+        // `broker` and `mcp` are implemented now; their subcommands are
+        // exercised in the dedicated tests below.
         (
             "audit",
             Command::Audit(StubArgs {
@@ -1971,4 +1969,175 @@ fn pack_add_force_never_swaps_capabilities_on_one_path() {
     let installed =
         vaultx_policy_packs::load_pack(&root.join("policy-packs/github/call.yaml")).unwrap();
     assert_eq!(installed.name, "test.capability.call");
+}
+
+#[test]
+fn run_requires_environment_pinned_commit_and_nonempty_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    // No environments exist yet: unknown-environment usage error.
+    let err = dispatch(&cli(
+        root,
+        Command::Run {
+            env: Some("development".into()),
+            allow_empty: false,
+            command: vec!["sh".into(), "-c".into(), "exit 0".into()],
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("unknown environment `development`")),
+        "{err:?}"
+    );
+
+    // Environments pin a commit. The pin here binds ONLY a plain secret
+    // (set via the service layer; stdin is a process concern): the run
+    // resolver skips secret entries entirely, so the resolved set is empty
+    // and execution is refused without --allow-empty — and even with
+    // --allow-empty the secret must never reach the child environment.
+    {
+        use vaultx_core::{SecretString, VaultxServices};
+        use vaultx_types::model::VariableKind;
+        let services = VaultxServices::open(root).expect("open");
+        services
+            .secrets()
+            .set_secret(
+                "API_TOKEN",
+                &SecretString::copy_from("canary-hunter2"),
+                VariableKind::Secret,
+                "development",
+                None,
+            )
+            .expect("set");
+    }
+    commit_ok(root, "seed", None);
+    dispatch(&cli(
+        root,
+        Command::Env {
+            command: EnvCommand::Create {
+                name: "development".into(),
+            },
+        },
+    ))
+    .unwrap();
+    let err = dispatch(&cli(
+        root,
+        Command::Run {
+            env: None,
+            allow_empty: false,
+            command: vec!["sh".into(), "-c".into(), "exit 0".into()],
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("resolves no config variables")),
+        "{err:?}"
+    );
+
+    // --allow-empty explicitly permits running; the secret stays out.
+    let out = dispatch(&cli(
+        root,
+        Command::Run {
+            env: None,
+            allow_empty: true,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "test -z \"${API_TOKEN:-}\"".into(),
+            ],
+        },
+    ))
+    .unwrap();
+    assert_eq!(out, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_injects_committed_config_only_and_propagates_exit_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["RUN_PROBE=committed-value".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "seed config", None);
+    dispatch(&cli(
+        root,
+        Command::Env {
+            command: EnvCommand::Create {
+                name: "development".into(),
+            },
+        },
+    ))
+    .unwrap();
+
+    // Staged-but-uncommitted values must NOT leak into the child.
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["RUN_UNCOMMITTED=stage-only".into()],
+        },
+    ))
+    .unwrap();
+
+    let out = dispatch(&cli(
+        root,
+        Command::Run {
+            env: None,
+            allow_empty: false,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "test \"$RUN_PROBE\" = committed-value && test -z \"${RUN_UNCOMMITTED:-}\"".into(),
+            ],
+        },
+    ))
+    .unwrap();
+    assert_eq!(out, "", "success prints nothing extra");
+
+    // Nonzero child status propagates as ChildExit with its own code.
+    let err = dispatch(&cli(
+        root,
+        Command::Run {
+            env: None,
+            allow_empty: true,
+            command: vec!["sh".into(), "-c".into(), "exit 7".into()],
+        },
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CliError::ChildExit(7)), "{err:?}");
+    assert_eq!(err.exit_code(), 7);
+
+    let err = dispatch(&cli(
+        root,
+        Command::Run {
+            env: None,
+            allow_empty: true,
+            command: vec!["definitely-not-a-program-xyz".into()],
+        },
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CliError::Runtime(_)), "{err:?}");
+
+    // Missing command after -- is a usage error.
+    let err = dispatch(&cli(
+        root,
+        Command::Run {
+            env: None,
+            allow_empty: true,
+            command: Vec::new(),
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("command after `--`")),
+        "{err:?}"
+    );
 }

@@ -38,7 +38,7 @@ use crate::project::ProjectContext;
 
 /// JSON key holding the config value inside a `ConfigValue` object
 /// payload.
-const VALUE_KEY: &str = "value";
+pub(crate) const VALUE_KEY: &str = "value";
 
 /// Report of an `.env`-style import pass.
 ///
