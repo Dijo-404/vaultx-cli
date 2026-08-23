@@ -522,18 +522,28 @@ impl<'a> SecretService<'a> {
             .map(|record| record.state))
     }
 
-    /// Verifies that the wrapped project vault keys unwrap under the
-    /// configured root key, discarding them immediately. Intended for
-    /// diagnostics; never returns key material.
+    /// Strictly verifies that the wrapped project vault keys unwrap under
+    /// the previously persisted root wrapping key, discarding them
+    /// immediately. Intended for diagnostics; never returns key material.
     ///
-    /// Callers should confirm `.vaultx/keys/project.json` exists first:
-    /// when it does and the root key file is present this is a pure read.
+    /// Unlike the provisioning paths this is strictly read-only: the root
+    /// key is obtained through the provider's `load` (never `obtain`), so
+    /// a lost `.vaultx/root.key` fails loudly instead of being silently
+    /// recreated and masking the loss.
     ///
     /// # Errors
-    /// * [`CoreError::ProjectKey`] when the bundle is unreadable,
-    ///   unsupported, or fails to unwrap (wrong root key).
+    /// * [`CoreError::ProjectKey`] when the root wrapping key is missing
+    ///   or unusable, when `.vaultx/keys/project.json` does not exist, or
+    ///   when the stored bundle fails to unwrap.
     pub fn verify_project_keys(&self) -> CoreResult<()> {
-        self.cached_keys()?;
+        let root = self.root_store.load().map_err(|err| {
+            CoreError::ProjectKey(format!("root wrapping key unavailable: {err}"))
+        })?;
+        self.read_project_keys(&root)?.ok_or_else(|| {
+            CoreError::ProjectKey(
+                "wrapped key bundle not found at .vaultx/keys/project.json".to_owned(),
+            )
+        })?;
         Ok(())
     }
 
@@ -1700,6 +1710,31 @@ mod tests {
             }
             other => panic!("expected ProjectKey error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_project_keys_is_strictly_read_only() {
+        let fx = fixture();
+        service(&fx)
+            .set_secret("K", &secret("v"), VariableKind::Secret, "dev", None)
+            .unwrap();
+        assert!(fx.store_path.is_file());
+        std::fs::remove_file(&fx.store_path).unwrap();
+
+        match service(&fx).verify_project_keys() {
+            Err(CoreError::ProjectKey(reason)) => {
+                assert!(
+                    reason.contains("root wrapping key"),
+                    "error must name the lost root key: {reason}"
+                );
+            }
+            other => panic!("expected ProjectKey error, got {other:?}"),
+        }
+        // The read-only path must not have provisioned a fresh key.
+        assert!(
+            !fx.store_path.exists(),
+            "verify_project_keys recreated the root wrapping key"
+        );
     }
 
     #[cfg(unix)]

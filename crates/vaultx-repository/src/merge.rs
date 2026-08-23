@@ -205,9 +205,14 @@ fn merge_inner(
                 // always pick a side here.
                 if let Some(side) = strategy {
                     let chosen = if side.picks_ours() { o } else { t };
-                    if let Some(obj) = chosen.cloned() {
-                        merged.policies.insert(name.clone(), obj);
-                    }
+                    debug_assert!(
+                        chosen.is_some(),
+                        "a genuine policy disagreement implies both sides bind a document"
+                    );
+                    merged.policies.insert(
+                        name.clone(),
+                        chosen.cloned().expect("both sides bound a document"),
+                    );
                 } else {
                     conflicts.push(Conflict::PolicyConflict { name: name.clone() });
                 }
@@ -240,11 +245,15 @@ fn apply_entry_side(
 }
 
 /// Picks the most specific conflict category for an irreconcilable entry.
-/// [`Conflict::SecretConflict`] applies when both sides bind secrets, or
-/// when one side deletes an entry that was a secret at `base` (delete vs.
-/// rotate must also be resolved explicitly). Every other disagreement —
-/// config objects, brokered bindings, dynamic providers, or kind
-/// mismatches — reports as [`Conflict::ConfigConflict`].
+///
+/// Any dispute that touches a secret binding blocks under **every**
+/// strategy: when any of `base`, `ours`, or `theirs` binds a secret, the
+/// disagreement returns [`Conflict::SecretConflict`] — covering
+/// rotate-vs-rotate, modify-vs-delete, rotation vs. kind change, and
+/// fresh secret-vs-config clashes alike — so a merge strategy can never
+/// adopt or drop a secret binding silently. Every other disagreement —
+/// config objects, brokered bindings, dynamic providers, or non-secret
+/// kind mismatches — reports as [`Conflict::ConfigConflict`].
 fn classify_entry_conflict(
     name: &VariableName,
     base: Option<&ManifestEntry>,
@@ -261,10 +270,7 @@ fn classify_entry_conflict(
     let is_secret =
         |entry: Option<&ManifestEntry>| entry.is_some_and(|e| e.kind() == VariableKind::Secret);
 
-    let secret_conflict = (is_secret(ours) && is_secret(theirs))
-        || (is_secret(base) && (ours.is_none() || theirs.is_none()));
-
-    if secret_conflict {
+    if is_secret(base) || is_secret(ours) || is_secret(theirs) {
         Conflict::SecretConflict {
             name: name.clone(),
             ours_rev: secret_revision(ours),
@@ -416,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn kind_mismatch_between_sides_is_config_conflict() {
+    fn kind_change_involving_a_secret_blocks_explicitly() {
         let base = manifest_of(&[("MIXED", cfg("obj_mixed_v1"))]);
         let ours = manifest_of(&[("MIXED", sec("sec_rev_1"))]); // became secret
         let theirs = manifest_of(&[("MIXED", cfg("obj_mixed_v2"))]);
@@ -424,7 +430,51 @@ mod tests {
         let conflicts = three_way_merge(&base, &ours, &theirs).expect_err("kind mismatch");
         assert_eq!(
             conflicts,
-            vec![Conflict::ConfigConflict { name: var("MIXED") }]
+            vec![Conflict::SecretConflict {
+                name: var("MIXED"),
+                ours_rev: Some(rev("sec_rev_1")),
+                theirs_rev: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn strategy_theirs_cannot_adopt_over_a_rotated_secret() {
+        // base=secret; ours rotated; theirs replaced the binding with plain
+        // config. Picking "theirs" would silently drop the rotated secret.
+        let base = manifest_of(&[("TOKEN", sec("sec_rev_base"))]);
+        let ours = manifest_of(&[("TOKEN", sec("sec_rev_ours"))]);
+        let theirs = manifest_of(&[("TOKEN", cfg("obj_plain"))]);
+
+        let conflicts = three_way_merge_with_strategy(&base, &ours, &theirs, MergeStrategy::Theirs)
+            .expect_err("strategy must not adopt over a rotation");
+        assert_eq!(
+            conflicts,
+            vec![Conflict::SecretConflict {
+                name: var("TOKEN"),
+                ours_rev: Some(rev("sec_rev_ours")),
+                theirs_rev: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn strategy_theirs_cannot_drop_a_fresh_secret_for_config() {
+        // No base binding: ours introduced a secret, theirs introduced
+        // plain config at the same name.
+        let base = Manifest::new();
+        let ours = manifest_of(&[("TOKEN", sec("sec_rev_new"))]);
+        let theirs = manifest_of(&[("TOKEN", cfg("obj_plain"))]);
+
+        let conflicts = three_way_merge_with_strategy(&base, &ours, &theirs, MergeStrategy::Theirs)
+            .expect_err("strategy must not silently drop a secret");
+        assert_eq!(
+            conflicts,
+            vec![Conflict::SecretConflict {
+                name: var("TOKEN"),
+                ours_rev: Some(rev("sec_rev_new")),
+                theirs_rev: None,
+            }]
         );
     }
 

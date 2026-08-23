@@ -1227,7 +1227,6 @@ mod tests {
         // chains onto the previous head; old commits stay intact.
         let repo = ctx.repository();
         let (_, new_manifest) = repo.show(&report.commit_id).unwrap();
-        let (c2_commit, _) = repo.show(&c2).unwrap();
         assert_eq!(
             new_manifest,
             repo.manifest_at(&c2).unwrap(),
@@ -1237,7 +1236,6 @@ mod tests {
             repo.show(&report.commit_id).unwrap().0.parents,
             vec![c3.clone()]
         );
-        let _ = c2_commit.manifest; // object id path exercised via show()
 
         let detail = history.show(&c2).unwrap();
         assert!(detail.entries.iter().any(|e| e.name == "A"));

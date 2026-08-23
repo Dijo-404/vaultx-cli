@@ -167,8 +167,19 @@ impl<'a> DoctorService<'a> {
                 "project vault keys not provisioned yet (created on first secret write)",
             );
         }
-        // Unwrap attempt through the secret layer's own key path; keys are
-        // discarded immediately and never surfaced.
+        // Distinguish a lost root wrapping key (operator action required;
+        // must never be silently recreated) from an unwrap failure under
+        // a present-but-wrong key.
+        if !self.ctx.vault_dir().join(ROOT_KEY_FILE).is_file() {
+            return outcome(
+                "project keys",
+                CheckStatus::Fail,
+                format!(
+                    "root wrapping key missing at .vaultx/{ROOT_KEY_FILE}; \
+                     project vault keys cannot be unwrapped until it is restored"
+                ),
+            );
+        }
         match crate::secrets::SecretService::new(self.ctx).verify_project_keys() {
             Ok(()) => outcome(
                 "project keys",
@@ -406,8 +417,45 @@ mod tests {
         let outcomes = DoctorService::new(&ctx).run();
         let keys = outcomes.iter().find(|o| o.name == "project keys").unwrap();
         assert_eq!(keys.status, CheckStatus::Fail);
-        // The failure message names no secret material beyond the path.
-        assert!(!keys.detail.contains('v') || keys.detail.len() > 10);
+        // A present-but-wrong root key is a generic unwrap failure, not a
+        // missing-wrapping-key condition.
+        assert!(
+            keys.detail
+                .contains("cannot unwrap .vaultx/keys/project.json")
+                && !keys.detail.contains("root wrapping key missing"),
+            "detail should name the unwrap failure: {}",
+            keys.detail
+        );
+    }
+
+    #[test]
+    fn lost_root_wrapping_key_fails_and_is_never_recreated() {
+        let (_guard, ctx) = temp_ctx();
+        crate::secrets::SecretService::new(&ctx)
+            .set_secret(
+                "TOKEN",
+                &vaultx_crypto::secret::SecretString::copy_from("v"),
+                vaultx_types::model::VariableKind::Secret,
+                "development",
+                None,
+            )
+            .unwrap();
+        assert!(ctx.vault_dir().join(ROOT_KEY_FILE).is_file());
+        std::fs::remove_file(ctx.vault_dir().join(ROOT_KEY_FILE)).unwrap();
+
+        let outcomes = DoctorService::new(&ctx).run();
+        let keys = outcomes.iter().find(|o| o.name == "project keys").unwrap();
+        assert_eq!(keys.status, CheckStatus::Fail);
+        assert!(
+            keys.detail.contains("root wrapping key missing")
+                && keys.detail.contains(".vaultx/root.key"),
+            "detail must name the lost wrapping key: {}",
+            keys.detail
+        );
+        assert!(
+            !ctx.vault_dir().join(ROOT_KEY_FILE).exists(),
+            "doctor must never recreate a lost root wrapping key"
+        );
     }
 
     fn render_lines(outcomes: &[CheckOutcome]) -> Vec<String> {

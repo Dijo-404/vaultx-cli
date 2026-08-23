@@ -255,7 +255,8 @@ pub enum Command {
     /// Roll back to a historical state by appending a new commit
     /// (history is never rewritten).
     Rollback {
-        /// Commit id prefix to restore (default: HEAD's first parent).
+        /// Commit id prefix to restore, resolved against the current
+        /// branch's first-parent log (default: HEAD's first parent).
         #[arg(long, value_name = "COMMIT")]
         to: Option<String>,
     },
@@ -679,7 +680,7 @@ fn cmd_commit(
     let Some(message) = message else {
         return Err(CliError::Usage("commit requires -m <message>".into()));
     };
-    let author = author.unwrap_or("unknown");
+    let author = author.unwrap_or(DEFAULT_AUTHOR);
     let id = services.history().commit(message, author)?;
     Ok(format!("committed {id}"))
 }

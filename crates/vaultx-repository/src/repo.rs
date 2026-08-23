@@ -415,8 +415,19 @@ impl Repository {
     /// topologies; criss-cross merges may pick any valid base. `None`
     /// when the two histories share no commits.
     ///
+    /// # Error tolerance (asymmetric by design)
+    ///
+    /// The walk over `a`'s ancestry is **strict**: every visited commit
+    /// must resolve in this store, and lookup/corruption failures
+    /// propagate as [`RepoError`]. The walk from `b` is **tolerant**:
+    /// commits that do not resolve here (disjoint roots, foreign stores)
+    /// are treated as leaves, so "no common ancestor" stays representable
+    /// as `Ok(None)` instead of surfacing as
+    /// [`RepoError::ObjectNotFound`].
+    ///
     /// # Errors
-    /// Propagates lookup/decode failures for visited commits.
+    /// Propagates lookup/decode failures for commits visited on the `a`
+    /// side and for resolvable commits visited on the `b` side.
     pub fn merge_base(&self, a: &CommitId, b: &CommitId) -> Result<Option<CommitId>, RepoError> {
         let history = History::new(&self.store);
         let mut ancestors_of_a = std::collections::BTreeSet::new();
@@ -459,6 +470,15 @@ impl Repository {
     /// validates the merge itself — callers must have resolved conflicts
     /// beforehand. The target branch ref advances; when HEAD symbolically
     /// points at the same branch its working state follows automatically.
+    ///
+    /// # Concurrency (TOCTOU)
+    ///
+    /// The target tip is read and the ref written without any
+    /// compare-and-swap guard: this relies on the crate-wide
+    /// single-process single-writer assumption. A concurrent writer
+    /// advancing the same branch between the tip read above and the final
+    /// ref write would have its tip silently overwritten (its commit
+    /// objects remain intact in the content-addressed store).
     ///
     /// # Errors
     /// * [`RepoError::RefNotFound`] for unknown branches.

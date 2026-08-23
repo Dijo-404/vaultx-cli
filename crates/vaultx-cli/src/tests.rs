@@ -1618,9 +1618,8 @@ fn doctor_fresh_repo_passes_and_tampered_object_exits_nonzero() {
         CliError::Diagnostics(report) => {
             assert!(report.contains("FAIL repository integrity"), "{report}");
             assert!(
-                report.contains("summary: 6 passed, 2 warned, 1 failed")
-                    || report.contains("summary: "),
-                "{report}"
+                report.contains("summary: 2 passed, 4 warned, 1 failed"),
+                "exact summary expected:\n{report}"
             );
         }
         other => panic!("expected Diagnostics, got {other:?}"),
