@@ -62,6 +62,11 @@ base64 = "0.22"
 rpassword = "7"
 # Async runtime for the broker IPC server, client, and real transport.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+# Terminal UI (plan §15): ratatui renders; crossterm drives input and
+# the terminal backend. Versions are kept in lockstep with the
+# ratatui-crossterm backend crate.
+ratatui = { version = "0.30" }
+crossterm = "0.29"
 # Hardened outbound HTTP client for the broker transport (rustls only;
 # default features pull the native-tls stack and are deliberately off).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

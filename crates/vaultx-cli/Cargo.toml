@@ -22,6 +22,7 @@ vaultx-core = { path = "../vaultx-core" }
 vaultx-mcp = { path = "../vaultx-mcp" }
 vaultx-policy = { path = "../vaultx-policy" }
 vaultx-policy-packs = { path = "../vaultx-policy-packs" }
+vaultx-tui = { path = "../vaultx-tui" }
 vaultx-types = { path = "../vaultx-types" }
 zeroize = { workspace = true }
 

@@ -1,0 +1,552 @@
+//! Snapshot loading: maps `vaultx-core` / broker / audit services onto
+//! the plain owned rows the state machine renders.
+//!
+//! The loader is the only place that touches domain services. Every
+//! fallible piece degrades individually — a missing broker, audit file,
+//! session store, or pack tree yields empty data plus a status note,
+//! never a crashed UI.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use vaultx_audit::{AppendStore as _, AuditEvent, AuditFilter, JsonlAppendStore};
+use vaultx_broker::{FileSessionStore, SessionStore as _};
+use vaultx_core::{DiffEntry, VaultxServices};
+use vaultx_policy_packs::{load_pack, pack_files};
+use vaultx_types::{AgentId, CommitId, ObjectId};
+
+use crate::mask::{self, RedactedLine};
+use crate::state::{
+    AgentDetail, AgentRow, AgentsData, AuditRow, BrokerStatus, EnvRow, HistoryRow, LoadedState,
+    OutcomeFilter, SessionRow, SessionStatus, Snapshot, VariableRow,
+};
+
+/// Default environment when `--env` is omitted (mirrors the CLI).
+pub const DEFAULT_ENV: &str = "development";
+/// Maximum audit events loaded per refresh.
+pub const AUDIT_LIMIT: usize = 200;
+/// Recent history rows shown in the dashboard pane.
+const HISTORY_LIMIT: usize = 50;
+/// Broker probe budget; a wedged endpoint must not freeze startup.
+const BROKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reads project state through the application services.
+#[derive(Clone, Debug)]
+pub struct SnapshotSource<'a> {
+    services: &'a VaultxServices,
+    env: Option<String>,
+    socket: Option<&'a Path>,
+}
+
+impl<'a> SnapshotSource<'a> {
+    /// Builds a source over an opened project.
+    #[must_use]
+    pub fn new(
+        services: &'a VaultxServices,
+        env: Option<String>,
+        socket: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            services,
+            env,
+            socket,
+        }
+    }
+
+    /// Loads everything one UI refresh needs. Never fails overall:
+    /// individual pieces degrade into notes rendered on the status line.
+    #[must_use]
+    pub fn load(&self) -> LoadedState {
+        let mut notes = Vec::new();
+        let snapshot = self.load_snapshot(&mut notes);
+        let diff = self.load_diff_lines(&mut notes);
+        let (agents, policy_names, editor_seed) = self.load_agents(&mut notes);
+        let audit = query_audit_rows(&self.audit_path(), OutcomeFilter::All, AUDIT_LIMIT)
+            .unwrap_or_else(|reason| {
+                notes.push(format!("audit unavailable: {reason}"));
+                Vec::new()
+            });
+        let broker = broker_status(self.socket);
+
+        LoadedState {
+            snapshot: Snapshot { notes, ..snapshot },
+            diff,
+            agents,
+            audit,
+            broker,
+            policy_names,
+            editor_seed,
+        }
+    }
+
+    fn audit_path(&self) -> PathBuf {
+        self.services.context().audit_path()
+    }
+
+    fn session_store_path(&self) -> PathBuf {
+        self.services.context().vault_dir().join("sessions.json")
+    }
+
+    fn load_snapshot(&self, notes: &mut Vec<String>) -> Snapshot {
+        let mut snap = Snapshot {
+            env: Some(self.env.clone().unwrap_or_else(|| DEFAULT_ENV.to_owned())),
+            ..Snapshot::default()
+        };
+
+        match self.services.staging().status() {
+            Ok(report) => {
+                snap.branch = report.branch;
+                snap.head_short = report.head_commit.as_ref().map(short_id);
+                if let Some(head) = report.head_commit {
+                    match self.services.history().show(&head) {
+                        Ok(detail) => {
+                            snap.variables = detail
+                                .entries
+                                .iter()
+                                .map(|entry| VariableRow {
+                                    name: entry.name.clone(),
+                                    kind: entry.kind.to_owned(),
+                                    reference: mask::mask_reference(entry.kind, &entry.reference),
+                                })
+                                .collect();
+                        }
+                        Err(err) => notes.push(format!("variables unavailable: {err}")),
+                    }
+                }
+            }
+            Err(err) => notes.push(format!("status unavailable: {err}")),
+        }
+
+        match self.services.environments().list_environments() {
+            Ok(envs) => {
+                snap.envs = envs
+                    .into_iter()
+                    .map(|env| EnvRow {
+                        name: env.name,
+                        protected: env.protected,
+                        commit_short: env.commit.as_ref().map(short_id),
+                    })
+                    .collect();
+            }
+            Err(err) => notes.push(format!("environments unavailable: {err}")),
+        }
+
+        match self.services.history().log(HISTORY_LIMIT) {
+            Ok(entries) => {
+                snap.history = entries
+                    .into_iter()
+                    .map(|entry| HistoryRow {
+                        short: short_id(&entry.id),
+                        message: first_line(&entry.message),
+                        author: entry.author,
+                    })
+                    .collect();
+            }
+            Err(err) => notes.push(format!("history unavailable: {err}")),
+        }
+
+        snap
+    }
+
+    fn load_diff_lines(&self, notes: &mut Vec<String>) -> Vec<RedactedLine> {
+        let entries = match self.services.history().diff_staged() {
+            Ok(entries) => entries,
+            Err(err) => {
+                notes.push(format!("diff unavailable: {err}"));
+                return Vec::new();
+            }
+        };
+        let mut lines = Vec::new();
+        for entry in &entries {
+            // Policy changes upgrade to host/path/method deltas whenever
+            // both documents resolve from the repository object store;
+            // otherwise they stay metadata-only object deltas.
+            if let DiffEntry::PolicyChanged {
+                old_policy_object,
+                new_policy_object,
+                ..
+            } = entry
+            {
+                if let (Some(old), Some(new)) = (
+                    resolve_policy_document(self.services, old_policy_object),
+                    resolve_policy_document(self.services, new_policy_object),
+                ) {
+                    lines.extend(mask::policy_delta(&old, &new));
+                    continue;
+                }
+            }
+            lines.extend(mask::redact_diff(std::slice::from_ref(entry)));
+        }
+        lines
+    }
+
+    fn load_agents(&self, notes: &mut Vec<String>) -> (AgentsData, Vec<String>, String) {
+        let documents = match self.services.policies().load_policies() {
+            Ok(documents) => documents,
+            Err(err) => {
+                notes.push(format!("policies unavailable: {err}"));
+                Vec::new()
+            }
+        };
+
+        let policy_names: Vec<String> = documents
+            .iter()
+            .map(|doc| doc.name.as_str().to_owned())
+            .collect();
+        let editor_seed = documents
+            .first()
+            .and_then(|doc| serde_yaml::to_string(doc).ok())
+            .unwrap_or_default();
+
+        let list: Vec<AgentRow> = match self.services.agents().list_agents() {
+            Ok(summaries) => summaries
+                .into_iter()
+                .map(|agent| AgentRow {
+                    name: agent.name,
+                    enabled: agent.enabled,
+                })
+                .collect(),
+            Err(err) => {
+                notes.push(format!("agents unavailable: {err}"));
+                Vec::new()
+            }
+        };
+
+        let capabilities = self.load_capabilities(notes);
+
+        let mut details = BTreeMap::new();
+        for row in &list {
+            let Ok(full_id) = AgentId::parse(&format!("agent_{}", row.name)) else {
+                continue;
+            };
+            let attached = attached_documents(self.services, &documents, row.name.as_str());
+            let sessions = load_session_rows(
+                &self.session_store_path(),
+                full_id.as_str(),
+                unix_now_secs(),
+            );
+            let agent_prefix = format!("agent:{}", row.name);
+            let audit = query_audit_rows(&self.audit_path(), OutcomeFilter::All, AUDIT_LIMIT)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| row.actor == agent_prefix)
+                .take(8)
+                .collect();
+
+            details.insert(
+                row.name.clone(),
+                AgentDetail {
+                    full_id: full_id.as_str().to_owned(),
+                    enabled: row.enabled,
+                    policies: attached
+                        .iter()
+                        .map(|doc| doc.name.as_str().to_owned())
+                        .collect(),
+                    credentials: union(attached.iter().map(|d| d.credential.as_str())),
+                    allowed_hosts: union(documents_hosts(&attached)),
+                    allowed_methods: union(attached_allow_methods(&attached)),
+                    allowed_paths: union(attached_allow_paths(&attached)),
+                    capabilities: capabilities.clone(),
+                    sessions,
+                    audit,
+                },
+            );
+        }
+
+        (AgentsData { list, details }, policy_names, editor_seed)
+    }
+
+    /// Semantic capability names from `<project>/policy-packs`; a missing
+    /// or broken tree simply yields no capabilities.
+    fn load_capabilities(&self, notes: &mut Vec<String>) -> Vec<String> {
+        let dir = self.services.context().root().join("policy-packs");
+        if !dir.is_dir() {
+            return Vec::new();
+        }
+        let files = match pack_files(&dir) {
+            Ok(files) => files,
+            Err(err) => {
+                notes.push(format!("policy packs unavailable: {err}"));
+                return Vec::new();
+            }
+        };
+        files
+            .iter()
+            .filter_map(|file| load_pack(file).ok().map(|pack| pack.name))
+            .collect()
+    }
+}
+
+/// Policies governing one agent: those named on its identity file first,
+/// falling back to principal matches when no explicit attachment exists.
+fn attached_documents<'doc>(
+    services: &VaultxServices,
+    documents: &'doc [vaultx_policy::PolicyDocument],
+    bare_name: &str,
+) -> Vec<&'doc vaultx_policy::PolicyDocument> {
+    let principal = format!("agent:{bare_name}");
+    let by_principal: Vec<&vaultx_policy::PolicyDocument> = documents
+        .iter()
+        .filter(|doc| doc.principal.as_str() == principal)
+        .collect();
+    let Ok(identity) = services.agents().inspect(bare_name) else {
+        return by_principal;
+    };
+    let by_name: Vec<&vaultx_policy::PolicyDocument> = documents
+        .iter()
+        .filter(|doc| identity.policy_names.iter().any(|n| n == &doc.name))
+        .collect();
+    if by_name.is_empty() {
+        by_principal
+    } else {
+        by_name
+    }
+}
+
+fn documents_hosts(docs: &[&vaultx_policy::PolicyDocument]) -> Vec<String> {
+    docs.iter()
+        .flat_map(|doc| doc.http.hosts.iter().map(String::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn attached_allow_methods(docs: &[&vaultx_policy::PolicyDocument]) -> Vec<String> {
+    docs.iter()
+        .flat_map(|doc| doc.http.allow.iter())
+        .flat_map(|rule| rule.methods.iter().map(|m| m.as_str()))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn attached_allow_paths(docs: &[&vaultx_policy::PolicyDocument]) -> Vec<String> {
+    docs.iter()
+        .flat_map(|doc| doc.http.allow.iter())
+        .flat_map(|rule| rule.paths.iter().map(String::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn union<I>(values: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        let value = value.into();
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn short_id(id: &CommitId) -> String {
+    let text = id.as_str();
+    let hex = text.strip_prefix("cmt_").unwrap_or(text);
+    hex.chars().take(7).collect()
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().to_owned()
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Decodes a stored policy document from the repository object store, or
+/// `None` when the object is absent/undecodable as a policy document.
+fn resolve_policy_document(
+    services: &VaultxServices,
+    object_id: &ObjectId,
+) -> Option<vaultx_policy::PolicyDocument> {
+    let envelope = services
+        .context()
+        .repository()
+        .objects()
+        .get(object_id)
+        .ok()?;
+    let payload: serde_json::Value = envelope.decode_payload().ok()?;
+    serde_json::from_value(payload).ok()
+}
+
+/// Queries the local JSONL audit store with the given outcome filter.
+///
+/// # Errors
+/// Returns the store's message when it cannot be read or parsed.
+pub fn query_audit_rows(
+    audit_path: &Path,
+    filter: OutcomeFilter,
+    limit: usize,
+) -> Result<Vec<AuditRow>, String> {
+    let store = JsonlAppendStore::open(audit_path);
+    let filter = AuditFilter {
+        decision_allow: filter.allows_only(),
+        limit: Some(limit),
+        ..AuditFilter::default()
+    };
+    let events = store.query(&filter).map_err(|e| e.to_string())?;
+    Ok(events.iter().map(audit_row_from_event).collect())
+}
+
+fn audit_row_from_event(event: &AuditEvent) -> AuditRow {
+    let (allowed, deny_reason) = match &event.decision {
+        vaultx_audit::AuditDecision::Allow => (true, None),
+        vaultx_audit::AuditDecision::Deny { reason } => (false, Some(reason.clone())),
+    };
+    AuditRow {
+        sequence: event.sequence,
+        actor: event.actor.as_str().to_owned(),
+        action: action_label(event.action).to_owned(),
+        allowed,
+        deny_reason,
+        destination: event
+            .destination
+            .as_ref()
+            .map(|dest| format!("{}:{}{}", dest.host(), dest.port(), dest.path())),
+    }
+}
+
+fn action_label(action: vaultx_audit::AuditAction) -> &'static str {
+    use vaultx_audit::AuditAction as A;
+    match action {
+        A::HttpRequest => "http.request",
+        A::SessionCreated => "session.created",
+        A::SessionRevoked => "session.revoked",
+        A::SecretSet => "secret.set",
+        A::SecretRotate => "secret.rotate",
+        A::SecretDestroy => "secret.destroy",
+        A::ConfigCommitted => "config.committed",
+        A::PolicyUpdated => "policy.updated",
+    }
+}
+
+/// Classifies one agent's stored sessions into view rows.
+///
+/// # Errors
+/// Returns the store's message when it cannot be opened or read.
+pub fn load_session_rows(
+    store_path: &Path,
+    agent_full_id: &str,
+    now_secs: u64,
+) -> Result<Vec<SessionRow>, String> {
+    let store = FileSessionStore::open(store_path.to_path_buf()).map_err(|e| e.to_string())?;
+    let agent = AgentId::parse(agent_full_id).map_err(|e| e.to_string())?;
+    let records = store.list_for_agent(&agent).map_err(|e| e.to_string())?;
+    Ok(records
+        .into_iter()
+        .map(|record| {
+            let status = if record.revoked {
+                SessionStatus::Revoked
+            } else if record.expires_at_secs.is_some_and(|exp| exp <= now_secs) {
+                SessionStatus::Expired
+            } else {
+                SessionStatus::Active
+            };
+            SessionRow {
+                session_id: record.session_id.as_str().to_owned(),
+                environment: record.environment.as_str().to_owned(),
+                status,
+            }
+        })
+        .collect())
+}
+
+/// Probes the broker endpoint so panes can degrade gracefully when it is
+/// offline.
+#[must_use]
+pub fn broker_status(socket: Option<&Path>) -> BrokerStatus {
+    let endpoint = socket
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(vaultx_broker_client::default_endpoint()));
+    match probe_endpoint(endpoint.clone()) {
+        Ok(version) => BrokerStatus::Online(version),
+        Err(reason) => BrokerStatus::Offline(format!("{} ({})", endpoint.display(), reason)),
+    }
+}
+
+fn probe_endpoint(endpoint: PathBuf) -> Result<String, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(async move {
+            let attempt = async {
+                let mut client = vaultx_broker_client::BrokerClient::connect(&endpoint)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                client.ping().await.map_err(|e| e.to_string())
+            };
+            tokio::time::timeout(BROKER_PROBE_TIMEOUT, attempt)
+                .await
+                .map_err(|_| "timed out".to_owned())?
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use vaultx_audit::{
+        AuditAction, AuditDecision, CorrelationId, NewAuditEvent, SafeAuditMetadata,
+    };
+    use vaultx_policy::Principal;
+    use vaultx_types::ProjectId;
+
+    fn new_event(decision: AuditDecision) -> NewAuditEvent {
+        NewAuditEvent {
+            correlation_id: CorrelationId::parse("corr-tui").expect("valid correlation"),
+            actor: Principal::parse("agent:bot").expect("valid principal"),
+            project: ProjectId::parse("proj_tui").expect("valid project"),
+            environment: None,
+            action: AuditAction::HttpRequest,
+            decision,
+            credential: None,
+            destination: None,
+            capability: None,
+            policy_ids: Vec::new(),
+            metadata: SafeAuditMetadata::from_pairs([("http.method", "GET")])
+                .expect("valid metadata"),
+        }
+    }
+
+    #[test]
+    fn outcome_filter_returns_only_matching_audit_rows() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("audit.jsonl");
+        let store = JsonlAppendStore::open(&path);
+        store
+            .append(new_event(AuditDecision::Allow))
+            .expect("append allow");
+        store
+            .append(new_event(
+                AuditDecision::deny("path_not_allowed").expect("valid reason"),
+            ))
+            .expect("append deny");
+        store
+            .append(new_event(
+                AuditDecision::deny("host_not_allowed").expect("valid reason"),
+            ))
+            .expect("append deny");
+
+        assert_eq!(
+            query_audit_rows(&path, OutcomeFilter::All, AUDIT_LIMIT)
+                .expect("query")
+                .len(),
+            3
+        );
+
+        let allows = query_audit_rows(&path, OutcomeFilter::Allow, AUDIT_LIMIT).expect("query");
+        assert_eq!(allows.len(), 1);
+        assert!(allows.iter().all(|row| row.allowed));
+
+        let denies = query_audit_rows(&path, OutcomeFilter::Deny, AUDIT_LIMIT).expect("query");
+        assert_eq!(denies.len(), 2);
+        assert!(denies.iter().all(|row| !row.allowed));
+    }
+}

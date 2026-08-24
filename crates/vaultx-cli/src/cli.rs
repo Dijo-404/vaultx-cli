@@ -332,6 +332,17 @@ pub enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Launch the interactive terminal UI dashboard.
+    Tui {
+        /// Environment whose pinned commit backs the dashboard (default:
+        /// development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+        /// Broker endpoint override (probed for agent/audit status lines;
+        /// offline brokers degrade the UI instead of failing it).
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
     /// Audit log inspection (planned).
     Audit(StubArgs),
     /// Remote repository configuration (planned).
@@ -799,6 +810,7 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
                 cmd_mcp_serve(&cli.project, agent, env.as_deref(), socket.as_deref())
             }
         },
+        Command::Tui { env, socket } => cmd_tui(&cli.project, env.as_deref(), socket.as_deref()),
         Command::Audit(_) => Err(CliError::NotImplemented("audit")),
         Command::Remote(_) => Err(CliError::NotImplemented("remote")),
         Command::Login(_) => Err(CliError::NotImplemented("login")),
@@ -1519,6 +1531,23 @@ fn cmd_mcp_serve(
     };
     run_async(vaultx_mcp::serve(config))
         .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))?;
+    Ok(String::new())
+}
+
+/// Launches the interactive TUI (plan §15/§38). The project is opened
+/// first so a bad directory maps onto the exit-3 class; everything else
+/// is delegated to `vaultx-tui`, which owns its own terminal handling.
+fn cmd_tui(project: &Path, env: Option<&str>, socket: Option<&Path>) -> Result<String, CliError> {
+    VaultxServices::open(project).map_err(|err| match err {
+        CoreError::NotARepository(path) => CliError::NotARepository(path),
+        other => other.into(),
+    })?;
+    vaultx_tui::run(&vaultx_tui::TuiConfig {
+        project: project.to_path_buf(),
+        env: env.map(str::to_owned),
+        socket: socket.map(Path::to_path_buf),
+    })
+    .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))?;
     Ok(String::new())
 }
 
