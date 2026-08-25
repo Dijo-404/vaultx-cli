@@ -558,9 +558,14 @@ pub enum AgentCommand {
     /// delegation chains. Revoking (or expiring) the parent invalidates
     /// every descendant at validation time. At least one narrowing flag
     /// is required — a delegation that narrows nothing is rejected.
+    ///
+    /// The parent is identified by its **raw capability token**: holding
+    /// the token is what proves authority to delegate, so bare `sess_...`
+    /// ids are refused (same rationale as broker request `--session`).
     Delegate {
-        /// Parent session id (`sess_...`) or its capability token.
-        session_id: String,
+        /// Raw parent capability token from `agent session create`
+        /// (`sess_...` ids are refused).
+        parent_token: String,
         /// Restrict the child to these credential names (repeatable).
         #[arg(long = "credential", value_name = "NAME")]
         credentials: Vec<String>,
@@ -888,7 +893,7 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
                 with_open(&cli.project, |s| cmd_agent_session_revoke(s, session_id))
             }
             AgentCommand::Delegate {
-                session_id,
+                parent_token,
                 credentials,
                 hosts,
                 methods,
@@ -897,7 +902,7 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             } => with_open(&cli.project, |s| {
                 cmd_agent_delegate(
                     s,
-                    session_id,
+                    parent_token,
                     credentials,
                     hosts,
                     methods,
@@ -1902,15 +1907,18 @@ fn cmd_agent_session_revoke(
 
 /// Mints a delegated child session from a live parent (plan §25).
 ///
-/// The parent is located by id or raw capability token; the CLI requires
-/// at least one narrowing flag so delegation can never grow a pointless
-/// unconstrained chain. Path globs are validated up front so a typo dies
-/// as a usage error instead of a silently-never-matching constraint. The
-/// child token prints exactly once with the same warning wording as
-/// `agent session create` and is never echoed anywhere else.
+/// Delegation is **possession-gated**: the parent must be presented by its
+/// raw capability token, never by bare session id — an id alone proves
+/// nothing about who is delegating (mirrors broker request `--session`).
+/// The CLI also requires at least one narrowing flag so delegation can
+/// never grow a pointless unconstrained chain. Path globs are validated up
+/// front so a typo dies as a usage error instead of a silently-never-
+/// matching constraint. The child token prints exactly once with the same
+/// warning wording as `agent session create` and is never echoed anywhere
+/// else; parent tokens are never echoed at all.
 fn cmd_agent_delegate(
     services: &VaultxServices,
-    session_id: &str,
+    parent_token: &str,
     credentials: &[String],
     hosts: &[String],
     methods: &[String],
@@ -1951,16 +1959,27 @@ fn cmd_agent_delegate(
         remaining_requests: max_requests,
     };
 
-    let parent_id = vaultx_types::SessionId::parse(session_id).ok();
-    let parent = match &parent_id {
-        Some(id) => vaultx_broker::DelegationParent::Id(id),
-        None => vaultx_broker::DelegationParent::Token(session_id),
-    };
+    // Possession proof: refuse id-shaped input before any store lookup.
+    // The token itself is never quoted back in errors — pasted tokens must
+    // not leak into terminals or logs.
+    if parent_token.starts_with(vaultx_types::SessionId::PREFIX) {
+        return Err(CliError::Usage(
+            "delegation requires the raw parent capability token (shown once by \
+             `agent session create`); a `sess_...` id alone proves nothing"
+                .into(),
+        ));
+    }
     let (child_id, raw_token) = open_session_store(services)?
-        .delegate(parent, &constraints)
+        .delegate(
+            vaultx_broker::DelegationParent::Token(parent_token),
+            &constraints,
+        )
         .map_err(|err| match err {
             vaultx_broker::BrokerError::InvalidSession => {
-                CliError::Usage(format!("no such live session `{session_id}`"))
+                CliError::Usage("unknown or invalid parent session token".into())
+            }
+            vaultx_broker::BrokerError::SessionRevoked => {
+                CliError::Usage("parent session revoked or expired".into())
             }
             other => CliError::Runtime(CoreError::Io(std::io::Error::other(other.to_string()))),
         })?;

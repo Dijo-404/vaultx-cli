@@ -100,6 +100,7 @@ impl<'de> Deserialize<'de> for TokenHash {
 /// authority ⊆ parent effective authority` — hold transitively across
 /// chains.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionConstraints {
     /// Allowed credential logical names; `None` = unrestricted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,8 +188,13 @@ impl SessionConstraints {
             }
         }
         if let Some(set) = &self.hosts {
-            let list: Vec<String> = set.iter().cloned().collect();
-            if !vaultx_policy::host_matches(&list, host) {
+            // Same semantics as `vaultx_policy::host_matches` (exact match
+            // after lowercasing both sides) without materializing a Vec.
+            let lowered = host.to_ascii_lowercase();
+            if !set
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&lowered))
+            {
                 return Err("host");
             }
         }
@@ -285,11 +291,17 @@ fn glob_subsumes(parent: &str, child: &str) -> bool {
     }
 }
 
-/// How a delegation locates its parent session: by stored id or by
-/// presenting the parent's raw capability token.
+/// How a delegation locates its parent session.
+///
+/// The CLI surface is possession-gated and only ever uses
+/// [`DelegationParent::Token`]; the id variant exists for in-crate
+/// fixtures and store-internal lookups and is deliberately not part of
+/// the documented API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DelegationParent<'a> {
-    /// Look up the parent session by its stored id.
+    /// Look up the parent session by its stored id. Internal/test-only:
+    /// an id alone proves no possession of the parent capability.
+    #[doc(hidden)]
     Id(&'a SessionId),
     /// Resolve the parent through its raw capability token verifier.
     Token(&'a str),
@@ -298,7 +310,11 @@ pub enum DelegationParent<'a> {
 /// Stored state of one agent session (plan §25). Mirrors the plan's
 /// `AgentSession` shape: identity binding plus the token *verifier* and a
 /// revocation flag.
+///
+/// Unknown fields are refused on deserialization so a hand-edited store
+/// cannot smuggle in unvalidated state alongside the schema.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSessionRecord {
     /// Identifier of the session (`sess_...`).
     pub session_id: SessionId,
@@ -722,6 +738,20 @@ impl InMemorySessionStore {
             .get(&computed)
             .cloned()
             .ok_or(BrokerError::InvalidSession)?;
+        // Liveness re-check in the same lock hold: a session revoked or
+        // orphaned by a dead chain between authentication and this point
+        // neither executes nor burns budget.
+        {
+            let record = state
+                .sessions
+                .get(&session_id)
+                .ok_or(BrokerError::InvalidSession)?;
+            if is_dead(record, &self.clock_override)
+                || !ancestors_live(&state, record, &self.clock_override)
+            {
+                return Err(BrokerError::SessionRevoked);
+            }
+        }
         let record = state
             .sessions
             .get_mut(&session_id)
@@ -1347,6 +1377,23 @@ mod tests {
         );
         assert!(subsumes("/repos/*", "/repos/acme"));
 
+        assert!(
+            subsumes("/a/**", "/a/**"),
+            "identical open-ended globs survive intersection"
+        );
+        assert!(
+            subsumes("/repos/acme/**", "/repos/acme/**"),
+            "identical nested globs survive intersection"
+        );
+
+        // Unicode literal segments behave like any other literal.
+        assert!(subsumes("/café/**", "/café/münchen"));
+        assert!(!subsumes("/café/münchen", "/café/other"));
+        assert!(
+            !subsumes("/caf*", "/café/x"),
+            "* covers whole segments only"
+        );
+
         assert!(subsumes("/a/b/**", "/a/b/c/**"), "open-ended prefixes nest");
         assert!(
             !subsumes("/a/**/z", "/a/z"),
@@ -1416,6 +1463,21 @@ mod tests {
 /// whose mode grants group/other access rather than silently reading a
 /// leaked store. Mutations persist atomically via a unique tempfile +
 /// fsync + rename within the same directory.
+///
+/// # Store trust model
+///
+/// The file protects **token secrecy** (only SHA-256 verifiers are ever
+/// written) and **revocation durability**; it is not assumed to be
+/// tamper-proof — it is ordinary owner-writable config, editable by
+/// anything that already runs as the user. Delegation containment is
+/// therefore made *self-verifying* instead of trusted: on every load
+/// (`open` and each locked operation), every delegated record is re-checked
+/// against its parent — stored constraints must equal the intersection of
+/// the parent's constraints with themselves, parents must exist, and the
+/// parent/constraints pair must be complete. Any widened link, dangling
+/// ancestor, half-written delegation, or unknown field fails the load
+/// closed with a `tampered delegation constraints` error, so a hand-edited
+/// child can never gain authority beyond what minting proved.
 pub struct FileSessionStore {
     path: PathBuf,
     lock_path: PathBuf,
@@ -1452,20 +1514,19 @@ impl FileSessionStore {
     /// Opens (or creates) the store at `path`.
     ///
     /// # Errors
-    /// Propagates I/O failures, JSON corruption, and permission-refusal
+    /// Propagates I/O failures, JSON corruption (including unknown
+    /// fields), tampered delegation chains, and permission-refusal
     /// ([`BrokerError::TransportFailure`]) when the existing file is
     /// readable by group/other.
     pub fn open(path: PathBuf) -> Result<Self, BrokerError> {
+        Self::sweep_stale_tmp_files(&path);
         if path.exists() {
             Self::check_mode(&path)?;
-            // Corruption is surfaced eagerly so operators learn about it
-            // before the first mutation would clobber context.
-            let text = std::fs::read_to_string(&path).map_err(|err| {
-                BrokerError::TransportFailure(format!("cannot read session store: {err}"))
-            })?;
-            let _: Vec<AgentSessionRecord> = serde_json::from_str(&text).map_err(|err| {
-                BrokerError::TransportFailure(format!("corrupt session store: {err}"))
-            })?;
+            // Corruption and delegation tampering are surfaced eagerly so
+            // operators learn about them before the first mutation would
+            // clobber context.
+            let records = Self::parse_store(&path)?;
+            Self::verify_delegation_chains(&records, &path)?;
         }
         let mut lock_name = path.clone().into_os_string();
         lock_name.push(".lock");
@@ -1474,6 +1535,103 @@ impl FileSessionStore {
             lock_path: PathBuf::from(lock_name),
             clock_override: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Best-effort removal of stale writer debris (`<name>.tmp.<pid>.<seq>`)
+    /// left behind by processes that crashed mid-persist. Files modified
+    /// within the last few minutes are spared: a concurrently-opening peer
+    /// must never destroy another writer's in-flight temp.
+    fn sweep_stale_tmp_files(path: &Path) {
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        let prefix = format!("{name}.tmp.");
+        let Some(cutoff) =
+            std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(300))
+        else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+                continue;
+            }
+            let fresh = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified > cutoff)
+                .unwrap_or(true);
+            if !fresh {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Reads and deserializes the store, mapping any parse failure
+    /// (including [`deny_unknown_fields`] rejections) to a corrupt-store
+    /// error naming the file.
+    fn parse_store(path: &Path) -> Result<Vec<AgentSessionRecord>, BrokerError> {
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            BrokerError::TransportFailure(format!("cannot read session store: {err}"))
+        })?;
+        serde_json::from_str(&text)
+            .map_err(|err| BrokerError::TransportFailure(format!("corrupt session store: {err}")))
+    }
+
+    /// Re-derives every delegated record's constraints from its parent:
+    /// the stored set must be exactly what minting would have produced
+    /// (`stored == parent.constraints ∩ stored`), parents must exist, and
+    /// a delegation link must always carry both halves. Anything else
+    /// fails closed — see the [store trust model](Self) above.
+    fn verify_delegation_chains(
+        records: &[AgentSessionRecord],
+        path: &Path,
+    ) -> Result<(), BrokerError> {
+        let fail = |detail: String| {
+            BrokerError::TransportFailure(format!(
+                "tampered delegation constraints in {}: {}",
+                path.display(),
+                detail
+            ))
+        };
+        let by_id: HashMap<&SessionId, &AgentSessionRecord> =
+            records.iter().map(|r| (&r.session_id, r)).collect();
+        for record in records {
+            match (&record.parent_session, &record.constraints) {
+                (None, None) => {}
+                (Some(parent_id), Some(child_constraints)) => {
+                    let parent = by_id.get(parent_id).ok_or_else(|| {
+                        fail(format!(
+                            "session {} delegates from missing session {parent_id}",
+                            record.session_id
+                        ))
+                    })?;
+                    let narrowed = parent
+                        .constraints
+                        .as_ref()
+                        .map(|parent_constraints| parent_constraints.narrow(child_constraints))
+                        .unwrap_or_else(|| child_constraints.clone());
+                    if &narrowed != child_constraints {
+                        return Err(fail(format!(
+                            "session {} stores constraints wider than its parent allows",
+                            record.session_id
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(fail(format!(
+                        "session {} has a half-written delegation link",
+                        record.session_id
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Test-only: pins the wall clock used for expiry decisions across
@@ -1558,16 +1716,19 @@ impl FileSessionStore {
     }
 
     /// Loads the current on-disk records under an already-held lock.
+    ///
+    /// Delegation chains are re-verified here (not just in [`Self::open`])
+    /// so every operation runs against freshly-proven containment: a store
+    /// widened between open and now fails the operation instead of leaking
+    /// authority.
     fn load_records(&self) -> Result<Vec<AgentSessionRecord>, BrokerError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
         Self::check_mode(&self.path)?;
-        let text = std::fs::read_to_string(&self.path).map_err(|err| {
-            BrokerError::TransportFailure(format!("cannot read session store: {err}"))
-        })?;
-        serde_json::from_str(&text)
-            .map_err(|err| BrokerError::TransportFailure(format!("corrupt session store: {err}")))
+        let records = Self::parse_store(&self.path)?;
+        Self::verify_delegation_chains(&records, &self.path)?;
+        Ok(records)
     }
 
     /// Runs `body` against a freshly-loaded in-memory store under the
@@ -1825,5 +1986,200 @@ mod file_store_tests {
             store.validate(&token),
             Err(BrokerError::SessionRevoked)
         ));
+    }
+
+    /// Seeds a two-level delegation chain (root → scoped child → deeper
+    /// grandchild) through the real store API and returns the raw JSON.
+    fn seeded_chain_json(path: &Path) -> String {
+        let store = FileSessionStore::open(path.to_path_buf()).unwrap();
+        let (_, root_token) = store.create(&agent(), &environment()).unwrap();
+        let level_one = SessionConstraints {
+            paths: Some(vec!["/repos/**".to_owned()]),
+            remaining_requests: Some(5),
+            ..SessionConstraints::default()
+        };
+        let (_, child_token) =
+            SessionStore::delegate(&store, DelegationParent::Token(&root_token), &level_one)
+                .unwrap();
+        drop(store);
+        let reopened = FileSessionStore::open(path.to_path_buf()).unwrap();
+        let level_two = SessionConstraints {
+            paths: Some(vec!["/repos/acme/**".to_owned()]),
+            remaining_requests: Some(2),
+            ..SessionConstraints::default()
+        };
+        let (_grandchild_id, _) =
+            SessionStore::delegate(&reopened, DelegationParent::Token(&child_token), &level_two)
+                .unwrap();
+        std::fs::read_to_string(path).expect("store readable")
+    }
+
+    #[test]
+    fn load_refuses_child_constraints_wider_than_their_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let json = seeded_chain_json(&path);
+
+        // Hand-edit the grandchild's budget beyond what its parent allows:
+        // the stored set no longer equals parent ∩ stored ⇒ tampered.
+        let widened = json.replace("\"remaining_requests\": 2", "\"remaining_requests\": 999");
+        assert_ne!(json, widened, "fixture edit must apply");
+        std::fs::write(&path, widened).unwrap();
+
+        let err = FileSessionStore::open(path.clone()).unwrap_err();
+        assert!(
+            err.to_string().contains("tampered delegation constraints")
+                && err.to_string().contains("sessions.json"),
+            "{err}"
+        );
+        // Eager verification means the widened store can never be opened
+        // again — every entry point (open and each locked operation) runs
+        // the same containment proof.
+        assert!(matches!(
+            FileSessionStore::open(path),
+            Err(BrokerError::TransportFailure(_))
+        ));
+    }
+
+    #[test]
+    fn load_refuses_dangling_delegation_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let json = seeded_chain_json(&path);
+
+        // Drop the root record while keeping both children: every child's
+        // ancestor chain now points at a missing session.
+        let mut parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let before = parsed.len();
+        parsed.retain(|record| record.get("parent_session").is_some());
+        assert_eq!(before - parsed.len(), 1, "removed the root only");
+        std::fs::write(&path, serde_json::to_string_pretty(&parsed).unwrap()).unwrap();
+        let err = FileSessionStore::open(path).unwrap_err();
+        assert!(
+            err.to_string().contains("delegates from missing session"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn load_refuses_unknown_fields_on_records_and_constraints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let store = FileSessionStore::open(path.clone()).unwrap();
+        store.create(&agent(), &environment()).unwrap();
+        drop(store);
+
+        // Unknown field on a session record.
+        let json = std::fs::read_to_string(&path).unwrap();
+        let poisoned = json.replace(
+            "\"revoked\": false",
+            "\"revoked\": false,\"bogus_field\": 1",
+        );
+        assert_ne!(json, poisoned);
+        std::fs::write(&path, &poisoned).unwrap();
+        let err = FileSessionStore::open(path.clone()).unwrap_err();
+        assert!(err.to_string().contains("corrupt session store"), "{err}");
+
+        // Unknown field inside a constraints object (needs a delegated
+        // child first).
+        let fresh = dir.path().join("chain.json");
+        let chain = seeded_chain_json(&fresh);
+        let poisoned_constraints = chain.replace(
+            "\"remaining_requests\": 2",
+            "\"extra\": true,\"remaining_requests\": 2",
+        );
+        assert_ne!(chain, poisoned_constraints);
+        std::fs::write(&fresh, poisoned_constraints).unwrap();
+        let err = FileSessionStore::open(fresh).unwrap_err();
+        assert!(err.to_string().contains("corrupt session store"), "{err}");
+    }
+
+    #[test]
+    fn consume_budget_refuses_dead_sessions_without_burning_budget() {
+        let store = InMemorySessionStore::new();
+        store.set_clock_for_tests(3_000);
+        let (root_id, _) = store
+            .create_expiring(&agent(), &environment(), Some(60))
+            .unwrap();
+        let requested = SessionConstraints {
+            remaining_requests: Some(2),
+            ..SessionConstraints::default()
+        };
+        let (child_id, child_token) =
+            SessionStore::delegate(&store, DelegationParent::Id(&root_id), &requested).unwrap();
+        assert!(store.consume_budget(&child_token).is_ok());
+
+        // Revoked root: consumption is refused outright...
+        store.revoke(&root_id).unwrap();
+        assert!(matches!(
+            store.consume_budget(&child_token),
+            Err(BrokerError::SessionRevoked)
+        ));
+
+        // ...and the stored budget was not touched by the refused call.
+        let records = store.list_for_agent(&agent()).unwrap();
+        let child = records
+            .iter()
+            .find(|record| record.session_id == child_id)
+            .unwrap();
+        assert_eq!(
+            child.constraints.as_ref().unwrap().remaining_requests,
+            Some(1)
+        );
+
+        // Expired ancestors behave identically.
+        store.set_clock_for_tests(3_061);
+        assert!(matches!(
+            store.consume_budget(&child_token),
+            Err(BrokerError::SessionRevoked)
+        ));
+    }
+
+    #[test]
+    fn budget_decrements_persist_across_store_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+
+        let first = FileSessionStore::open(path.clone()).unwrap();
+        let (_, root_token) = first.create(&agent(), &environment()).unwrap();
+        let requested = SessionConstraints {
+            remaining_requests: Some(2),
+            ..SessionConstraints::default()
+        };
+        let (_, child_token) =
+            SessionStore::delegate(&first, DelegationParent::Token(&root_token), &requested)
+                .unwrap();
+        first.consume_budget(&child_token).unwrap();
+        drop(first);
+
+        // A freshly-opened instance sees exactly one unit consumed — and
+        // exhaustion is durable too.
+        let second = FileSessionStore::open(path.clone()).unwrap();
+        let records = second.list_for_agent(&agent()).unwrap();
+        let child = records
+            .iter()
+            .find(|record| record.constraints.is_some())
+            .unwrap();
+        assert_eq!(
+            child.constraints.as_ref().unwrap().remaining_requests,
+            Some(1)
+        );
+        second.consume_budget(&child_token).unwrap();
+        assert!(matches!(
+            second.consume_budget(&child_token),
+            Err(BrokerError::BudgetExhausted)
+        ));
+        drop(second);
+
+        let third = FileSessionStore::open(path).unwrap();
+        let records = third.list_for_agent(&agent()).unwrap();
+        let child = records
+            .iter()
+            .find(|record| record.constraints.is_some())
+            .unwrap();
+        assert_eq!(
+            child.constraints.as_ref().unwrap().remaining_requests,
+            Some(0)
+        );
     }
 }

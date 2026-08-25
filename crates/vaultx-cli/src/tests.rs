@@ -3818,13 +3818,37 @@ fn delegation_mints_scoped_child_enforced_by_broker_and_prints_token_once() {
         .and_then(|rest| rest.split_whitespace().next())
         .expect("session id printed")
         .to_owned();
+    // Possession-gated delegation: the raw token is the parent handle.
+    let parent_token = created.lines().last().unwrap().trim().to_owned();
+    assert_ne!(parent_token, parent_id);
+
+    // Bare `sess_...` ids are refused before any store lookup: holding an
+    // id proves nothing about who is delegating.
+    let err = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Delegate {
+                parent_token: parent_id.clone(),
+                credentials: vec!["github-work-token".into()],
+                hosts: Vec::new(),
+                methods: Vec::new(),
+                paths: Vec::new(),
+                max_requests: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("raw parent capability token")),
+        "{err:?}"
+    );
 
     // Delegate: at least one narrowing flag is mandatory.
     let err = dispatch(&cli(
         root,
         Command::Agent {
             command: AgentCommand::Delegate {
-                session_id: parent_id.clone(),
+                parent_token: parent_token.clone(),
                 credentials: Vec::new(),
                 hosts: Vec::new(),
                 methods: Vec::new(),
@@ -3844,7 +3868,7 @@ fn delegation_mints_scoped_child_enforced_by_broker_and_prints_token_once() {
         root,
         Command::Agent {
             command: AgentCommand::Delegate {
-                session_id: parent_id.clone(),
+                parent_token: parent_token.clone(),
                 credentials: Vec::new(),
                 hosts: Vec::new(),
                 methods: Vec::new(),
@@ -3859,12 +3883,13 @@ fn delegation_mints_scoped_child_enforced_by_broker_and_prints_token_once() {
         "{err:?}"
     );
 
-    // Unknown parents are refused without minting anything.
+    // Unknown tokens are refused without minting anything — and the
+    // presented value is never echoed back into the error.
     let err = dispatch(&cli(
         root,
         Command::Agent {
             command: AgentCommand::Delegate {
-                session_id: "sess_missing0000000000000000000000".into(),
+                parent_token: "not-a-real-parent-token-at-all".into(),
                 credentials: vec!["c".into()],
                 hosts: Vec::new(),
                 methods: Vec::new(),
@@ -3875,15 +3900,20 @@ fn delegation_mints_scoped_child_enforced_by_broker_and_prints_token_once() {
     ))
     .unwrap_err();
     assert!(
-        matches!(&err, CliError::Usage(text) if text.contains("no such live session")),
+        matches!(&err, CliError::Usage(text) if text.contains("unknown or invalid parent session token")),
         "{err:?}"
+    );
+    let rendered = format!("{err}");
+    assert!(
+        !rendered.contains("not-a-real-parent-token"),
+        "token echoed in error"
     );
 
     let out = dispatch(&cli(
         root,
         Command::Agent {
             command: AgentCommand::Delegate {
-                session_id: parent_id.clone(),
+                parent_token: parent_token.clone(),
                 credentials: vec!["github-work-token".into()],
                 hosts: vec!["api.github.com".into()],
                 methods: vec!["GET".into()],
@@ -4012,4 +4042,25 @@ fn delegation_mints_scoped_child_enforced_by_broker_and_prints_token_once() {
         engine.execute_broker_request(after_revoke).decision,
         vaultx_broker::Decision::Deny { ref reason, .. } if reason == "session_revoked"
     ));
+
+    // Delegating from a revoked/expired parent is a usage error, not a
+    // runtime failure — and the dead token still proves nothing.
+    let err = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Delegate {
+                parent_token: parent_token.clone(),
+                credentials: vec!["github-work-token".into()],
+                hosts: Vec::new(),
+                methods: Vec::new(),
+                paths: Vec::new(),
+                max_requests: Some(1),
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("parent session revoked or expired")),
+        "{err:?}"
+    );
 }

@@ -635,6 +635,24 @@ impl BrokerEngine {
                     None,
                 );
             }
+            // The session (or an ancestor in its delegation chain) died
+            // between stage 2 and here. Route through the same revocation
+            // denial class as authentication so audit stays consistent —
+            // and the budget was provably not decremented.
+            Err(BrokerError::SessionRevoked) => {
+                return self.deny(
+                    request_id,
+                    &correlation_id,
+                    actor,
+                    Some(environment),
+                    Some(req.credential),
+                    destination,
+                    capability,
+                    req.method.as_str(),
+                    "session_revoked",
+                    None,
+                );
+            }
             // A storage failure during the decrement must not let an
             // unaccounted request through: fail closed with a distinct
             // broker-level reason.
