@@ -385,3 +385,129 @@ mod tests {
         .is_err());
     }
 }
+
+/// Property tests for manifest canonical serialization (plan §43:
+/// `decode(encode(x)) == x` for canonical domain objects, "hash
+/// canonicalization is stable" under differing insertion orderings).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::object::{hash_canonical, object_id, ObjectEnvelope, ObjectType};
+    use proptest::prelude::*;
+
+    /// Content for generated IDs. The first character is drawn from
+    /// letters that begin no registered ID prefix (`s`, `w`, `p`, `e`,
+    /// `c`, `o`, `a` are avoided) so prefixed-ID parsing never rejects a
+    /// generated value for nested-family embedding.
+    fn safe_id_content() -> impl Strategy<Value = String> {
+        "(b|d|f|g|h|i|j|k|l|m|n|q|r|t|u|v|x|y|z)[a-z0-9_]{2,12}"
+    }
+
+    fn variable_names() -> impl Strategy<Value = VariableName> {
+        "[A-Z][A-Z0-9_]{0,11}".prop_map(|name| VariableName::parse(&name).unwrap())
+    }
+
+    fn policy_names() -> impl Strategy<Value = PolicyName> {
+        "[a-z][a-z0-9_]{1,11}".prop_map(|name| PolicyName::parse(&name).unwrap())
+    }
+
+    fn any_entry() -> impl Strategy<Value = ManifestEntry> {
+        prop_oneof![
+            safe_id_content().prop_map(|content| ManifestEntry::Config {
+                object: ObjectId::parse(&format!("obj_{content}")).unwrap(),
+            }),
+            safe_id_content().prop_map(|content| ManifestEntry::Secret {
+                revision: SecretRevisionId::parse(&format!("sec_rev_{content}")).unwrap(),
+            }),
+            (safe_id_content(), safe_id_content()).prop_map(|(credential, revision)| {
+                ManifestEntry::Brokered {
+                    credential: CredentialRef::parse(&credential).unwrap(),
+                    revision: SecretRevisionId::parse(&format!("sec_rev_{revision}")).unwrap(),
+                }
+            }),
+            "[a-z][a-z0-9./_-]{2,15}".prop_map(|provider| ManifestEntry::Dynamic {
+                provider: DynamicProviderRef::parse(&provider).unwrap(),
+            }),
+        ]
+    }
+
+    /// Builds a manifest by folding generated `(name, entry)` pairs into
+    /// the underlying maps; duplicate names collapse map-style.
+    fn build_manifest(
+        entries: Vec<(VariableName, ManifestEntry)>,
+        policies: Vec<(PolicyName, String)>,
+    ) -> Manifest {
+        let mut manifest = Manifest::new();
+        for (name, entry) in entries {
+            manifest.entries.insert(name, entry);
+        }
+        for (name, content) in policies {
+            manifest
+                .policies
+                .insert(name, ObjectId::parse(&format!("obj_{content}")).unwrap());
+        }
+        manifest
+    }
+
+    fn envelope_of(manifest: &Manifest) -> (ObjectEnvelope, [u8; 32], ObjectId) {
+        let payload = serde_json::to_vec(manifest).unwrap();
+        let envelope = ObjectEnvelope::new(ObjectType::Manifest, payload);
+        let bytes = envelope.canonical_bytes().unwrap();
+        let digest = hash_canonical(&bytes);
+        let id = object_id(&bytes).unwrap();
+        (envelope, digest, id)
+    }
+
+    proptest! {
+        /// P1: random manifests mixing all four entry kinds plus policy
+        /// bindings survive JSON encode → decode and the typed
+        /// envelope-payload decode path with full equality.
+        #[test]
+        fn manifest_round_trips_through_json_and_envelope(
+            entries in proptest::collection::vec((variable_names(), any_entry()), 0..=6usize),
+            policies in proptest::collection::vec((policy_names(), safe_id_content()), 0..=4usize),
+        ) {
+            let manifest = build_manifest(entries, policies);
+
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let decoded: Manifest = serde_json::from_slice(&bytes).unwrap();
+            prop_assert_eq!(&decoded, &manifest);
+
+            // Re-encoding is byte-stable.
+            prop_assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+
+            // And the repository envelope path recovers the same manifest.
+            let envelope =
+                ObjectEnvelope::new(ObjectType::Manifest, serde_json::to_vec(&manifest).unwrap());
+            prop_assert_eq!(&envelope.decode_payload::<Manifest>().unwrap(), &manifest);
+        }
+
+        /// P2: the same logical manifest built with opposite insertion
+        /// orderings serializes to identical bytes and hashes to the same
+        /// object ID — key ordering must never influence content
+        /// addressing.
+        #[test]
+        fn hash_is_stable_under_differing_insertion_order(
+            entries in proptest::collection::vec((variable_names(), any_entry()), 1..=6usize),
+            policies in proptest::collection::vec((policy_names(), safe_id_content()), 0..=4usize),
+        ) {
+            let forward = build_manifest(entries.clone(), policies.clone());
+
+            // Reverse insertion of the *resolved* map contents: identical
+            // logical content regardless of how duplicates collapsed.
+            let mut backward = Manifest::new();
+            for (name, entry) in forward.entries.iter().rev() {
+                backward.entries.insert(name.clone(), entry.clone());
+            }
+            for (name, object) in forward.policies.iter().rev() {
+                backward.policies.insert(name.clone(), object.clone());
+            }
+            prop_assert_eq!(&forward, &backward);
+
+            let (_, digest_forward, id_forward) = envelope_of(&forward);
+            let (_, digest_backward, id_backward) = envelope_of(&backward);
+            prop_assert_eq!(digest_forward, digest_backward);
+            prop_assert_eq!(id_forward, id_backward);
+        }
+    }
+}

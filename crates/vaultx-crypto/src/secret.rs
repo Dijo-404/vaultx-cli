@@ -184,3 +184,90 @@ mod tests {
         assert!(is_ascii);
     }
 }
+
+/// Property tests for the redaction guarantee (plan §43: "secret
+/// Debug/Display never contains plaintext"; plan §36 INV-012).
+///
+/// Note on `Display`: per PLAN §8 these types deliberately implement **no**
+/// `Display`, so the property is asserted over `Debug` — the only formatting
+/// impl that exists.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The exact rendering contract, plus a sliding-window scan of the
+    /// plaintext against the rendered output (INV-012 canary style).
+    ///
+    /// Windows shorter than 4 bytes are skipped: a one-character window
+    /// like `e` legitimately occurs inside `<redacted>` itself and proves
+    /// nothing about leakage. When the plaintext *is* the redaction
+    /// marker, containment is trivially true by construction, so only the
+    /// exact-equality assertion applies.
+    fn assert_redacted(rendered: &str, plaintext: &[u8]) {
+        assert_eq!(rendered, "<redacted>");
+        if plaintext == b"<redacted>" || plaintext.len() < 4 {
+            return;
+        }
+        let max_window = plaintext.len().min(16);
+        for window in 4..=max_window {
+            for start in 0..=(plaintext.len() - window) {
+                let needle = String::from_utf8_lossy(&plaintext[start..start + window]);
+                assert!(
+                    !rendered.contains(needle.as_ref()),
+                    "rendered output contains a {window}-byte window of the plaintext"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        /// P5: arbitrary binary plaintexts never surface through `Debug`.
+        #[test]
+        fn secret_bytes_debug_never_contains_plaintext(
+            plaintext in proptest::collection::vec(any::<u8>(), 1..=64usize),
+        ) {
+            let secret = SecretBytes::from_vec(plaintext.clone());
+            let rendered = format!("{secret:?}");
+            let exposed_len = secret.expose(<[u8]>::len);
+            prop_assert_eq!(exposed_len, plaintext.len());
+            assert_redacted(&rendered, &plaintext);
+
+            // Same guarantee through the copying constructor.
+            let copied = SecretBytes::from_bytes(&plaintext);
+            assert_redacted(&format!("{copied:?}"), &plaintext);
+        }
+
+        /// P5: arbitrary Unicode strings (including control characters,
+        /// mixed scripts, and format characters) never surface through
+        /// `Debug` in whole or in any ≥4-byte window.
+        #[test]
+        fn secret_string_debug_never_contains_plaintext(plaintext in any::<String>()) {
+            let secret = SecretString::copy_from(&plaintext);
+            let rendered = format!("{secret:?}");
+            let exposed_len = secret.expose_str(str::len);
+            prop_assert_eq!(exposed_len, plaintext.len());
+            assert_redacted(&rendered, plaintext.as_bytes());
+
+            // Same guarantee through the owning constructor.
+            let owned = SecretString::new(plaintext.clone());
+            assert_redacted(&format!("{owned:?}"), plaintext.as_bytes());
+        }
+
+        /// P5: empty and marker-shaped secrets still render exactly as the
+        /// redaction placeholder.
+        #[test]
+        fn degenerate_secrets_render_as_placeholder(
+            variant in 0usize..3,
+        ) {
+            match variant {
+                0 => assert_eq!(format!("{:?}", SecretBytes::empty()), "<redacted>"),
+                1 => assert_eq!(format!("{:?}", SecretBytes::from_vec(Vec::new())), "<redacted>"),
+                _ => assert_eq!(
+                    format!("{:?}", SecretString::copy_from("<redacted>")),
+                    "<redacted>"
+                ),
+            }
+        }
+    }
+}

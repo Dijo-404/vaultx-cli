@@ -936,3 +936,124 @@ http:
         ));
     }
 }
+
+/// Property test for plan §36 INV-009 ("Policy defaults to deny") and
+/// plan §43's default-deny posture: arbitrary requests are denied by an
+/// empty engine and by engines holding only non-candidate policies.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+    use vaultx_types::CredentialRef;
+
+    /// Content for generated IDs; first character avoids letters that
+    /// begin registered ID prefixes so typed-ID parsing stays total.
+    fn hosts() -> impl Strategy<Value = String> {
+        proptest::collection::vec("[a-z][a-z0-9]{1,7}", 1..=3usize)
+            .prop_map(|labels| labels.join("."))
+            .boxed()
+    }
+
+    fn paths() -> impl Strategy<Value = String> {
+        // Segments exclude `.` / `..` / empty so every generated context
+        // passes canonical validation; this property pins rule-level
+        // default denial, not the separate invalid-context rejection.
+        prop_oneof![
+            Just("/".to_owned()),
+            proptest::collection::vec("[a-z0-9_~-]{1,8}", 1..=3usize)
+                .prop_map(|segments| format!("/{}", segments.join("/"))),
+        ]
+    }
+
+    fn methods() -> impl Strategy<Value = HttpMethod> {
+        prop::sample::select(vec![
+            HttpMethod::GET,
+            HttpMethod::POST,
+            HttpMethod::PUT,
+            HttpMethod::PATCH,
+            HttpMethod::DELETE,
+            HttpMethod::HEAD,
+            HttpMethod::OPTIONS,
+        ])
+    }
+
+    fn request_for(host: String, method: HttpMethod, path: String) -> AuthorizationRequest {
+        AuthorizationRequest {
+            principal: Principal::parse("agent:prop-agent").unwrap(),
+            action: Action::HttpRequest,
+            resource: CredentialRef::parse("prop-token").unwrap(),
+            context: AuthorizationContext {
+                host,
+                method,
+                path,
+                query: BTreeMap::new(),
+                body_len_bytes: 0,
+                environment: None,
+            },
+        }
+    }
+
+    /// A valid document bound to a different principal than
+    /// [`request_for`] uses — never a candidate for its requests.
+    fn wrong_principal_document(host: &str) -> PolicyDocument {
+        crate::loader::parse_policy_yaml(&format!(
+            "name: prop-other-principal\n\
+             principal: session:sess_unrelated\n\
+             credential: prop-token\n\
+             http:\n\
+             \x20 hosts: [{host}]\n\
+             \x20 allow:\n\
+             \x20   - methods: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]\n\
+             \x20     paths: [\"/**\"]\n"
+        ))
+        .unwrap()
+    }
+
+    /// A valid document bound to a different credential — also never a
+    /// candidate.
+    fn wrong_credential_document(host: &str) -> PolicyDocument {
+        let mut document = wrong_principal_document(host);
+        document.principal = Principal::parse("agent:prop-agent").unwrap();
+        document.credential = CredentialRef::parse("other-token").unwrap();
+        document.name = PolicyName::parse("prop-other-credential").unwrap();
+        document
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn empty_and_mismatched_engines_default_deny_arbitrary_requests(
+            host in hosts(),
+            method in methods(),
+            path in paths(),
+            body_len in any::<u64>(),
+        ) {
+            let mut request = request_for(host.clone(), method, path);
+            request.context.body_len_bytes = body_len;
+
+            let empty = RuleEngine::new();
+            assert!(matches!(
+                empty.authorize(&request),
+                AuthorizationDecision::Deny {
+                    reason: DenyReason::NoMatchingPolicy,
+                    policy: None,
+                }
+            ));
+
+            let mismatched = RuleEngine::from_documents([
+                wrong_principal_document(&host),
+                wrong_credential_document(&host),
+            ])
+            .unwrap();
+            assert!(matches!(
+                mismatched.authorize(&request),
+                AuthorizationDecision::Deny {
+                    reason: DenyReason::NoMatchingPolicy,
+                    policy: None,
+                }
+            ));
+        }
+    }
+}

@@ -537,3 +537,322 @@ mod tests {
         assert_eq!(parse_ok("https://8.8.8.8/x").host(), "8.8.8.8");
     }
 }
+
+/// Property tests for spelling-invariance (plan §43: "denied canonical
+/// request cannot become allowed through alternate URL spelling").
+///
+/// The invariant under test is INV-005's foundation: authorization runs on
+/// exactly one canonical destination, so every alternate spelling of one
+/// logical request must collapse to the identical [`CanonicalUrl`] — and
+/// therefore to an identical policy decision, in both the deny direction
+/// (spelling cannot rescue a denied request) and the allow direction
+/// (spelling cannot flip an allow into a deny either).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::netpolicy::EgressGuard;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+    use vaultx_policy::{
+        parse_policy_yaml, Action, AuthorizationContext, AuthorizationDecision, Authorizer,
+        HttpMethod, RuleEngine,
+    };
+
+    /// DNS-style hosts: 1–3 labels of `[a-z][a-z0-9]{1,7}` — valid under
+    /// both the canonicalizer's host grammar and the policy engine's
+    /// hostname validation.
+    fn hosts() -> impl Strategy<Value = String> {
+        proptest::collection::vec("[a-z][a-z0-9]{1,7}", 1..=3usize)
+            .prop_map(|labels| labels.join("."))
+            .boxed()
+    }
+
+    fn path_segments() -> impl Strategy<Value = Vec<String>> {
+        proptest::collection::vec("[a-z0-9]{1,8}", 1..=3usize)
+            .prop_filter("needs at least one segment", |segments| {
+                !segments.is_empty()
+            })
+    }
+
+    /// Flips the case of alphabetic characters at even indices — a
+    /// spelling variant beyond plain full-uppercase.
+    fn mixed_case(host: &str) -> String {
+        host.chars()
+            .enumerate()
+            .map(|(index, c)| {
+                if index % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    /// Alternate spellings of one logical `https://{host}/{path}?{query}`
+    /// request: case variants of the host, default-port elision/addition,
+    /// fragment addition/removal, dot-segment detours (`./`, `zz/../`),
+    /// percent-escape case flips, and query presence held consistent per
+    /// generated input (`?k=` with an empty value is a *different*
+    /// resource from no query, so the two families never mix).
+    ///
+    /// The final path segment always carries `%2F`/`%2f` so escape-case
+    /// normalization is exercised on every generated input.
+    fn spellings(
+        host: &str,
+        segments: &[String],
+        query_key: &str,
+        query_value: &str,
+        escape_uppercase: bool,
+        with_query: bool,
+    ) -> Vec<String> {
+        let tail = if escape_uppercase {
+            "esc%2Fape"
+        } else {
+            "esc%2fape"
+        };
+        let mut parts: Vec<&str> = segments.iter().map(String::as_str).collect();
+        parts.push(tail);
+
+        let suffix = if with_query {
+            format!("?{query_key}={query_value}")
+        } else {
+            String::new()
+        };
+        let plain_path = format!("/{}", parts.join("/"));
+        let dotted_path = format!("/./{}", parts.join("/"));
+        let dotted_mid_path = if parts.len() > 2 {
+            format!("/{}/zz/../{}", parts[0], parts[1..].join("/"))
+        } else {
+            dotted_path.clone()
+        };
+
+        vec![
+            format!("https://{host}{plain_path}{suffix}"),
+            format!("https://{}{plain_path}{suffix}", host.to_uppercase()),
+            format!("https://{}{plain_path}{suffix}", mixed_case(host)),
+            format!("https://{host}:443{plain_path}{suffix}"),
+            format!("https://{host}{plain_path}{suffix}#anchor"),
+            format!("https://{host}{dotted_path}{suffix}"),
+            format!("https://{host}{dotted_mid_path}{suffix}"),
+        ]
+    }
+
+    /// Builds the engine-facing context from a canonical URL, mirroring
+    /// the broker transport obligation: values are taken from the
+    /// canonical form only.
+    fn context_of(url: &CanonicalUrl) -> AuthorizationContext {
+        let mut query = BTreeMap::new();
+        for (key, value) in url.query_pairs() {
+            query.insert(key, value);
+        }
+        AuthorizationContext {
+            host: url.host().to_owned(),
+            method: HttpMethod::GET,
+            path: url.path(),
+            query,
+            body_len_bytes: 0,
+            environment: None,
+        }
+    }
+
+    fn authorize_all(engine: &RuleEngine, urls: &[CanonicalUrl]) -> Vec<AuthorizationDecision> {
+        urls.iter()
+            .map(|url| {
+                engine.authorize(&vaultx_policy::AuthorizationRequest {
+                    principal: vaultx_policy::Principal::parse("agent:prop-agent").unwrap(),
+                    action: Action::HttpRequest,
+                    resource: vaultx_policy::Resource::parse("prop-token").unwrap(),
+                    context: context_of(url),
+                })
+            })
+            .collect()
+    }
+
+    fn engine_from_yaml(yaml: &str) -> RuleEngine {
+        RuleEngine::from_documents([parse_policy_yaml(yaml).unwrap()]).unwrap()
+    }
+
+    fn allowing_yaml(host: &str) -> String {
+        format!(
+            "name: prop-allow\n\
+             principal: agent:prop-agent\n\
+             credential: prop-token\n\
+             http:\n\
+             \x20 hosts: [{host}]\n\
+             \x20 allow:\n\
+             \x20   - methods: [GET]\n\
+             \x20     paths: [\"/**\"]\n"
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Every spelling of one logical request parses successfully and
+        /// collapses to the byte-identical canonical URL.
+        #[test]
+        fn alternate_spellings_share_one_canonical_url(
+            host in hosts(),
+            segments in path_segments(),
+            query_key in "[a-z]{1,5}",
+            query_value in "[a-z0-9]{1,5}",
+            escape_uppercase in prop::bool::ANY,
+            with_query in prop::bool::ANY,
+        ) {
+            let raws = spellings(&host, &segments, &query_key, &query_value, escape_uppercase, with_query);
+            let base = CanonicalUrl::parse(&raws[0]).unwrap();
+            for raw in &raws {
+                let parsed = CanonicalUrl::parse(raw)
+                    .unwrap_or_else(|err| panic!("spelling {raw} must parse: {err:?}"));
+                prop_assert_eq!(&parsed, &base);
+                prop_assert_eq!(parsed.host(), base.host());
+                prop_assert_eq!(parsed.path(), base.path());
+                prop_assert_eq!(parsed.query_pairs(), base.query_pairs());
+            }
+        }
+
+        /// Deny direction: with no policies bound at all, every spelling
+        /// yields the identical deny decision — spelling can never rescue
+        /// a denied request.
+        #[test]
+        fn denied_request_stays_denied_under_every_spelling(
+            host in hosts(),
+            segments in path_segments(),
+            query_key in "[a-z]{1,5}",
+            query_value in "[a-z0-9]{1,5}",
+            escape_uppercase in prop::bool::ANY,
+            with_query in prop::bool::ANY,
+        ) {
+            let empty = RuleEngine::new();
+            let wrong_host = engine_from_yaml(
+                "name: prop-wrong-host\n\
+                 principal: agent:prop-agent\n\
+                 credential: prop-token\n\
+                 http:\n\
+                 \x20 hosts: [denied.example]\n\
+                 \x20 allow:\n\
+                 \x20   - methods: [GET]\n\
+                 \x20     paths: [\"/**\"]\n",
+            );
+
+            let raws =
+                spellings(&host, &segments, &query_key, &query_value, escape_uppercase, with_query);
+            let urls: Vec<CanonicalUrl> = raws
+                .iter()
+                .map(|raw| CanonicalUrl::parse(raw).unwrap())
+                .collect();
+
+            for decisions in [
+                authorize_all(&empty, &urls),
+                authorize_all(&wrong_host, &urls),
+            ] {
+                let first = decisions.first().cloned().unwrap();
+                assert!(matches!(first, AuthorizationDecision::Deny { .. }));
+                for (raw, decision) in raws.iter().zip(&decisions) {
+                    prop_assert_eq!(decision, &first, "decision drifted for spelling {}", raw);
+                }
+            }
+        }
+
+        /// Allow direction: when policy allows the canonical request,
+        /// every spelling produces the identical allow — normalization
+        /// never silently turns an allow into a deny either.
+        #[test]
+        fn allowed_request_stays_allowed_under_every_spelling(
+            host in hosts(),
+            segments in path_segments(),
+            query_key in "[a-z]{1,5}",
+            query_value in "[a-z0-9]{1,5}",
+            escape_uppercase in prop::bool::ANY,
+            with_query in prop::bool::ANY,
+        ) {
+            let engine = engine_from_yaml(&allowing_yaml(&host));
+
+            let raws =
+                spellings(&host, &segments, &query_key, &query_value, escape_uppercase, with_query);
+            let urls: Vec<CanonicalUrl> = raws
+                .iter()
+                .map(|raw| CanonicalUrl::parse(raw).unwrap())
+                .collect();
+
+            let decisions = authorize_all(&engine, &urls);
+            let first = decisions.first().cloned().unwrap();
+            assert!(matches!(
+                first,
+                AuthorizationDecision::Allow { .. }
+            ));
+            for (raw, decision) in raws.iter().zip(&decisions) {
+                prop_assert_eq!(decision, &first, "decision drifted for spelling {}", raw);
+            }
+
+            // Explicit-deny policies also bind on the canonical form only:
+            // a GET deny rule denies all spellings identically even while
+            // an allow rule exists in the same document.
+            let denying_yaml = format!(
+                "name: prop-deny\n\
+                 principal: agent:prop-agent\n\
+                 credential: prop-token\n\
+                 http:\n\
+                 \x20 hosts: [{host}]\n\
+                 \x20 allow:\n\
+                 \x20   - methods: [POST]\n\
+                 \x20     paths: [\"/**\"]\n\
+                 \x20 deny:\n\
+                 \x20   - methods: [GET]\n\
+                 \x20     paths: [\"/**\"]\n"
+            );
+            let denier = engine_from_yaml(&denying_yaml);
+            let decisions = authorize_all(&denier, &urls);
+            let first = decisions.first().cloned().unwrap();
+            assert!(matches!(
+                first,
+                AuthorizationDecision::Deny { reason: vaultx_policy::DenyReason::ExplicitDeny, .. }
+            ));
+            for (raw, decision) in raws.iter().zip(&decisions) {
+                prop_assert_eq!(decision, &first, "deny drifted for spelling {}", raw);
+            }
+        }
+
+        /// Egress classification is computed after WHATWG IPv4
+        /// normalization: decimal, hex (both cases), and partial-quad
+        /// integer host spellings all canonicalize to the same dotted
+        /// quad and therefore classify identically — a denied private
+        /// address cannot become allowed through numeric respelling.
+        #[test]
+        fn numeric_host_spellings_classify_identically(address in any::<u32>()) {
+            let octets = address.to_be_bytes();
+            let dotted = format!(
+                "{}.{}.{}.{}",
+                octets[0], octets[1], octets[2], octets[3]
+            );
+            // Last component fills the remaining octets (WHATWG rule), so
+            // `{a}.{b}.{c*256+d}` denotes the same address.
+            let remainder = u16::from_be_bytes([octets[2], octets[3]]);
+            let spellings = [
+                dotted.clone(),
+                address.to_string(),
+                format!("0x{address:x}"),
+                format!("0X{address:X}"),
+                format!("{}.{}.{}", octets[0], octets[1], remainder),
+            ];
+
+            let guard = EgressGuard::new(false);
+            let mut outcomes: Vec<Result<String, String>> = Vec::new();
+            for spelling in &spellings {
+                let url = CanonicalUrl::parse(&format!("https://{spelling}/p"))
+                    .unwrap_or_else(|err| panic!("spelling {spelling} must parse: {err:?}"));
+                prop_assert_eq!(url.host(), dotted.as_str());
+                outcomes.push(
+                    guard
+                        .check_host(url.host())
+                        .map(|class| class.to_string())
+                        .map_err(|err| err.to_string()),
+                );
+            }
+            for outcome in &outcomes {
+                prop_assert_eq!(outcome, &outcomes[0]);
+            }
+        }
+    }
+}

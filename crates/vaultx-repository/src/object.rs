@@ -227,3 +227,88 @@ mod tests {
         assert_eq!(envelope.decode_payload::<Inner>().unwrap(), inner);
     }
 }
+
+/// Property tests for canonical encoding and content addressing
+/// (plan §43: `decode(encode(x)) == x`, "hash canonicalization is
+/// stable").
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn any_object_type() -> impl Strategy<Value = ObjectType> {
+        prop_oneof![
+            Just(ObjectType::ConfigValue),
+            Just(ObjectType::Manifest),
+            Just(ObjectType::Commit),
+            Just(ObjectType::Policy),
+            Just(ObjectType::PolicyPackReference),
+            Just(ObjectType::EnvironmentDefinition),
+            Just(ObjectType::SecretRevisionMetadata),
+        ]
+    }
+
+    proptest! {
+        /// P1: every envelope — arbitrary payloads across all seven
+        /// categories — survives encode → decode with byte-exact payload
+        /// and identical re-encoded canonical bytes.
+        #[test]
+        fn envelope_round_trips_through_canonical_bytes(
+            kind in any_object_type(),
+            payload in proptest::collection::vec(any::<u8>(), 0..=512usize),
+        ) {
+            let envelope = ObjectEnvelope::new(kind, payload);
+            let bytes = envelope.canonical_bytes().unwrap();
+            let decoded: ObjectEnvelope = serde_json::from_slice(&bytes).unwrap();
+
+            prop_assert_eq!(&decoded.object_type, &envelope.object_type);
+            prop_assert_eq!(&decoded.format, &envelope.format);
+            prop_assert_eq!(&decoded.payload, &envelope.payload);
+            prop_assert_eq!(&decoded, &envelope);
+
+            // The canonical form is a fixed point of its own decoder.
+            prop_assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+        }
+
+        /// P2: independently constructed instances of the same logical
+        /// envelope always hash to the same digest and object ID.
+        #[test]
+        fn hash_and_object_id_are_stable_across_fresh_instances(
+            kind in any_object_type(),
+            payload in proptest::collection::vec(any::<u8>(), 0..=512usize),
+        ) {
+            let first = ObjectEnvelope::new(kind, payload.clone());
+            let second = ObjectEnvelope::new(kind, payload);
+
+            let bytes_first = first.canonical_bytes().unwrap();
+            let bytes_second = second.canonical_bytes().unwrap();
+            prop_assert_eq!(
+                hash_canonical(&bytes_first),
+                hash_canonical(&bytes_second)
+            );
+            prop_assert_eq!(
+                object_id(&bytes_first).unwrap(),
+                object_id(&bytes_second).unwrap()
+            );
+        }
+
+        /// Sanity direction of P2: distinct content must not collide on
+        /// IDs (256 random pairs; SHA-256 makes accidental collision a
+        /// non-event while still catching encoding bugs that merge
+        /// different payloads).
+        #[test]
+        fn distinct_envelopes_hash_differently(
+            kind_a in any_object_type(),
+            kind_b in any_object_type(),
+            payload_a in proptest::collection::vec(any::<u8>(), 1..=512usize),
+            payload_b in proptest::collection::vec(any::<u8>(), 1..=512usize),
+        ) {
+            prop_assume!(payload_a != payload_b);
+            let id = |kind: ObjectType, payload: &[u8]| {
+                object_id(&ObjectEnvelope::new(kind, payload.to_vec()).canonical_bytes().unwrap())
+                    .unwrap()
+            };
+            prop_assert_ne!(id(kind_a, &payload_a), id(kind_b, &payload_b));
+        }
+    }
+}

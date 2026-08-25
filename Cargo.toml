@@ -41,6 +41,8 @@ url = "2"
 
 # Test-only utilities shared across member crates.
 tempfile = "3"
+# Property-based testing (plan §43 properties); fuzz targets are separate.
+proptest = "1"
 
 # Crypto primitives used by `vaultx-crypto`. RNG strategy is pinned to
 # `rand_core` 0.6 + `getrandom` (the version expected by aes-gcm 0.10 and

@@ -15,4 +15,5 @@ vaultx-crypto = { path = "../vaultx-crypto" }
 vaultx-types = { path = "../vaultx-types" }
 
 [dev-dependencies]
+proptest = { workspace = true }
 tempfile = { workspace = true }

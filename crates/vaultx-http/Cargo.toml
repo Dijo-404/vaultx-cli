@@ -9,3 +9,10 @@ publish.workspace = true
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+# Dev-only: property tests assert that policy decisions are computed on
+# the canonical URL form, so spelling variants can never flip a decision
+# (plan §43). No runtime dependency in either direction.
+proptest = { workspace = true }
+vaultx-policy = { path = "../vaultx-policy" }
