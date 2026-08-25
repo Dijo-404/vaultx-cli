@@ -48,7 +48,7 @@ impl VaultCredentialSource {
         &self,
         credential: &CredentialRef,
         environment: &EnvironmentId,
-    ) -> Result<crate::secrets::SecretMetadata, BrokerError> {
+    ) -> Result<(String, crate::secrets::SecretMetadata), BrokerError> {
         let unknown = || BrokerError::UnknownCredential(credential.to_string());
         let secrets = SecretService::new(self.ctx.as_ref());
         for entry in secrets
@@ -70,7 +70,7 @@ impl VaultCredentialSource {
                 continue;
             };
             if binding.credential_ref == *credential {
-                return Ok(metadata);
+                return Ok((entry.name.to_string(), metadata));
             }
         }
         Err(unknown())
@@ -107,7 +107,7 @@ impl CredentialSource for VaultCredentialSource {
         credential: &CredentialRef,
         environment: &EnvironmentId,
     ) -> Result<InjectionTemplateId, BrokerError> {
-        let metadata = self.lookup(credential, environment)?;
+        let (_, metadata) = self.lookup(credential, environment)?;
         metadata
             .brokered
             .map(|binding| to_broker_template(binding.injection))
@@ -125,7 +125,7 @@ impl CredentialSource for VaultCredentialSource {
             .map_err(|_| BrokerError::UnknownCredential(credential.to_string()))?;
         for summary in environments {
             if let Ok(environment) = EnvironmentId::parse(&format!("env_{}", summary.name)) {
-                if let Ok(metadata) = self.lookup(credential, &environment) {
+                if let Ok((_, metadata)) = self.lookup(credential, &environment) {
                     if let Some(binding) = metadata.brokered {
                         return Ok(to_broker_template(binding.injection));
                     }
@@ -140,13 +140,16 @@ impl CredentialSource for VaultCredentialSource {
         credential: &CredentialRef,
         environment: &EnvironmentId,
     ) -> Result<SecretBytes, BrokerError> {
-        self.lookup(credential, environment)?;
+        // The binding's logical ref (`github_token`) is not the vault
+        // entry name (`GITHUB_TOKEN`); reveal must target the stored
+        // name, never the requested ref.
+        let (secret_name, _) = self.lookup(credential, environment)?;
         // Reveal happens only after the binding matched; any failure
         // collapses to the same unknown-credential denial so callers
         // cannot probe which step failed.
         let secrets = SecretService::new(self.ctx.as_ref());
         let plaintext = secrets
-            .reveal_secret(&credential.to_string(), Self::bare_env(environment))
+            .reveal_secret(&secret_name, Self::bare_env(environment))
             .map_err(|_| BrokerError::UnknownCredential(credential.to_string()))?;
         Ok(SecretBytes::from_bytes(plaintext.as_slice()))
     }
@@ -216,4 +219,53 @@ pub fn build_production_engine(ctx: &StdArc<ProjectContext>) -> CoreResult<Broke
             .map_err(|_| CoreError::Io(std::io::Error::other("invalid local project id")))?,
         egress_allow_private: false,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::{BrokeredBinding, SecretService};
+    use vaultx_crypto::secret::SecretString;
+    use vaultx_types::model::{InjectionTemplateId as ModelTemplate, VariableKind};
+    use vaultx_types::ProviderName;
+
+    /// Mirrors the real CLI flow: `vaultx secret set GITHUB_TOKEN
+    /// --brokered` stores the secret under the uppercase variable name
+    /// while the binding's logical ref is the lowercase form. Resolution
+    /// through [`VaultCredentialSource`] must decrypt the stored name,
+    /// not re-derive a vault entry from the ref (regression for the E2E
+    /// `credential_unavailable` denial).
+    #[test]
+    fn resolves_brokered_secret_by_binding_ref_not_entry_name() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ProjectContext::init(project_dir.path()).unwrap());
+        let secrets = SecretService::new(ctx.as_ref());
+        drop(store_dir);
+        secrets
+            .set_secret(
+                "GITHUB_TOKEN",
+                &SecretString::copy_from("cli-flow-canary"),
+                VariableKind::Brokered,
+                "development",
+                Some(BrokeredBinding {
+                    credential_ref: CredentialRef::parse("github_token").unwrap(),
+                    injection: ModelTemplate::GithubBearer,
+                    provider_hint: Some(ProviderName::parse("github").unwrap()),
+                }),
+            )
+            .unwrap();
+
+        let source = VaultCredentialSource::new(Arc::clone(&ctx));
+        let credential = CredentialRef::parse("github_token").unwrap();
+        let environment = EnvironmentId::parse("env_development").unwrap();
+
+        let template = source
+            .template_for_in_env(&credential, &environment)
+            .unwrap();
+        assert_eq!(template, InjectionTemplateId::GithubBearer);
+
+        let resolved = source.resolve(&credential, &environment).unwrap();
+        assert_eq!(resolved.expose(|b| b.to_vec()), b"cli-flow-canary");
+    }
 }

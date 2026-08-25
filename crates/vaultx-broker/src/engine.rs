@@ -510,8 +510,15 @@ impl BrokerEngine {
         // Authorization identity is the *agent* principal carried by the
         // validated session record, not the session id: policies are
         // authored against agent identities (plan §23) and the session
-        // proves possession of the agent's identity.
-        let actor = Principal::parse(&format!("agent:{}", record.agent))
+        // proves possession of the agent's identity. Session records store
+        // the prefixed `AgentId` (`agent_<name>`); policy principals are
+        // `agent:<bare-name>`, so strip the registration prefix here.
+        let bare_agent = record
+            .agent
+            .as_str()
+            .strip_prefix("agent_")
+            .unwrap_or(record.agent.as_str());
+        let actor = Principal::parse(&format!("agent:{bare_agent}"))
             .expect("agent principals always parse");
         let environment = record.environment;
 
@@ -897,7 +904,12 @@ mod tests {
                 &EnvironmentId::parse("env_development").unwrap(),
             )
             .expect("session created");
-        let principal = format!("agent:{FIXTURE_AGENT_ID}");
+        let principal = format!(
+            "agent:{}",
+            FIXTURE_AGENT_ID
+                .strip_prefix("agent_")
+                .unwrap_or(FIXTURE_AGENT_ID)
+        );
         let documents = [
             ("coding-agent-github", "github-work-token"),
             ("ghost-cred-policy", "ghost-token"),
@@ -1031,7 +1043,15 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.decision, AuditDecision::Allow);
-        assert_eq!(event.actor.as_str(), &format!("agent:{FIXTURE_AGENT_ID}"));
+        assert_eq!(
+            event.actor.as_str(),
+            &format!(
+                "agent:{}",
+                FIXTURE_AGENT_ID
+                    .strip_prefix("agent_")
+                    .unwrap_or(FIXTURE_AGENT_ID)
+            )
+        );
         let destination = event.destination.as_ref().expect("destination recorded");
         assert_eq!(destination.host(), "api.github.com");
         assert_eq!(destination.port(), 443);
@@ -1235,7 +1255,12 @@ mod tests {
         let lax = standard_fixture(happy_transport(), true);
         let mut doc = parse_policy_yaml(&policy_yaml(
             "private-host-agent",
-            &format!("agent:{FIXTURE_AGENT_ID}"),
+            &format!(
+                "agent:{}",
+                FIXTURE_AGENT_ID
+                    .strip_prefix("agent_")
+                    .unwrap_or(FIXTURE_AGENT_ID)
+            ),
             "github-work-token",
         ))
         .unwrap();
@@ -1244,7 +1269,12 @@ mod tests {
         engine_docs.push(
             parse_policy_yaml(&policy_yaml(
                 "coding-agent-github",
-                &format!("agent:{FIXTURE_AGENT_ID}"),
+                &format!(
+                    "agent:{}",
+                    FIXTURE_AGENT_ID
+                        .strip_prefix("agent_")
+                        .unwrap_or(FIXTURE_AGENT_ID)
+                ),
                 "github-work-token",
             ))
             .unwrap(),
@@ -1504,10 +1534,18 @@ mod tests {
             capability_hint: None,
         };
 
-        // Matching principal: allowed end-to-end.
-        let (engine, token, _dir) = build("agent:agent_test_agent");
+        // Matching principal: allowed end-to-end. Session records carry the
+        // prefixed `AgentId`; policies are authored against the bare name
+        // (`agent:<name>` per plan §23), which the engine derives.
+        let (engine, token, _dir) = build("agent:test_agent");
         let response = engine.execute_broker_request(request_for(&token));
         assert_eq!(response.decision, Decision::Allow);
+
+        // The raw prefixed id must NOT leak into principal matching.
+        let (engine, token, _dir) = build("agent:agent_test_agent");
+        let response = engine.execute_broker_request(request_for(&token));
+        let (reason, _) = deny_reason(&response);
+        assert_eq!(reason, "no_matching_policy");
 
         // Mismatched principal: silently default-denied by policy.
         let (engine, token, _dir) = build("agent:mismatch");
@@ -1726,7 +1764,12 @@ mod tests {
             .unwrap();
         let document = parse_policy_yaml(&policy_yaml(
             "coding-agent-github",
-            &format!("agent:{FIXTURE_AGENT_ID}"),
+            &format!(
+                "agent:{}",
+                FIXTURE_AGENT_ID
+                    .strip_prefix("agent_")
+                    .unwrap_or(FIXTURE_AGENT_ID)
+            ),
             "github-work-token",
         ))
         .unwrap();
@@ -1794,7 +1837,12 @@ mod tests {
             .unwrap();
         let document = parse_policy_yaml(&policy_yaml(
             "coding-agent-github",
-            &format!("agent:{FIXTURE_AGENT_ID}"),
+            &format!(
+                "agent:{}",
+                FIXTURE_AGENT_ID
+                    .strip_prefix("agent_")
+                    .unwrap_or(FIXTURE_AGENT_ID)
+            ),
             "github-work-token",
         ))
         .unwrap();
