@@ -248,7 +248,7 @@ fn load_session() -> Result<StoredSession, CliError> {
 fn store_session(session: &StoredSession) -> Result<(), CliError> {
     let json = serde_json::to_string(session)
         .map_err(|_| runtime_message("session serialization failed"))?;
-    write_atomic(&session_path(), &json)
+    write_private(&session_path(), &json)
 }
 
 fn load_remote_config(vault_dir: &Path) -> Result<RemoteConfig, CliError> {
@@ -720,15 +720,14 @@ pub(crate) fn normalize_server(raw: &str) -> Result<String, CliError> {
     if let Some(rest) = trimmed.strip_prefix("http://") {
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..authority_end];
-        // Bracketed IPv6 keeps its colons; strip them for classification.
-        let host = authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, _port)| host);
-        let host = host
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host)
-            .to_ascii_lowercase();
+        // Bracketed IPv6 keeps its colons; take the inside of the
+        // brackets. Bare hosts drop a `:port` suffix.
+        let host = if let Some(rest) = authority.strip_prefix('[') {
+            rest.split_once(']').map_or(rest, |(h, _)| h)
+        } else {
+            authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+        };
+        let host = host.to_ascii_lowercase();
         let loopback = host == "localhost"
             || host
                 .parse::<std::net::IpAddr>()
