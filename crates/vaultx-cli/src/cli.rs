@@ -550,6 +550,34 @@ pub enum AgentCommand {
         /// Full session id to revoke.
         session_id: String,
     },
+    /// Delegate a narrower capability from a live session (plan §25).
+    ///
+    /// The child inherits the parent's agent and environment and can
+    /// never exceed the parent's effective authority: every given flag
+    /// narrows further, and constraints intersect monotonically across
+    /// delegation chains. Revoking (or expiring) the parent invalidates
+    /// every descendant at validation time. At least one narrowing flag
+    /// is required — a delegation that narrows nothing is rejected.
+    Delegate {
+        /// Parent session id (`sess_...`) or its capability token.
+        session_id: String,
+        /// Restrict the child to these credential names (repeatable).
+        #[arg(long = "credential", value_name = "NAME")]
+        credentials: Vec<String>,
+        /// Restrict the child to these hosts, exact match (repeatable).
+        #[arg(long = "host", value_name = "HOST")]
+        hosts: Vec<String>,
+        /// Restrict the child to these HTTP methods (repeatable).
+        #[arg(long = "method", value_name = "METHOD")]
+        methods: Vec<String>,
+        /// Restrict the child to these path globs, e.g. `/repos/**`
+        /// (repeatable; `*` = one segment, trailing `**` = rest).
+        #[arg(long = "path", value_name = "GLOB")]
+        paths: Vec<String>,
+        /// Cap total allowed brokered requests for the child.
+        #[arg(long = "max-requests", value_name = "N")]
+        max_requests: Option<u64>,
+    },
     /// Run a command in a sanitized brokered environment for one agent
     /// (plan §17).
     ///
@@ -859,6 +887,24 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             AgentCommand::Revoke { session_id } => {
                 with_open(&cli.project, |s| cmd_agent_session_revoke(s, session_id))
             }
+            AgentCommand::Delegate {
+                session_id,
+                credentials,
+                hosts,
+                methods,
+                paths,
+                max_requests,
+            } => with_open(&cli.project, |s| {
+                cmd_agent_delegate(
+                    s,
+                    session_id,
+                    credentials,
+                    hosts,
+                    methods,
+                    paths,
+                    *max_requests,
+                )
+            }),
             AgentCommand::Run {
                 name,
                 env,
@@ -1852,6 +1898,76 @@ fn cmd_agent_session_revoke(
             other => CliError::Runtime(CoreError::Io(std::io::Error::other(other.to_string()))),
         })?;
     Ok(format!("revoked {id}"))
+}
+
+/// Mints a delegated child session from a live parent (plan §25).
+///
+/// The parent is located by id or raw capability token; the CLI requires
+/// at least one narrowing flag so delegation can never grow a pointless
+/// unconstrained chain. Path globs are validated up front so a typo dies
+/// as a usage error instead of a silently-never-matching constraint. The
+/// child token prints exactly once with the same warning wording as
+/// `agent session create` and is never echoed anywhere else.
+fn cmd_agent_delegate(
+    services: &VaultxServices,
+    session_id: &str,
+    credentials: &[String],
+    hosts: &[String],
+    methods: &[String],
+    paths: &[String],
+    max_requests: Option<u64>,
+) -> Result<String, CliError> {
+    if credentials.is_empty()
+        && hosts.is_empty()
+        && methods.is_empty()
+        && paths.is_empty()
+        && max_requests.is_none()
+    {
+        return Err(CliError::Usage(
+            "delegation must narrow at least one dimension; pass \
+             --credential/--host/--method/--path/--max-requests"
+                .into(),
+        ));
+    }
+    for pattern in paths {
+        if vaultx_policy::validate_pattern(pattern).is_err() {
+            return Err(CliError::Usage(format!("invalid path glob `{pattern}`")));
+        }
+    }
+
+    let to_set = |items: &[String]| -> Option<std::collections::BTreeSet<String>> {
+        if items.is_empty() {
+            None
+        } else {
+            Some(items.iter().cloned().collect())
+        }
+    };
+    let constraints = vaultx_broker::SessionConstraints {
+        credentials: to_set(credentials),
+        environments: None,
+        hosts: to_set(hosts),
+        methods: to_set(methods),
+        paths: (!paths.is_empty()).then(|| paths.to_vec()),
+        remaining_requests: max_requests,
+    };
+
+    let parent_id = vaultx_types::SessionId::parse(session_id).ok();
+    let parent = match &parent_id {
+        Some(id) => vaultx_broker::DelegationParent::Id(id),
+        None => vaultx_broker::DelegationParent::Token(session_id),
+    };
+    let (child_id, raw_token) = open_session_store(services)?
+        .delegate(parent, &constraints)
+        .map_err(|err| match err {
+            vaultx_broker::BrokerError::InvalidSession => {
+                CliError::Usage(format!("no such live session `{session_id}`"))
+            }
+            other => CliError::Runtime(CoreError::Io(std::io::Error::other(other.to_string()))),
+        })?;
+
+    Ok(format!(
+        "created delegated session {child_id}\n\nCAPABILITY TOKEN (shown once; it cannot be recovered):\n{raw_token}"
+    ))
 }
 
 /// Project id every local service binds to; mirrors

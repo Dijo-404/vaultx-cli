@@ -3759,3 +3759,257 @@ fn run_requires_command_after_double_dash() {
     );
     assert_eq!(err.exit_code(), 1);
 }
+
+// -- agent delegation (plan §25) ----------------------------------------------
+
+#[test]
+fn delegation_mints_scoped_child_enforced_by_broker_and_prints_token_once() {
+    use std::sync::Arc;
+
+    use vaultx_audit::JsonlAppendStore;
+    use vaultx_broker::{
+        BrokerDependencies, BrokerEngine, BrokerService, CredentialMetadata, ExecutedResponse,
+        FileSessionStore, InMemoryCredentialSource, InjectorRegistry, SessionStore as _,
+        TransportExecutor,
+    };
+    use vaultx_crypto::secret::SecretBytes;
+    use vaultx_policy::{parse_policy_yaml, RuleEngine};
+    use vaultx_types::{AgentId, CredentialRef, ProjectId};
+
+    struct StaticTransport(ExecutedResponse);
+    impl TransportExecutor for StaticTransport {
+        fn execute(
+            &self,
+            _outbound: &vaultx_broker::OutboundRequest,
+        ) -> Result<ExecutedResponse, vaultx_broker::BrokerError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Create {
+                name: "ci-bot".into(),
+            },
+        },
+    ))
+    .unwrap();
+    let created = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::SessionCreate {
+                name: "ci-bot".into(),
+                env: None,
+                ttl_secs: None,
+            },
+        },
+    ))
+    .unwrap();
+    let parent_id = created
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("created session ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("session id printed")
+        .to_owned();
+
+    // Delegate: at least one narrowing flag is mandatory.
+    let err = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Delegate {
+                session_id: parent_id.clone(),
+                credentials: Vec::new(),
+                hosts: Vec::new(),
+                methods: Vec::new(),
+                paths: Vec::new(),
+                max_requests: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("narrow at least one dimension")),
+        "{err:?}"
+    );
+
+    // Malformed path globs die as usage errors, not silent constraints.
+    let err = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Delegate {
+                session_id: parent_id.clone(),
+                credentials: Vec::new(),
+                hosts: Vec::new(),
+                methods: Vec::new(),
+                paths: vec!["/repos/../escape".into()],
+                max_requests: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("invalid path glob")),
+        "{err:?}"
+    );
+
+    // Unknown parents are refused without minting anything.
+    let err = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Delegate {
+                session_id: "sess_missing0000000000000000000000".into(),
+                credentials: vec!["c".into()],
+                hosts: Vec::new(),
+                methods: Vec::new(),
+                paths: Vec::new(),
+                max_requests: None,
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("no such live session")),
+        "{err:?}"
+    );
+
+    let out = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Delegate {
+                session_id: parent_id.clone(),
+                credentials: vec!["github-work-token".into()],
+                hosts: vec!["api.github.com".into()],
+                methods: vec!["GET".into()],
+                paths: vec!["/repos/acme/ok/**".into()],
+                max_requests: Some(5),
+            },
+        },
+    ))
+    .unwrap();
+    assert!(
+        out.contains("CAPABILITY TOKEN (shown once; it cannot be recovered):"),
+        "{out}"
+    );
+    let child_token = out.lines().last().unwrap().trim().to_owned();
+    assert_eq!(
+        out.matches(child_token.as_str()).count(),
+        1,
+        "token printed exactly once"
+    );
+
+    // Later CLI output never re-echoes the capability token.
+    let listing = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::SessionsList {
+                name: "ci-bot".into(),
+            },
+        },
+    ))
+    .unwrap();
+    assert!(listing.contains("sess_"), "{listing}");
+    assert!(
+        !listing.contains(child_token.as_str()),
+        "token leaked via sessions list"
+    );
+
+    // Broker enforcement against the same on-disk session store.
+    let sessions =
+        Arc::new(FileSessionStore::open(root.join(".vaultx").join("sessions.json")).unwrap());
+    let credentials = InMemoryCredentialSource::new();
+    credentials.insert(
+        CredentialRef::parse("github-work-token").unwrap(),
+        SecretBytes::from_bytes(b"CANARY_CLI_DELEGATION_7f3"),
+        vaultx_broker::InjectionTemplateId::GithubBearer,
+        CredentialMetadata::default(),
+    );
+    let document = parse_policy_yaml(
+        "name: ci-bot-github\n\
+         principal: \"agent:ci-bot\"\n\
+         credential: github-work-token\n\
+         http:\n  \
+         hosts: [api.github.com]\n  \
+         allow:\n    - methods: [GET]\n      paths: [/repos/acme/**]\n",
+    )
+    .unwrap();
+    let engine = BrokerEngine::new(BrokerDependencies {
+        authorizer: Arc::new(RuleEngine::from_documents([document]).unwrap()),
+        sessions,
+        credentials: Arc::new(credentials),
+        injectors: Arc::new(InjectorRegistry::new()),
+        transport: Arc::new(StaticTransport(ExecutedResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+        })),
+        audit: Arc::new(JsonlAppendStore::open(root.join("audit-cli.jsonl"))),
+        project: ProjectId::parse("proj_local").unwrap(),
+        egress_allow_private: false,
+    });
+
+    let request_for = |token: &str, url: &str| vaultx_broker::BrokerRequest {
+        protocol: vaultx_broker::PROTOCOL_VERSION,
+        session_token: token.to_owned(),
+        credential: CredentialRef::parse("github-work-token").unwrap(),
+        method: vaultx_policy::HttpMethod::GET,
+        url: url.to_owned(),
+        headers: Vec::new(),
+        body: vaultx_broker::BrokerBody::None,
+        capability_hint: None,
+    };
+
+    let in_scope = request_for(&child_token, "https://api.github.com/repos/acme/ok");
+    assert_eq!(
+        engine.execute_broker_request(in_scope).decision,
+        vaultx_broker::Decision::Allow
+    );
+
+    let out_of_scope = request_for(&child_token, "https://api.github.com/repos/acme/other");
+    let response = engine.execute_broker_request(out_of_scope);
+    assert!(matches!(
+        &response.decision,
+        vaultx_broker::Decision::Deny { reason, .. } if reason == "outside_delegation"
+    ));
+
+    // The parent's own token still covers the path the child cannot reach:
+    // attenuation narrowed the child, never the parent.
+    let parent_record_store =
+        FileSessionStore::open(root.join(".vaultx").join("sessions.json")).unwrap();
+    let records = parent_record_store
+        .list_for_agent(&AgentId::parse("agent_ci-bot").unwrap())
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    let delegated = records
+        .iter()
+        .find(|record| record.constraints.is_some())
+        .expect("delegated child listed");
+    assert_eq!(
+        delegated.constraints.as_ref().unwrap().remaining_requests,
+        Some(4),
+        "the allowed request consumed exactly one budget unit"
+    );
+    assert!(delegated.parent_session.is_some());
+
+    // Revoking the parent through the CLI invalidates the child at once.
+    dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Revoke {
+                session_id: parent_id.clone(),
+            },
+        },
+    ))
+    .unwrap();
+    let after_revoke = request_for(&child_token, "https://api.github.com/repos/acme/ok");
+    assert!(matches!(
+        engine.execute_broker_request(after_revoke).decision,
+        vaultx_broker::Decision::Deny { ref reason, .. } if reason == "session_revoked"
+    ));
+}

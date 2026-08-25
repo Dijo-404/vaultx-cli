@@ -8,6 +8,8 @@
 //!  3. canonicalize URL              → deny "invalid_destination"
 //!  4. DNS/network policy (literal)  → deny "destination_denied"
 //!  5. authorization                 → policy Deny { reason, policy }
+//! 5b. delegation attenuation         → deny "outside_delegation" /
+//!                                        "budget_exhausted" (plan §25)
 //!  6. resolve credential            → deny "credential_unavailable"
 //!     (template + metadata + plaintext, decrypted in memory only)
 //!  7. strip caller sensitive headers (INV-004), inject auth material
@@ -584,6 +586,73 @@ impl BrokerEngine {
                     );
                 }
             };
+
+        // Stage 5b — delegation attenuation (plan §25). Defense in depth
+        // *after* policy authorization: the session's own constraint set
+        // can only further narrow what this token may touch, never widen
+        // it (`child effective authority ⊆ parent effective authority`).
+        // Delegation denials carry no policy attribution because no
+        // policy decided them; they are recorded through the same
+        // http-request deny event with `stage.reason`.
+        if let Some(constraints) = &record.constraints {
+            if constraints
+                .check_request(
+                    req.credential.as_str(),
+                    environment.as_str(),
+                    canonical.host(),
+                    req.method.as_str(),
+                    &canonical.path(),
+                )
+                .is_err()
+            {
+                return self.deny(
+                    request_id,
+                    &correlation_id,
+                    actor,
+                    Some(environment),
+                    Some(req.credential),
+                    destination,
+                    capability,
+                    req.method.as_str(),
+                    "outside_delegation",
+                    None,
+                );
+            }
+        }
+        match self.sessions.consume_budget(&req.session_token) {
+            Ok(()) => {}
+            Err(BrokerError::BudgetExhausted) => {
+                return self.deny(
+                    request_id,
+                    &correlation_id,
+                    actor,
+                    Some(environment),
+                    Some(req.credential),
+                    destination,
+                    capability,
+                    req.method.as_str(),
+                    "budget_exhausted",
+                    None,
+                );
+            }
+            // A storage failure during the decrement must not let an
+            // unaccounted request through: fail closed with a distinct
+            // broker-level reason.
+            Err(_) => {
+                return self.deny(
+                    request_id,
+                    &correlation_id,
+                    actor,
+                    Some(environment),
+                    Some(req.credential),
+                    destination,
+                    capability,
+                    req.method.as_str(),
+                    "budget_check_failed",
+                    None,
+                );
+            }
+        }
 
         // Stage 6 — resolve credential (template, metadata, plaintext).
         let (template, metadata, secret) =
@@ -1608,11 +1677,15 @@ mod tests {
 
     impl Fixture {
         fn captured_empty(&self) -> bool {
+            self.captured_len() == 0
+        }
+
+        fn captured_len(&self) -> usize {
             self.transport
                 .captured
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
+                .len()
         }
     }
 
@@ -1885,5 +1958,155 @@ mod tests {
     #[test]
     fn max_response_body_constant_is_one_mebibyte() {
         assert_eq!(MAX_RESPONSE_BODY_BYTES, 1_048_576);
+    }
+
+    // -- delegation enforcement (plan §25) --------------------------------------
+
+    use crate::session::{DelegationParent, SessionConstraints};
+
+    fn delegate_from_fixture(
+        fixture: &Fixture,
+        constraints: SessionConstraints,
+    ) -> (SessionId, String) {
+        fixture
+            .sessions
+            .delegate(DelegationParent::Id(&fixture.session_id), &constraints)
+            .expect("delegation succeeds from the live fixture session")
+    }
+
+    fn path_scoped_constraints(patterns: &[&str]) -> SessionConstraints {
+        SessionConstraints {
+            paths: Some(patterns.iter().map(|p| (*p).to_owned()).collect()),
+            ..SessionConstraints::default()
+        }
+    }
+
+    #[test]
+    fn delegated_child_is_allowed_in_scope_and_denied_outside_delegation() {
+        let fixture = standard_fixture(happy_transport(), false);
+        let (_child_id, child_token) = delegate_from_fixture(
+            &fixture,
+            path_scoped_constraints(&["/repos/acme/backend/issues/**"]),
+        );
+
+        // In scope: policy allows /repos/acme/backend/** and the child's
+        // narrower issues/** glob matches this path.
+        let mut allowed = broker_request(&fixture);
+        allowed.session_token = child_token.clone();
+        let response = fixture.engine.execute_broker_request(allowed);
+        assert_eq!(response.decision, Decision::Allow);
+        let executions_after_allow = fixture.captured_len();
+
+        // Out of scope along a dimension policy itself permits: this URL
+        // passes the /repos/acme/backend/** allow rule but misses the
+        // child's glob, so attenuation — not policy — denies it.
+        let mut outside = broker_request(&fixture);
+        outside.session_token = child_token.clone();
+        outside.url = "https://api.github.com/repos/acme/backend/pulls".to_owned();
+        let response = fixture.engine.execute_broker_request(outside);
+        let (reason, policy) = deny_reason(&response);
+        assert_eq!(reason, "outside_delegation");
+        assert_eq!(policy, None, "no policy decided an attenuated denial");
+        assert_eq!(
+            fixture.captured_len(),
+            executions_after_allow,
+            "attenuated requests never execute"
+        );
+
+        // The deny is audited like any other brokered outcome.
+        let events = audit_events(&fixture);
+        assert!(matches!(
+            events.last().unwrap().decision,
+            AuditDecision::Deny { ref reason } if reason == "outside_delegation"
+        ));
+    }
+
+    #[test]
+    fn credential_narrowing_denies_other_credentials_before_resolution() {
+        let fixture = standard_fixture(happy_transport(), false);
+        let constraints = SessionConstraints {
+            credentials: Some(std::collections::BTreeSet::from([
+                "github-work-token".to_owned()
+            ])),
+            ..SessionConstraints::default()
+        };
+        let (_, child_token) = delegate_from_fixture(&fixture, constraints);
+
+        // `sigv4-token` passes its own policy (sigv4-agent allows this
+        // host/method/path) but is outside the child's credential set:
+        // the delegation gate must deny before credential resolution
+        // would surface template_unsupported.
+        let mut request = broker_request(&fixture);
+        request.session_token = child_token;
+        request.credential = CredentialRef::parse("sigv4-token").unwrap();
+        let response = fixture.engine.execute_broker_request(request);
+        let (reason, _) = deny_reason(&response);
+        assert_eq!(reason, "outside_delegation");
+    }
+
+    #[test]
+    fn budget_exhaustion_denies_after_n_allowed_brokered_requests() {
+        let fixture = standard_fixture(happy_transport(), false);
+        let constraints = SessionConstraints {
+            remaining_requests: Some(2),
+            ..SessionConstraints::default()
+        };
+        let (child_id, child_token) = delegate_from_fixture(&fixture, constraints);
+
+        for _ in 0..2 {
+            let mut request = broker_request(&fixture);
+            request.session_token = child_token.clone();
+            let response = fixture.engine.execute_broker_request(request);
+            assert_eq!(response.decision, Decision::Allow);
+        }
+        let mut third = broker_request(&fixture);
+        third.session_token = child_token.clone();
+        let response = fixture.engine.execute_broker_request(third);
+        let (reason, _) = deny_reason(&response);
+        assert_eq!(reason, "budget_exhausted");
+
+        // The decrement persisted on the stored record.
+        let records = fixture
+            .sessions
+            .list_for_agent(&AgentId::parse(FIXTURE_AGENT_ID).unwrap())
+            .unwrap();
+        let child = records
+            .iter()
+            .find(|record| record.session_id == child_id)
+            .expect("child record listed");
+        assert_eq!(
+            child.constraints.as_ref().unwrap().remaining_requests,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn revoking_the_root_session_invalidates_delegated_children() {
+        let fixture = standard_fixture(happy_transport(), false);
+        let (_, child_token) =
+            delegate_from_fixture(&fixture, path_scoped_constraints(&["/repos/**"]));
+
+        fixture.sessions.revoke(&fixture.session_id).unwrap();
+        let mut request = broker_request(&fixture);
+        request.session_token = child_token;
+        let response = fixture.engine.execute_broker_request(request);
+        let (reason, _) = deny_reason(&response);
+        assert_eq!(reason, "session_revoked");
+    }
+
+    #[test]
+    fn unconstrained_root_sessions_skip_delegation_gates_entirely() {
+        // Sessions minted directly carry no constraints; the pipeline
+        // behaves exactly as before §25 (budget consumption is a no-op).
+        let fixture = standard_fixture(happy_transport(), false);
+        let response = fixture
+            .engine
+            .execute_broker_request(broker_request(&fixture));
+        assert_eq!(response.decision, Decision::Allow);
+        let records = fixture
+            .sessions
+            .list_for_agent(&AgentId::parse(FIXTURE_AGENT_ID).unwrap())
+            .unwrap();
+        assert!(records[0].constraints.is_none());
     }
 }

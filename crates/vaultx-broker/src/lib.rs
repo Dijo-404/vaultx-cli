@@ -70,7 +70,8 @@ pub use request::{
     BrokerBody, BrokerRequest, BrokerResponse, Decision, RequestId, PROTOCOL_VERSION,
 };
 pub use session::{
-    hash_token, AgentSessionRecord, FileSessionStore, InMemorySessionStore, SessionStore, TokenHash,
+    hash_token, AgentSessionRecord, DelegationParent, FileSessionStore, InMemorySessionStore,
+    SessionConstraints, SessionStore, TokenHash,
 };
 pub use transport::{ExecutedResponse, TransportExecutor};
 

@@ -24,6 +24,15 @@ pub enum BrokerError {
     /// The session exists but has been revoked.
     #[error("session has been revoked")]
     SessionRevoked,
+    /// A delegated session exhausted its remaining-request budget (plan
+    /// §25). Carries no request context.
+    #[error("delegated session budget is exhausted")]
+    BudgetExhausted,
+    /// A delegation request was malformed: it narrowed nothing, or it
+    /// carried an invalid path pattern. The message names the problem
+    /// class, never any token material.
+    #[error("invalid delegation: {0}")]
+    InvalidDelegation(String),
     /// The referenced logical credential does not exist. Only the logical
     /// ID is carried — never any resolved material.
     #[error("unknown credential reference `{0}`")]
@@ -84,6 +93,8 @@ mod tests {
             BrokerError::ProtocolUnsupported(2),
             BrokerError::InvalidSession,
             BrokerError::SessionRevoked,
+            BrokerError::BudgetExhausted,
+            BrokerError::InvalidDelegation("narrowed nothing".to_owned()),
             BrokerError::UnknownCredential("deploy_token-1".to_owned()),
             BrokerError::AuthorizationDenied {
                 reason: "no_matching_policy".to_owned(),

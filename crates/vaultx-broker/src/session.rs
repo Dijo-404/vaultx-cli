@@ -7,7 +7,7 @@
 //! afterwards. Validation compares verifier hashes in constant time
 //! ([`subtle`]) so token guessing cannot be timed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -90,6 +90,211 @@ impl<'de> Deserialize<'de> for TokenHash {
 // Session record + store seam
 // ---------------------------------------------------------------------------
 
+/// Narrowing constraints attached to a delegated child session (plan §25).
+///
+/// Every field is an independent attenuation dimension; `None` (or an
+/// empty pattern list) means *unrestricted along that dimension* relative
+/// to what policy already allows. Constraints can only ever narrow:
+/// delegation intersects them with the parent's own constraints, which is
+/// what makes the plan's verification property — `child effective
+/// authority ⊆ parent effective authority` — hold transitively across
+/// chains.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionConstraints {
+    /// Allowed credential logical names; `None` = unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<BTreeSet<String>>,
+    /// Allowed environments; `None` = unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environments: Option<BTreeSet<String>>,
+    /// Allowed hosts (exact, case-insensitive); `None` = unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<BTreeSet<String>>,
+    /// Allowed HTTP methods (compared ASCII-case-insensitively);
+    /// `None` = unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methods: Option<BTreeSet<String>>,
+    /// Allowed request paths as segment-oriented glob patterns
+    /// ([`vaultx_policy::path_matches`] grammar). `None` = unrestricted;
+    /// `Some(empty)` = nothing allowed along this dimension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Remaining request budget. Decremented atomically on each allowed
+    /// brokered request; `Some(0)` denies everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_requests: Option<u64>,
+}
+
+impl SessionConstraints {
+    /// True when this set narrows nothing at all. Such a delegation is
+    /// rejected: it would grow the chain without reducing authority.
+    #[must_use]
+    pub fn is_unconstrained(&self) -> bool {
+        self.credentials.is_none()
+            && self.environments.is_none()
+            && self.hosts.is_none()
+            && self.methods.is_none()
+            && self.paths.is_none()
+            && self.remaining_requests.is_none()
+    }
+
+    /// Intersects `requested` into `self`, producing the constraints a
+    /// child of a session carrying `self` would store. Set dimensions
+    /// intersect literally, budgets take the minimum, and path globs keep
+    /// only requested patterns fully subsumed by at least one existing
+    /// pattern — so the result's accepted-request language is always a
+    /// subset of both operands'.
+    #[must_use]
+    pub fn narrow(&self, requested: &Self) -> Self {
+        Self {
+            credentials: narrow_set(&self.credentials, &requested.credentials),
+            environments: narrow_set(&self.environments, &requested.environments),
+            hosts: narrow_set(&self.hosts, &requested.hosts),
+            methods: narrow_set(&self.methods, &requested.methods),
+            paths: narrow_paths(&self.paths, &requested.paths),
+            remaining_requests: match (&self.remaining_requests, &requested.remaining_requests) {
+                (Some(parent), Some(child)) => Some((*parent).min(*child)),
+                (only, None) | (None, only) => *only,
+            },
+        }
+    }
+
+    /// Checks one canonical brokered request against this constraint set.
+    ///
+    /// Returns the name of the first violated dimension; the engine maps
+    /// any violation to the same external denial (`outside_delegation`)
+    /// so callers cannot probe which dimension tripped.
+    ///
+    /// The budget dimension is *not* consulted here — it is enforced by
+    /// [`SessionStore::consume_budget`], whose decrement must be atomic
+    /// with the decision.
+    pub fn check_request(
+        &self,
+        credential: &str,
+        environment: &str,
+        host: &str,
+        method: &str,
+        path: &str,
+    ) -> Result<(), &'static str> {
+        if let Some(set) = &self.credentials {
+            if !set.contains(credential) {
+                return Err("credential");
+            }
+        }
+        if let Some(set) = &self.environments {
+            if !set.contains(environment) {
+                return Err("environment");
+            }
+        }
+        if let Some(set) = &self.hosts {
+            let list: Vec<String> = set.iter().cloned().collect();
+            if !vaultx_policy::host_matches(&list, host) {
+                return Err("host");
+            }
+        }
+        if let Some(set) = &self.methods {
+            if !set
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(method))
+            {
+                return Err("method");
+            }
+        }
+        if let Some(patterns) = &self.paths {
+            if !patterns
+                .iter()
+                .any(|pattern| vaultx_policy::path_matches(pattern, path))
+            {
+                return Err("path");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn narrow_set(
+    parent: &Option<BTreeSet<String>>,
+    requested: &Option<BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    match (parent, requested) {
+        (Some(a), Some(b)) => Some(a.intersection(b).cloned().collect()),
+        (only, None) | (None, only) => only.clone(),
+    }
+}
+
+fn narrow_paths(
+    parent: &Option<Vec<String>>,
+    requested: &Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    match (parent, requested) {
+        (Some(kept), Some(wanted)) => Some(
+            wanted
+                .iter()
+                .filter(|child| kept.iter().any(|pattern| glob_subsumes(pattern, child)))
+                .cloned()
+                .collect(),
+        ),
+        (only, None) | (None, only) => only.clone(),
+    }
+}
+
+/// True when every path matched by `child_pattern` is also matched by
+/// `parent_pattern`. Both must satisfy the segment-glob grammar
+/// ([`vaultx_policy::validate_pattern`]); anything else conservatively
+/// reports no subsumption so invalid input can never widen a chain.
+fn glob_subsumes(parent: &str, child: &str) -> bool {
+    fn split(pattern: &str) -> Option<(Vec<&str>, bool)> {
+        vaultx_policy::validate_pattern(pattern).ok()?;
+        let mut segments: Vec<&str> = pattern
+            .strip_prefix('/')
+            .unwrap_or(pattern)
+            .split('/')
+            .collect();
+        let starred = segments.last() == Some(&"**");
+        if starred {
+            segments.pop();
+        }
+        Some((segments, starred))
+    }
+    let Some((p_segments, p_star)) = split(parent) else {
+        return false;
+    };
+    let Some((c_segments, c_star)) = split(child) else {
+        return false;
+    };
+    // "/**" accepts everything.
+    if p_segments.is_empty() && p_star {
+        return true;
+    }
+    // A bare "/**" child is only subsumed by "/**" (handled above).
+    if c_segments.is_empty() && c_star {
+        return false;
+    }
+    let covered_prefix = p_segments
+        .iter()
+        .zip(&c_segments)
+        .all(|(p, c)| *p == "*" || p == c);
+    match (p_star, c_star) {
+        // Fixed-length on both sides: same length plus pairwise coverage.
+        (false, false) => p_segments.len() == c_segments.len() && covered_prefix,
+        // Parent open-ended: the child's prefix must extend it; deeper
+        // child segments fall under the parent's trailing `**`.
+        (true, _) => c_segments.len() >= p_segments.len() && covered_prefix,
+        // Child open-ended under a fixed-length parent can overshoot.
+        (false, true) => false,
+    }
+}
+
+/// How a delegation locates its parent session: by stored id or by
+/// presenting the parent's raw capability token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DelegationParent<'a> {
+    /// Look up the parent session by its stored id.
+    Id(&'a SessionId),
+    /// Resolve the parent through its raw capability token verifier.
+    Token(&'a str),
+}
+
 /// Stored state of one agent session (plan §25). Mirrors the plan's
 /// `AgentSession` shape: identity binding plus the token *verifier* and a
 /// revocation flag.
@@ -110,6 +315,17 @@ pub struct AgentSessionRecord {
     /// revoked; `None` means no expiry.
     #[serde(default)]
     pub expires_at_secs: Option<u64>,
+    /// Parent session when this record was minted by delegation (plan
+    /// §25). Revocation cascade is enforced at *validation* time by
+    /// walking this link: revoking a parent never rewrites child rows,
+    /// but every live validation re-checks the whole chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<SessionId>,
+    /// Delegation narrowing constraints; `None` for sessions minted
+    /// directly (`agent session create`), always `Some` for delegated
+    /// children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<SessionConstraints>,
 }
 
 /// Session authentication boundary used by the broker engine.
@@ -164,6 +380,38 @@ pub trait SessionStore: Send + Sync {
     /// # Errors
     /// Implementation-defined (persistence failure).
     fn list_for_agent(&self, agent: &AgentId) -> Result<Vec<AgentSessionRecord>, BrokerError>;
+
+    /// Mints a delegated child session from a live parent (plan §25).
+    ///
+    /// The child inherits the parent's agent and environment; its stored
+    /// constraints are the **intersection** of the parent's own
+    /// constraints (if any) and `requested`, so delegation chains
+    /// monotonically narrow and `child effective authority ⊆ parent
+    /// effective authority` holds transitively. The raw child token is
+    /// returned exactly once, like [`SessionStore::create`].
+    ///
+    /// # Errors
+    /// Returns [`BrokerError::InvalidSession`] when the parent cannot be
+    /// located, [`BrokerError::SessionRevoked`] when it is revoked or
+    /// expired, and [`BrokerError::InvalidDelegation`] when the request
+    /// narrows nothing or carries an invalid path pattern. Entropy and
+    /// persistence failures propagate implementation-defined variants.
+    fn delegate(
+        &self,
+        parent: DelegationParent<'_>,
+        requested: &SessionConstraints,
+    ) -> Result<(SessionId, String), BrokerError>;
+
+    /// Atomically consumes one unit of the presented session's remaining
+    /// request budget. Sessions without a budget always succeed without
+    /// mutating anything; at zero the denial is returned instead of a
+    /// wraparound decrement (plan §25 budget attenuation).
+    ///
+    /// # Errors
+    /// Returns [`BrokerError::BudgetExhausted`] when the budget is spent
+    /// and [`BrokerError::InvalidSession`] for unknown tokens;
+    /// persistence failures propagate implementation-defined variants.
+    fn consume_budget(&self, raw_token: &str) -> Result<(), BrokerError>;
 }
 
 /// True when `record` can no longer validate: revoked or past its expiry.
@@ -172,6 +420,31 @@ fn is_dead(record: &AgentSessionRecord, clock: &std::sync::atomic::AtomicU64) ->
         || record
             .expires_at_secs
             .is_some_and(|expiry| expiry <= now_secs(clock))
+}
+
+/// True when every ancestor of `record` still exists and is live. A
+/// missing, revoked, or expired parent invalidates the child; cycles in a
+/// (tampered) store fail closed instead of looping forever.
+fn ancestors_live(
+    state: &InMemoryState,
+    record: &AgentSessionRecord,
+    clock: &std::sync::atomic::AtomicU64,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut cursor = record.parent_session.clone();
+    while let Some(id) = cursor {
+        if !seen.insert(id.clone()) {
+            return false;
+        }
+        let Some(parent) = state.sessions.get(&id) else {
+            return false;
+        };
+        if is_dead(parent, clock) {
+            return false;
+        }
+        cursor = parent.parent_session.clone();
+    }
+    true
 }
 
 /// Reads the effective unix-seconds clock for one store instance.
@@ -274,6 +547,11 @@ impl SessionStore for InMemorySessionStore {
         if is_dead(&record, &self.clock_override) {
             return Err(BrokerError::SessionRevoked);
         }
+        // Delegation chains stay live end-to-end: a revoked or expired
+        // ancestor invalidates every descendant at validation time.
+        if !ancestors_live(&state, &record, &self.clock_override) {
+            return Err(BrokerError::SessionRevoked);
+        }
         Ok(record)
     }
 
@@ -297,6 +575,18 @@ impl SessionStore for InMemorySessionStore {
             .collect();
         records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         Ok(records)
+    }
+
+    fn delegate(
+        &self,
+        parent: DelegationParent<'_>,
+        requested: &SessionConstraints,
+    ) -> Result<(SessionId, String), BrokerError> {
+        self.delegate_inner(parent, requested)
+    }
+
+    fn consume_budget(&self, raw_token: &str) -> Result<(), BrokerError> {
+        self.consume_budget_inner(raw_token).map(|_| ())
     }
 }
 
@@ -339,10 +629,115 @@ impl InMemorySessionStore {
                 token_hash,
                 revoked: false,
                 expires_at_secs,
+                parent_session: None,
+                constraints: None,
             },
         );
         state.by_hash.insert(token_hash, session_id.clone());
         Ok((session_id, raw_token))
+    }
+
+    /// Shared delegation path (plan §25). Validates the parent, intersects
+    /// constraints monotonically, and mints a fresh child token.
+    fn delegate_inner(
+        &self,
+        parent: DelegationParent<'_>,
+        requested: &SessionConstraints,
+    ) -> Result<(SessionId, String), BrokerError> {
+        for pattern in requested.paths.iter().flatten() {
+            if vaultx_policy::validate_pattern(pattern).is_err() {
+                return Err(BrokerError::InvalidDelegation(format!(
+                    "invalid path pattern `{pattern}`"
+                )));
+            }
+        }
+
+        // One lock hold covers parent validation through child insertion:
+        // a concurrent revocation can never interleave mid-delegation.
+        let mut state = self.lock();
+        let parent_record = match &parent {
+            DelegationParent::Id(id) => state.sessions.get(*id),
+            DelegationParent::Token(token) => state
+                .by_hash
+                .get(&TokenHash::from_token(token))
+                .and_then(|id| state.sessions.get(id)),
+        }
+        .cloned()
+        .ok_or(BrokerError::InvalidSession)?;
+
+        if is_dead(&parent_record, &self.clock_override) {
+            return Err(BrokerError::SessionRevoked);
+        }
+        let narrowed = match &parent_record.constraints {
+            Some(parent_constraints) => parent_constraints.narrow(requested),
+            None => requested.clone(),
+        };
+        if narrowed.is_unconstrained() {
+            return Err(BrokerError::InvalidDelegation(
+                "delegation narrows nothing; at least one constraint dimension is required"
+                    .to_owned(),
+            ));
+        }
+
+        let session_id = SessionId::parse(&format!("sess_{}", random_hex(SESSION_ID_BYTES)?))
+            .map_err(|_| {
+                BrokerError::Entropy("generated session id failed validation".to_owned())
+            })?;
+        let raw_token = random_hex(SESSION_TOKEN_BYTES)?;
+        let token_hash = TokenHash::from_token(&raw_token);
+
+        if state.by_hash.contains_key(&token_hash) {
+            return Err(BrokerError::Entropy(
+                "session token verifier collision".to_owned(),
+            ));
+        }
+        state.sessions.insert(
+            session_id.clone(),
+            AgentSessionRecord {
+                session_id: session_id.clone(),
+                agent: parent_record.agent,
+                environment: parent_record.environment,
+                token_hash,
+                revoked: false,
+                // No independent expiry: the child dies with its parent
+                // through the validation-time chain walk instead.
+                expires_at_secs: None,
+                parent_session: Some(parent_record.session_id),
+                constraints: Some(narrowed),
+            },
+        );
+        state.by_hash.insert(token_hash, session_id.clone());
+        Ok((session_id, raw_token))
+    }
+
+    /// Budget decrement returning whether the store actually mutated, so
+    /// the file-backed wrapper knows whether to persist. The check and
+    /// decrement run under one lock hold — atomic per process, and the
+    /// file store serializes processes behind its flock.
+    fn consume_budget_inner(&self, raw_token: &str) -> Result<bool, BrokerError> {
+        let computed = TokenHash::from_token(raw_token);
+        let mut state = self.lock();
+        let session_id = state
+            .by_hash
+            .get(&computed)
+            .cloned()
+            .ok_or(BrokerError::InvalidSession)?;
+        let record = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(BrokerError::InvalidSession)?;
+        match record
+            .constraints
+            .as_mut()
+            .and_then(|c| c.remaining_requests.as_mut())
+        {
+            None => Ok(false),
+            Some(0) => Err(BrokerError::BudgetExhausted),
+            Some(remaining) => {
+                *remaining -= 1;
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -527,6 +922,474 @@ mod tests {
         let decoded: AgentSessionRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, record);
         assert!(!encoded.contains("\"revoked\":true"));
+    }
+
+    // -- delegation (plan §25) --------------------------------------------------
+
+    fn credential_set(names: &[&str]) -> Option<BTreeSet<String>> {
+        Some(names.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    #[test]
+    fn delegate_mints_constrained_child_inheriting_agent_and_environment() {
+        let store = InMemorySessionStore::new();
+        let (root_id, parent_token) = store.create(&agent(), &environment()).unwrap();
+        let requested = SessionConstraints {
+            credentials: credential_set(&["github-work-token"]),
+            hosts: Some(BTreeSet::from(["api.github.com".to_owned()])),
+            remaining_requests: Some(5),
+            ..SessionConstraints::default()
+        };
+        let (_child_id, child_token) =
+            SessionStore::delegate(&store, DelegationParent::Token(&parent_token), &requested)
+                .unwrap();
+
+        assert_ne!(child_token, parent_token);
+        assert_eq!(child_token.len(), 64);
+        let record = store.validate(&child_token).unwrap();
+        assert_eq!(record.parent_session.as_ref(), Some(&root_id));
+        assert_eq!(record.agent, agent());
+        assert_eq!(record.environment, environment());
+        let constraints = record
+            .constraints
+            .expect("delegated child carries constraints");
+        assert_eq!(
+            constraints.credentials,
+            credential_set(&["github-work-token"])
+        );
+        assert_eq!(
+            constraints.hosts,
+            Some(BTreeSet::from(["api.github.com".to_owned()]))
+        );
+        assert_eq!(constraints.remaining_requests, Some(5));
+    }
+
+    #[test]
+    fn delegate_resolves_parent_by_id_and_by_raw_token() {
+        let store = InMemorySessionStore::new();
+        let (parent_id, parent_token) = store.create(&agent(), &environment()).unwrap();
+        let requested = SessionConstraints {
+            methods: Some(BTreeSet::from(["GET".to_owned()])),
+            ..SessionConstraints::default()
+        };
+
+        let by_id =
+            SessionStore::delegate(&store, DelegationParent::Id(&parent_id), &requested).unwrap();
+        let by_token =
+            SessionStore::delegate(&store, DelegationParent::Token(&parent_token), &requested)
+                .unwrap();
+
+        for (_child_id, child_token) in [by_id, by_token] {
+            let record = store.validate(&child_token).unwrap();
+            assert_eq!(record.agent, agent());
+            assert_eq!(record.parent_session.as_ref(), Some(&parent_id));
+        }
+    }
+
+    #[test]
+    fn delegate_rejects_unknown_revoked_and_expired_parents() {
+        let store = InMemorySessionStore::new();
+        let requested = SessionConstraints {
+            paths: Some(vec!["/repos/**".to_owned()]),
+            ..SessionConstraints::default()
+        };
+
+        // Unknown parent id and unknown token both fail closed.
+        let unknown = SessionId::parse("sess_does_not_exist").unwrap();
+        assert!(matches!(
+            SessionStore::delegate(&store, DelegationParent::Id(&unknown), &requested),
+            Err(BrokerError::InvalidSession)
+        ));
+        assert!(matches!(
+            SessionStore::delegate(&store, DelegationParent::Token("nope"), &requested),
+            Err(BrokerError::InvalidSession)
+        ));
+
+        // Revoked parent.
+        let (revoked_id, revoked_token) = store.create(&agent(), &environment()).unwrap();
+        store.revoke(&revoked_id).unwrap();
+        assert!(matches!(
+            SessionStore::delegate(&store, DelegationParent::Id(&revoked_id), &requested),
+            Err(BrokerError::SessionRevoked)
+        ));
+        assert!(matches!(
+            SessionStore::delegate(&store, DelegationParent::Token(&revoked_token), &requested),
+            Err(BrokerError::SessionRevoked)
+        ));
+
+        // Expired parent behaves like a revoked one.
+        store.set_clock_for_tests(1_000);
+        let (expired_id, _) = store
+            .create_expiring(&agent(), &environment(), Some(30))
+            .unwrap();
+        store.set_clock_for_tests(1_031);
+        assert!(matches!(
+            SessionStore::delegate(&store, DelegationParent::Id(&expired_id), &requested),
+            Err(BrokerError::SessionRevoked)
+        ));
+    }
+
+    #[test]
+    fn delegation_that_narrows_nothing_is_rejected() {
+        let store = InMemorySessionStore::new();
+        let (_, token) = store.create(&agent(), &environment()).unwrap();
+        let empty = SessionConstraints::default();
+        assert!(matches!(
+            SessionStore::delegate(&store, DelegationParent::Token(&token), &empty),
+            Err(BrokerError::InvalidDelegation(_))
+        ));
+        // A constrained parent cannot mint an unconstrained child either:
+        // the intersection keeps the parent's restrictions, so this only
+        // rejects the truly pointless fully-unconstrained chain.
+        assert!(matches!(
+            SessionStore::delegate(&store, DelegationParent::Token(&token), &empty),
+            Err(BrokerError::InvalidDelegation(_))
+        ));
+    }
+
+    #[test]
+    fn delegate_rejects_invalid_path_patterns() {
+        let store = InMemorySessionStore::new();
+        let (_, token) = store.create(&agent(), &environment()).unwrap();
+        let requested = SessionConstraints {
+            paths: Some(vec!["/repos/../escape".to_owned()]),
+            ..SessionConstraints::default()
+        };
+        assert!(matches!(
+            SessionStore::delegate(&store, DelegationParent::Token(&token), &requested),
+            Err(BrokerError::InvalidDelegation(message))
+                if message.contains("invalid path pattern")
+        ));
+    }
+
+    #[test]
+    fn grandchild_constraints_are_the_two_level_intersection() {
+        let store = InMemorySessionStore::new();
+        let (_, root_token) = store.create(&agent(), &environment()).unwrap();
+
+        let level_one = SessionConstraints {
+            credentials: credential_set(&["cred-a", "cred-b"]),
+            hosts: Some(BTreeSet::from([
+                "api.github.com".to_owned(),
+                "files.example.com".to_owned(),
+            ])),
+            methods: Some(BTreeSet::from(["GET".to_owned(), "POST".to_owned()])),
+            paths: Some(vec!["/repos/**".to_owned()]),
+            remaining_requests: Some(10),
+            environments: None,
+        };
+        let (child_id, _child_token) =
+            SessionStore::delegate(&store, DelegationParent::Token(&root_token), &level_one)
+                .unwrap();
+
+        let level_two = SessionConstraints {
+            credentials: credential_set(&["cred-b", "cred-c"]),
+            hosts: Some(BTreeSet::from([
+                "files.example.com".to_owned(),
+                "evil.example.com".to_owned(),
+            ])),
+            methods: Some(BTreeSet::from(["DELETE".to_owned(), "POST".to_owned()])),
+            paths: Some(vec!["/repos/acme/**".to_owned(), "/other/**".to_owned()]),
+            remaining_requests: Some(4),
+            environments: None,
+        };
+        let (_grandchild_id, grandchild_token) =
+            SessionStore::delegate(&store, DelegationParent::Id(&child_id), &level_two).unwrap();
+
+        let record = store.validate(&grandchild_token).unwrap();
+        let constraints = record.constraints.unwrap();
+        assert_eq!(
+            constraints.credentials,
+            credential_set(&["cred-b"]),
+            "credentials intersect"
+        );
+        assert_eq!(
+            constraints.hosts,
+            Some(BTreeSet::from(["files.example.com".to_owned()])),
+            "hosts intersect"
+        );
+        assert_eq!(
+            constraints.methods,
+            Some(BTreeSet::from(["POST".to_owned()])),
+            "methods intersect"
+        );
+        assert_eq!(
+            constraints.paths,
+            Some(vec!["/repos/acme/**".to_owned()]),
+            "only patterns subsumed by the parent's globs survive; /other/** is dropped"
+        );
+        assert_eq!(constraints.remaining_requests, Some(4), "budgets take min");
+    }
+
+    #[test]
+    fn path_intersection_of_disjoint_globs_allows_nothing() {
+        // Parent allows /a/**; requesting only /b/** must NOT degrade to
+        // unrestricted — `Some(empty)` means nothing matches.
+        let store = InMemorySessionStore::new();
+        let (_, root_token) = store.create(&agent(), &environment()).unwrap();
+        let parent_level = SessionConstraints {
+            paths: Some(vec!["/a/**".to_owned()]),
+            ..SessionConstraints::default()
+        };
+        let (child_id, _) =
+            SessionStore::delegate(&store, DelegationParent::Token(&root_token), &parent_level)
+                .unwrap();
+        let requested = SessionConstraints {
+            paths: Some(vec!["/b/**".to_owned()]),
+            ..SessionConstraints::default()
+        };
+        let (_, grandchild_token) =
+            SessionStore::delegate(&store, DelegationParent::Id(&child_id), &requested).unwrap();
+        let record = store.validate(&grandchild_token).unwrap();
+        let constraints = record.constraints.unwrap();
+        assert_eq!(constraints.paths, Some(Vec::new()));
+        assert!(constraints
+            .check_request("c", "env_development", "h.test", "GET", "/a/x")
+            .is_err());
+    }
+
+    #[test]
+    fn revoked_parent_invalidates_child_at_validation_time() {
+        let store = InMemorySessionStore::new();
+        let (root_id, _) = store.create(&agent(), &environment()).unwrap();
+        let requested = SessionConstraints {
+            paths: Some(vec!["/**".to_owned()]),
+            ..SessionConstraints::default()
+        };
+        let (_, child_token) =
+            SessionStore::delegate(&store, DelegationParent::Id(&root_id), &requested).unwrap();
+        assert!(store.validate(&child_token).is_ok());
+
+        // Revoking the parent does not rewrite the child row, yet the
+        // child stops validating immediately (chain walk).
+        store.revoke(&root_id).unwrap();
+        assert!(matches!(
+            store.validate(&child_token),
+            Err(BrokerError::SessionRevoked)
+        ));
+    }
+
+    #[test]
+    fn expired_parent_invalidates_child_at_validation_time() {
+        let store = InMemorySessionStore::new();
+        store.set_clock_for_tests(2_000);
+        let (root_id, _) = store
+            .create_expiring(&agent(), &environment(), Some(60))
+            .unwrap();
+        let requested = SessionConstraints {
+            methods: Some(BTreeSet::from(["GET".to_owned()])),
+            ..SessionConstraints::default()
+        };
+        let (_, child_token) =
+            SessionStore::delegate(&store, DelegationParent::Id(&root_id), &requested).unwrap();
+        assert!(store.validate(&child_token).is_ok());
+
+        store.set_clock_for_tests(2_061);
+        assert!(matches!(
+            store.validate(&child_token),
+            Err(BrokerError::SessionRevoked)
+        ));
+    }
+
+    #[test]
+    fn budget_decrements_only_on_consumption_and_exhausts_atomically() {
+        let store = InMemorySessionStore::new();
+        let (_, root_token) = store.create(&agent(), &environment()).unwrap();
+        let requested = SessionConstraints {
+            remaining_requests: Some(2),
+            ..SessionConstraints::default()
+        };
+        let (_, child_token) =
+            SessionStore::delegate(&store, DelegationParent::Token(&root_token), &requested)
+                .unwrap();
+
+        assert!(store.consume_budget(&child_token).is_ok());
+        assert!(store.consume_budget(&child_token).is_ok());
+        assert!(matches!(
+            store.consume_budget(&child_token),
+            Err(BrokerError::BudgetExhausted)
+        ));
+        // Exhaustion is sticky; nothing wrapped around.
+        assert!(matches!(
+            store.consume_budget(&child_token),
+            Err(BrokerError::BudgetExhausted)
+        ));
+
+        // Unbudgeted sessions never mutate and always succeed; unknown
+        // tokens are invalid sessions.
+        assert!(store.consume_budget(&root_token).is_ok());
+        assert!(matches!(
+            store.consume_budget("unknown-token"),
+            Err(BrokerError::InvalidSession)
+        ));
+    }
+
+    #[test]
+    fn legacy_records_without_delegation_fields_still_load() {
+        // Backward compatibility: stores written before plan §25 carry no
+        // parent/constraints keys; serde defaults must fill them in.
+        let legacy = format!(
+            "{{\"session_id\":\"sess_legacy\",\"agent\":\"{}\",\"environment\":\"{}\",\"token_hash\":\"{}\",\"revoked\":false,\"expires_at_secs\":null}}",
+            agent(),
+            environment(),
+            hex::encode(TokenHash::from_token("legacy-token").as_bytes()),
+        );
+        let decoded: AgentSessionRecord = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(decoded.parent_session, None);
+        assert_eq!(decoded.constraints, None);
+
+        // And the full new shape round trips losslessly.
+        let full = AgentSessionRecord {
+            parent_session: Some(SessionId::parse("sess_parent").unwrap()),
+            constraints: Some(SessionConstraints {
+                paths: Some(vec!["/x/**".to_owned()]),
+                ..SessionConstraints::default()
+            }),
+            ..decoded.clone()
+        };
+        let encoded = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentSessionRecord>(&encoded).unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn check_request_enforces_every_dimension() {
+        let constraints = SessionConstraints {
+            credentials: credential_set(&["cred-a"]),
+            environments: Some(BTreeSet::from(["env_dev".to_owned()])),
+            hosts: Some(BTreeSet::from(["API.GitHub.com".to_owned()])),
+            methods: Some(BTreeSet::from(["get".to_owned()])),
+            paths: Some(vec!["/repos/*/issues".to_owned()]),
+            remaining_requests: Some(1),
+        };
+        assert!(constraints
+            .check_request(
+                "cred-a",
+                "env_dev",
+                "api.github.com",
+                "GET",
+                "/repos/acme/issues"
+            )
+            .is_ok());
+
+        for (credential, environment, host, method, path, dimension) in [
+            (
+                "cred-b",
+                "env_dev",
+                "api.github.com",
+                "GET",
+                "/repos/acme/issues",
+                "credential",
+            ),
+            (
+                "cred-a",
+                "env_prod",
+                "api.github.com",
+                "GET",
+                "/repos/acme/issues",
+                "environment",
+            ),
+            (
+                "cred-a",
+                "env_dev",
+                "evil.github.com",
+                "GET",
+                "/repos/acme/issues",
+                "host",
+            ),
+            (
+                "cred-a",
+                "env_dev",
+                "api.github.com",
+                "POST",
+                "/repos/acme/issues",
+                "method",
+            ),
+            (
+                "cred-a",
+                "env_dev",
+                "api.github.com",
+                "GET",
+                "/repos/acme/web/issues",
+                "path",
+            ),
+            (
+                "cred-a",
+                "env_dev",
+                "api.github.com",
+                "GET",
+                "/repos",
+                "path",
+            ),
+        ] {
+            assert_eq!(
+                constraints.check_request(credential, environment, host, method, path),
+                Err(dimension),
+                "{dimension} violation must be reported"
+            );
+        }
+    }
+
+    #[test]
+    fn glob_subsumption_covers_the_segment_grammar() {
+        let subsumes = glob_subsumes;
+        assert!(subsumes("/**", "/anything/at/all"));
+        assert!(subsumes("/repos/**", "/repos/acme/backend/pulls"));
+        assert!(!subsumes("/other/**", "/repos/acme"));
+
+        assert!(subsumes("/repos/*", "/repos/acme"), "* covers one segment");
+        assert!(!subsumes("/repos/*", "/repos/acme/deep"));
+        assert!(
+            !subsumes("/repos/acme", "/repos/*"),
+            "wildcard child can widen"
+        );
+        assert!(subsumes("/repos/*", "/repos/acme"));
+
+        assert!(subsumes("/a/b/**", "/a/b/c/**"), "open-ended prefixes nest");
+        assert!(
+            !subsumes("/a/**/z", "/a/z"),
+            "invalid patterns never subsume"
+        );
+
+        assert!(
+            !subsumes("/a/b", "/a/**"),
+            "open child overshoots fixed parent"
+        );
+        assert!(!subsumes("not-a-pattern", "/a"));
+        assert!(!subsumes("/a", "also-bad"));
+    }
+
+    #[test]
+    fn narrow_produces_subset_language_for_sets_budgets_and_paths() {
+        let parent = SessionConstraints {
+            credentials: credential_set(&["cred-a", "cred-b"]),
+            hosts: Some(BTreeSet::from(["a.test".to_owned()])),
+            methods: Some(BTreeSet::from(["GET".to_owned()])),
+            paths: Some(vec!["/repos/**".to_owned()]),
+            remaining_requests: Some(7),
+            environments: None,
+        };
+        // A *broader* request cannot widen anything.
+        let broader = SessionConstraints {
+            credentials: credential_set(&["cred-c"]),
+            hosts: Some(BTreeSet::from(["b.test".to_owned()])),
+            methods: Some(BTreeSet::from(["DELETE".to_owned()])),
+            paths: Some(vec!["/**".to_owned()]),
+            remaining_requests: Some(99),
+            environments: None,
+        };
+        let narrowed = parent.narrow(&broader);
+        assert_eq!(narrowed.credentials, credential_set(&[]));
+        assert_eq!(narrowed.hosts, Some(BTreeSet::from([])));
+        assert_eq!(narrowed.methods, Some(BTreeSet::from([])));
+        assert_eq!(
+            narrowed.paths,
+            Some(vec![]),
+            "no /** pattern survives under /repos/**"
+        );
+        assert_eq!(narrowed.remaining_requests, Some(7));
     }
 }
 
@@ -824,6 +1687,26 @@ impl SessionStore for FileSessionStore {
 
     fn list_for_agent(&self, agent: &AgentId) -> Result<Vec<AgentSessionRecord>, BrokerError> {
         self.with_locked(|inner| Ok((inner.list_for_agent(agent)?, false)))
+    }
+
+    fn delegate(
+        &self,
+        parent: DelegationParent<'_>,
+        requested: &SessionConstraints,
+    ) -> Result<(SessionId, String), BrokerError> {
+        self.with_locked(|inner| {
+            let created = inner.delegate(parent, requested)?;
+            Ok((created, true))
+        })
+    }
+
+    fn consume_budget(&self, raw_token: &str) -> Result<(), BrokerError> {
+        // Budget decrements persist immediately: a crash between an
+        // allowed request and the next must not reset the counter.
+        self.with_locked(|inner| {
+            let consumed = inner.consume_budget_inner(raw_token)?;
+            Ok(((), consumed))
+        })
     }
 }
 

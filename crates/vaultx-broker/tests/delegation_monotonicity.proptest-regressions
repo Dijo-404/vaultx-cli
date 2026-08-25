@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5d36d5c09d8bd8d8b51c15e47edad8da199be3da79a00243bccd82d79f4c6477 # shrinks to cred_parent = [false, false, false], cred_extra = [false, false, false], env_parent = [false, false], env_extra = [false, false], host_parent = [false, false], host_extra = [false, false], method_parent = [true, false], method_extra = [false, false], path_parent = [true, false, false, false, false, false], path_extra = [true, false, false, false, false, false], requests = [Request { credential: 0, environment: 0, host: 0, method: 1, path: 0 }]

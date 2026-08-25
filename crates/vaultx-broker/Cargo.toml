@@ -29,3 +29,4 @@ vaultx-types = { path = "../vaultx-types" }
 rcgen = "0.13"
 tokio-rustls = "0.26"
 tempfile = { workspace = true }
+proptest = { workspace = true }
