@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use vaultx_audit::{AppendStore as _, AuditEvent, JsonlAppendStore};
@@ -26,6 +27,7 @@ use vaultx_core::CoreError;
 use vaultx_crypto::envelope::RootKey;
 use vaultx_crypto::error::CryptoError;
 use vaultx_crypto::signature::SigningKeyPair;
+use vaultx_http::{classify_ip, Classification};
 use vaultx_keyring::WrappingKeyProvider;
 use vaultx_sync_client::transport::{ControlPlaneTransport, TransportRequest, TransportResponse};
 use vaultx_sync_client::{
@@ -45,6 +47,19 @@ const REMOTE_FILE: &str = "remote.json";
 const SYNC_STATE_FILE: &str = "sync-state.json";
 /// Directory (under `$XDG_RUNTIME_DIR`) holding the live session token.
 const RUNTIME_SUBDIR: &str = "vaultx";
+
+/// Outbound connect timeout (mirrors the broker transport).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-read timeout (mirrors the broker transport).
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-request ceiling (mirrors the broker transport).
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard ceiling on any single control-plane response body.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum events per audit-ingest POST so large backlogs converge
+/// within the control plane's list/body limits.
+const AUDIT_UPLOAD_CHUNK: usize = 1_000;
 
 /// One named remote: where the control plane is and which project this
 /// repository synchronizes with. Deliberately token-free.
@@ -106,8 +121,75 @@ fn runtime_message(message: impl Into<String>) -> CliError {
     CliError::Runtime(CoreError::Io(std::io::Error::other(message.into())))
 }
 
-/// Writes `contents` atomically (tmp file + rename) so concurrent readers
-/// never observe torn JSON.
+/// Fresh unpredictable temp-file candidate next to `path` (never a
+/// symlink target: creation uses `create_new`, which refuses existing
+/// entries including symlinks).
+fn tmp_candidate(path: &Path) -> PathBuf {
+    let mut entropy = [0u8; 8];
+    getrandom::getrandom(&mut entropy).expect("OS randomness unavailable");
+    let name = path
+        .file_name()
+        .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned());
+    path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        hex::encode(entropy)
+    ))
+}
+
+/// Writes `contents` to `path` atomically: creates an exclusive
+/// (`create_new`) owner-only temp file via `candidate` and renames it
+/// over the destination. Name collisions are retried with fresh
+/// candidates; any other error aborts.
+pub(crate) fn write_atomic_via<F>(
+    path: &Path,
+    contents: &str,
+    mut candidate: F,
+) -> Result<(), std::io::Error>
+where
+    F: FnMut() -> PathBuf,
+{
+    for _ in 0..16 {
+        let tmp = candidate();
+        #[cfg(unix)]
+        let opened = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+        };
+        #[cfg(not(unix))]
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp);
+        match opened {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(contents.as_bytes())?;
+                drop(file);
+                return match std::fs::rename(&tmp, path) {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        Err(err)
+                    }
+                };
+            }
+            // Predicted name lost a race (or was planted): try a new one.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::other(
+        "could not create a unique temporary file after 16 attempts",
+    ))
+}
+
+/// Writes `contents` atomically (exclusive temp file + rename) so
+/// concurrent readers never observe torn JSON.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), CliError> {
     let parent = path.parent().ok_or_else(|| {
         map_io(std::io::Error::other(
@@ -115,39 +197,38 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), CliError> {
         ))
     })?;
     std::fs::create_dir_all(parent).map_err(map_io)?;
-    let tmp = path.with_file_name(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned()),
-        std::process::id()
-    ));
-    write_private(&tmp, contents)?;
-    std::fs::rename(&tmp, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
-        map_io(err)
-    })
+    write_atomic_via(path, contents, || tmp_candidate(path)).map_err(map_io)
 }
 
-/// Writes with owner-only permissions (0600 on unix).
-fn write_private(path: &Path, contents: &str) -> Result<(), CliError> {
+/// Ensures `dir` exists with owner-only permissions (0700 on unix) —
+/// applied to the runtime session directory before any token lands
+/// there.
+fn ensure_private_dir(dir: &Path) -> Result<(), CliError> {
+    std::fs::create_dir_all(dir).map_err(map_io)?;
     #[cfg(unix)]
     {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(map_io)?;
-        file.write_all(contents.as_bytes()).map_err(map_io)?;
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(dir).map_err(map_io)?;
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(map_io)?;
+        }
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, contents).map_err(map_io)?;
+        let _ = dir;
     }
     Ok(())
+}
+
+/// Writes secret material (`path`, `contents`) atomically into an
+/// owner-only private directory.
+fn write_private(path: &Path, contents: &str) -> Result<(), CliError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| map_io(std::io::Error::other("secret path has no parent directory")))?;
+    ensure_private_dir(parent)?;
+    write_atomic(path, contents)
 }
 
 /// `$XDG_RUNTIME_DIR/vaultx/session.json`; falls back to the system temp
@@ -170,11 +251,21 @@ fn store_session(session: &StoredSession) -> Result<(), CliError> {
     write_atomic(&session_path(), &json)
 }
 
-fn load_remote_config(vault_dir: &Path) -> RemoteConfig {
-    std::fs::read_to_string(vault_dir.join(REMOTE_FILE))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+fn load_remote_config(vault_dir: &Path) -> Result<RemoteConfig, CliError> {
+    let path = vault_dir.join(REMOTE_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RemoteConfig::default());
+        }
+        Err(err) => return Err(map_io(err)),
+    };
+    serde_json::from_str(&text).map_err(|err| {
+        runtime_message(format!(
+            "remote config `{}` is corrupt ({err}); delete it and re-run `vaultx remote add`",
+            path.display()
+        ))
+    })
 }
 
 fn save_remote_config(vault_dir: &Path, config: &RemoteConfig) -> Result<(), CliError> {
@@ -183,11 +274,24 @@ fn save_remote_config(vault_dir: &Path, config: &RemoteConfig) -> Result<(), Cli
     write_atomic(&vault_dir.join(REMOTE_FILE), &json)
 }
 
-fn load_sync_state(vault_dir: &Path) -> SyncState {
-    std::fs::read_to_string(vault_dir.join(SYNC_STATE_FILE))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+/// Loads the audit-upload watermark. A missing file starts fresh; a
+/// corrupt one is a hard error — silently resetting it would re-upload
+/// the whole log as duplicate server-side events.
+fn load_sync_state(vault_dir: &Path) -> Result<SyncState, CliError> {
+    let path = vault_dir.join(SYNC_STATE_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SyncState::default());
+        }
+        Err(err) => return Err(map_io(err)),
+    };
+    serde_json::from_str(&text).map_err(|err| {
+        runtime_message(format!(
+            "sync state `{}` is corrupt ({err}); delete it to re-upload from the start",
+            path.display()
+        ))
+    })
 }
 
 fn save_sync_state(vault_dir: &Path, state: &SyncState) -> Result<(), CliError> {
@@ -203,7 +307,7 @@ fn resolve_remote(
     vault_dir: &Path,
     requested: Option<&str>,
 ) -> Result<(String, RemoteEntry), CliError> {
-    let config = load_remote_config(vault_dir);
+    let config = load_remote_config(vault_dir)?;
     match requested {
         Some(name) => config.remotes.get(name).map_or_else(
             || {
@@ -238,18 +342,31 @@ fn resolve_remote(
 
 /// [`ControlPlaneTransport`] backed by reqwest (rustls only, mirroring
 /// the broker transport's hardened client). The bearer token rides only
-/// in the Authorization header and never appears in error strings.
-#[derive(Clone, Debug)]
+/// in the Authorization header and never appears in error strings or
+/// [`Debug`] output.
+#[derive(Clone)]
 struct HttpTransport {
     client: reqwest::Client,
     server: String,
     bearer: Arc<String>,
 }
 
+impl std::fmt::Debug for HttpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpTransport")
+            .field("server", &self.server)
+            .field("bearer", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
 impl HttpTransport {
     fn new(server: &str, token: &str) -> Result<Self, CliError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .timeout(TOTAL_TIMEOUT)
             .build()
             .map_err(|err| runtime_message(format!("cannot build HTTP client: {err}")))?;
         Ok(Self {
@@ -285,12 +402,28 @@ impl ControlPlaneTransport for HttpTransport {
             SyncError::Transport(err.to_string())
         })?;
         let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|err| SyncError::Transport(err.to_string()))?;
+        // Cap the read so a hostile/misbehaving proxy cannot exhaust
+        // memory with an unbounded body.
+        let body = read_capped(response, MAX_RESPONSE_BYTES).await?;
         Ok(TransportResponse { status, body })
     }
+}
+
+/// Reads a response body up to `cap` bytes; anything larger is a
+/// protocol error rather than an OOM.
+async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<String, SyncError> {
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| SyncError::Transport(err.to_string()))?
+    {
+        if bytes.len() + chunk.len() > cap {
+            return Err(SyncError::Protocol("response body exceeds size limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| SyncError::Protocol("response body is not valid UTF-8"))
 }
 
 /// Wraps a [`SyncError`] into the CLI error family without echoing any
@@ -367,6 +500,16 @@ fn open_sync_context(
     // completely unconfigured project gets the actionable message.
     let session = load_session()?;
     let (_, entry) = resolve_remote(ctx.vault_dir(), requested_remote)?;
+    // A stale remote/server pairing must never receive another plane's
+    // token: after re-login to a different control plane, old remotes
+    // have to be re-added explicitly.
+    if entry.server != session.server {
+        return Err(usage(format!(
+            "remote is bound to {} but the stored login is for {}; \
+             re-run `vaultx remote add` or `vaultx login`",
+            entry.server, session.server
+        )));
+    }
     let project_id = vaultx_types::ProjectId::parse(&entry.project_id)
         .map_err(|_| runtime_message("configured remote holds a malformed project id"))?;
     let transport = HttpTransport::new(&entry.server, &session.token)?;
@@ -393,11 +536,12 @@ fn run_pull(ctx: &SyncContext) -> Result<SyncResult, CliError> {
     crate::cli::run_async(ctx.client.pull(ctx.project_id.clone())).map_err(map_sync_error)
 }
 
-/// Uploads local audit events past the persisted watermark. The watermark
-/// advances only when every submitted event was accepted, so rejected
-/// batches retry wholesale on the next run.
+/// Uploads local audit events past the persisted watermark in bounded
+/// chunks. The watermark advances to the highest ACCEPTED sequence, so
+/// rejected events are skipped-with-reason and never wedge later
+/// uploads; accepted prefixes are never re-sent.
 fn upload_pending_audit(ctx: &SyncContext) -> Result<String, CliError> {
-    let state = load_sync_state(&ctx.vault_dir);
+    let state = load_sync_state(&ctx.vault_dir)?;
     let store = JsonlAppendStore::open(&ctx.audit_path);
     let events = store
         .query(&vaultx_audit::AuditFilter::default())
@@ -413,40 +557,73 @@ fn upload_pending_audit(ctx: &SyncContext) -> Result<String, CliError> {
     if pending.is_empty() {
         return Ok("audit: nothing new to upload".to_owned());
     }
-    let batch: Vec<IngestEvent> = pending.iter().map(|e| ingest_event_of(e)).collect();
-    let highest = pending
-        .iter()
-        .map(|event| event.sequence)
-        .max()
-        .or(state.last_uploaded_sequence);
-    let result = crate::cli::run_async(
-        ctx.client
-            .upload_audit_events(ctx.project_id.clone(), batch),
-    )
-    .map_err(map_sync_error)?;
-    if result.rejected.is_empty() {
-        save_sync_state(
-            &ctx.vault_dir,
-            &SyncState {
-                last_uploaded_sequence: highest,
-            },
-        )?;
+    let mut total_accepted = 0usize;
+    let mut skipped: Vec<(u64, String)> = Vec::new();
+    let mut watermark = state.last_uploaded_sequence;
+    for chunk in pending.chunks(AUDIT_UPLOAD_CHUNK) {
+        let batch: Vec<IngestEvent> = chunk.iter().map(|e| ingest_event_of(e)).collect();
+        let result = crate::cli::run_async(
+            ctx.client
+                .upload_audit_events(ctx.project_id.clone(), batch),
+        )
+        .map_err(map_sync_error)?;
+        let rejected: std::collections::HashMap<usize, &str> = result
+            .rejected
+            .iter()
+            .map(|r| (r.index, r.reason.as_str()))
+            .collect();
+        // Skipped events are reported once and deliberately never
+        // retried: the watermark rides to this chunk's end so one
+        // poison record cannot wedge every later upload.
+        let (chunk_accepted, chunk_skipped) = reconcile_chunk(&chunk_sequences(chunk), &rejected);
+        total_accepted += chunk_accepted;
+        skipped.extend(chunk_skipped);
+        if let Some(end) = chunk.last().map(|e| e.sequence) {
+            watermark = Some(watermark.map_or(end, |hi| hi.max(end)));
+        }
     }
-    Ok(render_audit_upload(&result.accepted, &result.rejected))
+    save_sync_state(
+        &ctx.vault_dir,
+        &SyncState {
+            last_uploaded_sequence: watermark,
+        },
+    )?;
+    Ok(render_audit_upload(total_accepted, &skipped))
 }
 
-fn render_audit_upload(
-    accepted: &usize,
-    rejected: &[vaultx_control_plane::protocol::AuditIngestRejection],
-) -> String {
+fn render_audit_upload(accepted: usize, skipped: &[(u64, String)]) -> String {
     let mut line = format!("audit: uploaded {accepted} event(s)");
-    if !rejected.is_empty() {
-        line.push_str(&format!(
-            ", {} rejected (watermark not advanced; they will retry)",
-            rejected.len()
-        ));
+    if !skipped.is_empty() {
+        line.push_str(&format!(", {} rejected (skipped)", skipped.len()));
+        for (sequence, reason) in skipped.iter().take(3) {
+            line.push_str(&format!("; seq {sequence}: {reason}"));
+        }
+        if skipped.len() > 3 {
+            line.push_str(&format!("; … and {} more", skipped.len() - 3));
+        }
     }
     line
+}
+
+/// Sequences of one upload chunk, in submission order.
+fn chunk_sequences(chunk: &[&AuditEvent]) -> Vec<u64> {
+    chunk.iter().map(|event| event.sequence).collect()
+}
+
+/// Pure reconciliation of one server response against its submitted
+/// sequences: returns how many events were accepted and which
+/// `(sequence, reason)` pairs were rejected by position.
+pub(crate) fn reconcile_chunk(
+    sequences: &[u64],
+    rejected: &std::collections::HashMap<usize, &str>,
+) -> (usize, Vec<(u64, String)>) {
+    let mut skipped = Vec::new();
+    for (index, sequence) in sequences.iter().enumerate() {
+        if let Some(reason) = rejected.get(&index) {
+            skipped.push((*sequence, (*reason).to_owned()));
+        }
+    }
+    (sequences.len() - skipped.len(), skipped)
 }
 
 fn ingest_event_of(event: &AuditEvent) -> IngestEvent {
@@ -533,10 +710,35 @@ pub(crate) fn cmd_login(server: &str, token_arg: Option<&str>) -> Result<String,
 
 /// Accepts `http(s)://host[:port]` bases only; anything else is refused
 /// before any credential material moves.
-fn normalize_server(raw: &str) -> Result<String, CliError> {
+pub(crate) fn normalize_server(raw: &str) -> Result<String, CliError> {
     let trimmed = raw.trim().trim_end_matches('/');
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err(usage("--server expects an http:// or https:// base URL"));
+    }
+    // Bearer tokens never travel over plaintext http except to a
+    // loopback control plane (local development servers).
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        // Bracketed IPv6 keeps its colons; strip them for classification.
+        let host = authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _port)| host);
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_ascii_lowercase();
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .is_some_and(|ip| classify_ip(ip) == Classification::Loopback);
+        if !loopback {
+            return Err(usage(
+                "remote control planes require https:// (plain http is only allowed for localhost)",
+            ));
+        }
     }
     Ok(trimmed.to_owned())
 }
@@ -577,7 +779,7 @@ pub(crate) fn cmd_remote_add(
     }
 
     let vault_dir = services.context().vault_dir().to_path_buf();
-    let mut config = load_remote_config(&vault_dir);
+    let mut config = load_remote_config(&vault_dir)?;
     if config.remotes.contains_key(&name) {
         return Err(usage(format!(
             "remote `{name}` already exists; remove it first"
@@ -611,7 +813,7 @@ fn validate_remote_name(name: &str) -> Result<String, CliError> {
 
 /// `vaultx remote list`.
 pub(crate) fn cmd_remote_list(services: &vaultx_core::VaultxServices) -> Result<String, CliError> {
-    let config = load_remote_config(services.context().vault_dir());
+    let config = load_remote_config(services.context().vault_dir())?;
     if config.remotes.is_empty() {
         return Ok("no remotes configured".to_owned());
     }
@@ -626,13 +828,41 @@ pub(crate) fn cmd_remote_list(services: &vaultx_core::VaultxServices) -> Result<
     ))
 }
 
+/// `vaultx remote agents [--remote NAME]` — lists agent identities
+/// registered on the remote project (plan §29 team identity).
+pub(crate) fn cmd_remote_agents(
+    services: &vaultx_core::VaultxServices,
+    remote: Option<&str>,
+) -> Result<String, CliError> {
+    let ctx = open_sync_context(services, remote, false)?;
+    let agents = crate::cli::run_async(ctx.client.list_remote_agents(ctx.project_id.clone()))
+        .map_err(map_sync_error)?;
+    if agents.is_empty() {
+        return Ok("no agent identities registered on the remote".to_owned());
+    }
+    let rows: Vec<Vec<String>> = agents
+        .iter()
+        .map(|agent| {
+            vec![
+                agent.agent_id.to_string(),
+                agent.display_name.to_string(),
+                (!agent.revoked).to_string(),
+            ]
+        })
+        .collect();
+    Ok(crate::output::render_table(
+        &["ID", "NAME", "ENABLED"],
+        &rows,
+    ))
+}
+
 /// `vaultx remote remove <NAME>`.
 pub(crate) fn cmd_remote_remove(
     services: &vaultx_core::VaultxServices,
     name: &str,
 ) -> Result<String, CliError> {
     let vault_dir = services.context().vault_dir().to_path_buf();
-    let mut config = load_remote_config(&vault_dir);
+    let mut config = load_remote_config(&vault_dir)?;
     if config.remotes.remove(name).is_none() {
         return Err(usage(format!("no remote named `{name}`")));
     }
@@ -713,8 +943,15 @@ pub(crate) fn cmd_push(
     let result = run_push(&ctx)?;
     let mut out = finish("push", &result, PullStrategy::FastForward)?;
     if with_audit {
-        out.push('\n');
-        out.push_str(&upload_pending_audit(&ctx)?);
+        // A failed audit upload must not hide the push summary that
+        // already succeeded: the summary rides inside the error payload.
+        match upload_pending_audit(&ctx) {
+            Ok(audit_line) => {
+                out.push('\n');
+                out.push_str(&audit_line);
+            }
+            Err(err) => return Err(CliError::Diagnostics(format!("{out}\n{err}"))),
+        }
     }
     Ok(out)
 }

@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 base64 = { workspace = true }
 clap = { workspace = true }
+getrandom = "0.2"
 hex = { workspace = true }
 reqwest = { workspace = true }
 rpassword = { workspace = true }
@@ -27,6 +28,7 @@ vaultx-broker = { path = "../vaultx-broker" }
 vaultx-broker-client = { path = "../vaultx-broker-client" }
 vaultx-control-plane = { path = "../vaultx-control-plane" }
 vaultx-core = { path = "../vaultx-core" }
+vaultx-http = { path = "../vaultx-http" }
 vaultx-crypto = { path = "../vaultx-crypto" }
 vaultx-keyring = { path = "../vaultx-keyring" }
 vaultx-mcp = { path = "../vaultx-mcp" }

@@ -104,11 +104,6 @@ pub enum ConflictReason {
     /// A protected environment ref rejected the update because the client
     /// did not assert authorization.
     ProtectedEnvironment,
-    /// The remote refused the update outright with this HTTP status.
-    Rejected {
-        /// HTTP status returned by the control plane.
-        status: u16,
-    },
     /// The remote ref points at history the local repository cannot
     /// resolve even after downloading everything offered, so ancestry —
     /// and therefore safety — cannot be established.
@@ -120,7 +115,6 @@ impl std::fmt::Display for ConflictReason {
         match self {
             Self::Diverged => f.write_str("diverged"),
             Self::ProtectedEnvironment => f.write_str("protected environment ref"),
-            Self::Rejected { status } => write!(f, "rejected with status {status}"),
             Self::UnverifiableHistory => f.write_str("unverifiable local history"),
         }
     }

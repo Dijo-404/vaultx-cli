@@ -893,6 +893,100 @@ fn audit_list_filters_by_outcome_actor_and_limit() {
     ))
     .unwrap();
     assert_eq!(actor_filtered, "no audit events");
+
+    // Positive filter: the real actor matches every row.
+    let actor_matched = dispatch(&cli(
+        root,
+        Command::Audit {
+            command: AuditCommand::List {
+                actor: Some("agent:ci-bot".to_owned()),
+                outcome: None,
+                limit: None,
+            },
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        actor_matched.lines().count(),
+        4,
+        "header + three rows for the matching actor: {actor_matched}"
+    );
+}
+
+#[test]
+fn normalize_server_enforces_https_off_loopback() {
+    use crate::remoting::normalize_server;
+    assert!(normalize_server("https://vaultx.example.com").is_ok());
+    assert!(normalize_server("http://localhost:8080").is_ok());
+    assert!(normalize_server("http://127.0.0.1:9000/").is_ok());
+    assert!(normalize_server("http://[::1]:9000").is_ok());
+    let err = normalize_server("http://sync.corp.example.com").unwrap_err();
+    assert!(err.to_string().contains("https"), "got: {err}");
+}
+
+#[test]
+fn parse_pull_strategy_accepts_known_and_rejects_unknown() {
+    use crate::cli::parse_pull_strategy;
+    assert_eq!(
+        parse_pull_strategy("fast-forward"),
+        Ok(crate::cli::PullStrategy::FastForward)
+    );
+    assert!(parse_pull_strategy("ours").is_ok());
+    assert!(parse_pull_strategy("yolo").is_err());
+}
+
+#[test]
+fn reconcile_chunk_skips_rejected_positions_and_counts_the_rest() {
+    use crate::remoting::reconcile_chunk;
+    use std::collections::HashMap;
+    let sequences = [10, 11, 12, 13];
+    let mut rejected = HashMap::new();
+    rejected.insert(1usize, "actor must not be empty");
+    let (accepted, skipped) = reconcile_chunk(&sequences, &rejected);
+    assert_eq!(accepted, 3);
+    assert_eq!(skipped, vec![(11, "actor must not be empty".to_owned())]);
+
+    let (all, none) = reconcile_chunk(&sequences, &HashMap::new());
+    assert_eq!(all, 4);
+    assert!(none.is_empty());
+}
+
+#[test]
+fn corrupt_sync_state_fails_loudly_instead_of_resetting() {
+    let _guard = team_sync_guard();
+    let plane = fake_control_plane();
+    let (root, _project) = setup_synced_project(plane, "corruptstate");
+    std::fs::write(root.join(".vaultx").join("sync-state.json"), "{not json").unwrap();
+
+    let err = dispatch(&cli(
+        &root,
+        Command::Push {
+            with_audit: true,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("corrupt"), "got: {err}");
+}
+
+#[test]
+fn remote_agents_lists_remote_identities_or_reports_empty() {
+    let _guard = team_sync_guard();
+    let plane = fake_control_plane();
+    let (root, _project) = setup_synced_project(plane, "remoteagents");
+
+    let out = dispatch(&cli(
+        &root,
+        Command::Remote {
+            command: RemoteCommand::Agents { remote: None },
+        },
+    ))
+    .unwrap();
+    assert!(
+        out.contains("no agent identities") || out.contains("ID"),
+        "got: {out}"
+    );
 }
 
 #[test]

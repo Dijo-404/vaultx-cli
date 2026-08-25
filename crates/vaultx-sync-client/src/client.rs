@@ -39,6 +39,24 @@ pub struct SyncOptions {
     pub authorize_protected_environments: bool,
 }
 
+/// Maximum known object ids carried by one query-missing request.
+/// Server-side list cardinality caps (and body-size limits) make a
+/// single all-ids request impossible for large projects, so larger
+/// known sets are split across sequential probes whose answers are
+/// unioned.
+const PROBE_KNOWN_IDS_CHUNK: usize = 4_000;
+
+/// Maximum object envelopes per batch upload request.
+const UPLOAD_MAX_ENTRIES: usize = 256;
+
+/// Approximate serialized-bytes budget per batch upload request. The
+/// estimate errs high so a full batch stays well under the control
+/// plane's 1 MiB body cap.
+const UPLOAD_MAX_BATCH_BYTES: usize = 512 * 1024;
+
+/// Per-entry byte overhead estimate (id, hash, JSON framing).
+const UPLOAD_ENTRY_OVERHEAD: usize = 96;
+
 /// Sync client bound to one local workspace, one transport, and one device
 /// identity.
 #[derive(Clone, Debug)]
@@ -108,23 +126,68 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
     /// Runs the query-missing probe shared by push and pull: declares
     /// known objects/refs plus signed device identity, receives missing
     /// objects, remote refs, policy/environment metadata, key material.
+    ///
+    /// Known-id sets beyond [`PROBE_KNOWN_IDS_CHUNK`] are split across
+    /// sequential probes; the missing sets are unioned (deduplicated by
+    /// id — a remote object absent from every chunk is reported by each)
+    /// and metadata comes from the final response, which is identical
+    /// across chunks within one probe round. Any chunk reporting
+    /// truncation keeps the flag set so the caller's convergence loop
+    /// re-probes with its advanced known set.
     async fn probe(&self, project: &ProjectId) -> SyncResultOf<QueryMissingResponse> {
         let known_object_ids = self.workspace.known_object_ids()?;
         let known_refs = self.workspace.all_refs()?;
-        let device = self.keys.attestation(project).map_err(SyncError::Keyring)?;
-        self.send_json(
-            TransportRequest::post(
-                format!("/projects/{project}/objects/query-missing"),
-                String::new(),
-            ),
-            Some(&QueryMissingRequest {
-                known_object_ids,
-                known_refs,
-                project: project.clone(),
-                device,
-            }),
-        )
-        .await
+        if known_object_ids.len() <= PROBE_KNOWN_IDS_CHUNK {
+            let device = self.keys.attestation(project).map_err(SyncError::Keyring)?;
+            return self
+                .send_json(
+                    TransportRequest::post(
+                        format!("/projects/{project}/objects/query-missing"),
+                        String::new(),
+                    ),
+                    Some(&QueryMissingRequest {
+                        known_object_ids,
+                        known_refs,
+                        project: project.clone(),
+                        device,
+                    }),
+                )
+                .await;
+        }
+
+        let mut missing_objects = Vec::new();
+        let mut seen_missing = BTreeSet::new();
+        let mut truncated = false;
+        let mut tail = None;
+        for chunk in known_object_ids.chunks(PROBE_KNOWN_IDS_CHUNK) {
+            // Each request carries a fresh device attestation.
+            let device = self.keys.attestation(project).map_err(SyncError::Keyring)?;
+            let response: QueryMissingResponse = self
+                .send_json(
+                    TransportRequest::post(
+                        format!("/projects/{project}/objects/query-missing"),
+                        String::new(),
+                    ),
+                    Some(&QueryMissingRequest {
+                        known_object_ids: chunk.to_vec(),
+                        known_refs: known_refs.clone(),
+                        project: project.clone(),
+                        device,
+                    }),
+                )
+                .await?;
+            truncated |= response.missing_objects_truncated;
+            for entry in &response.missing_objects {
+                if seen_missing.insert(entry.id.clone()) {
+                    missing_objects.push(entry.clone());
+                }
+            }
+            tail = Some(response);
+        }
+        let mut merged = tail.expect("at least one chunk was sent");
+        merged.missing_objects = missing_objects;
+        merged.missing_objects_truncated = truncated;
+        Ok(merged)
     }
 
     /// Verifies every returned object independently (canonical re-encode +
@@ -297,7 +360,12 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
     }
 
     /// Uploads objects the remote lacks after a local self-check that each
-    /// envelope's canonical hash matches its content-derived id.
+    /// envelope's canonical hash matches its content-derived id. Batches
+    /// are capped at [`UPLOAD_MAX_ENTRIES`] envelopes or the
+    /// [`UPLOAD_MAX_BATCH_BYTES`] budget, whichever fills first; a batch
+    /// that stores nothing (everything already present — e.g. a concurrent
+    /// writer converged first) stops the run so remaining batches are
+    /// re-evaluated on the next push instead of hammered blindly.
     async fn upload_missing_objects(
         &self,
         project: &ProjectId,
@@ -326,16 +394,46 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
                 content_hash: digest,
             });
         }
-        if entries.is_empty() {
-            return Ok(0);
+        // Greedy batching by entry count and estimated serialized size.
+        let mut batches: Vec<Vec<ObjectEntryWire>> = Vec::new();
+        let mut current: Vec<ObjectEntryWire> = Vec::new();
+        let mut current_bytes = 0usize;
+        for entry in entries {
+            let cost = entry.envelope_json.len()
+                + entry.id.as_str().len()
+                + entry.content_hash.len()
+                + UPLOAD_ENTRY_OVERHEAD;
+            if !current.is_empty()
+                && (current.len() >= UPLOAD_MAX_ENTRIES
+                    || current_bytes + cost > UPLOAD_MAX_BATCH_BYTES)
+            {
+                batches.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current_bytes += cost;
+            current.push(entry);
         }
-        let response: BatchObjectsResponse = self
-            .send_json(
-                TransportRequest::post(format!("/projects/{project}/objects/batch"), String::new()),
-                Some(&BatchObjectsRequest { entries }),
-            )
-            .await?;
-        Ok(response.stored)
+        if !current.is_empty() {
+            batches.push(current);
+        }
+
+        let mut stored_total = 0usize;
+        for batch in batches {
+            let response: BatchObjectsResponse = self
+                .send_json(
+                    TransportRequest::post(
+                        format!("/projects/{project}/objects/batch"),
+                        String::new(),
+                    ),
+                    Some(&BatchObjectsRequest { entries: batch }),
+                )
+                .await?;
+            stored_total += response.stored;
+            if response.stored == 0 {
+                break;
+            }
+        }
+        Ok(stored_total)
     }
 
     /// Publishes local refs that differ remotely, using optimistic
@@ -1006,8 +1104,8 @@ mod tests {
             .known_object_ids()
             .expect("B ids");
         let set_a: std::collections::BTreeSet<ObjectId> = ids_a.into_iter().collect();
-        let let_set_b: std::collections::BTreeSet<ObjectId> = ids_b.into_iter().collect();
-        assert_eq!(set_a, let_set_b);
+        let set_b: std::collections::BTreeSet<ObjectId> = ids_b.into_iter().collect();
+        assert_eq!(set_a, set_b);
     }
 
     #[tokio::test]

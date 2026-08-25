@@ -445,6 +445,12 @@ pub enum RemoteCommand {
         /// Remote name.
         name: String,
     },
+    /// List agent identities registered on the remote project.
+    Agents {
+        /// Remote name (defaults like `push`).
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 /// `vaultx workspace <subcommand>`.
@@ -990,6 +996,9 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             RemoteCommand::List => with_open(&cli.project, crate::remoting::cmd_remote_list),
             RemoteCommand::Remove { name } => with_open(&cli.project, |s| {
                 crate::remoting::cmd_remote_remove(s, name)
+            }),
+            RemoteCommand::Agents { remote } => with_open(&cli.project, |s| {
+                crate::remoting::cmd_remote_agents(s, remote.as_deref())
             }),
         },
         Command::Workspace { command } => match command {
@@ -2467,7 +2476,7 @@ pub enum PullStrategy {
     Ours,
 }
 
-fn parse_pull_strategy(raw: &str) -> Result<PullStrategy, String> {
+pub(crate) fn parse_pull_strategy(raw: &str) -> Result<PullStrategy, String> {
     match raw {
         "fast-forward" => Ok(PullStrategy::FastForward),
         "ours" => Ok(PullStrategy::Ours),
