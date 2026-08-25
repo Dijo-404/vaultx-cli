@@ -81,14 +81,14 @@ pub struct ObjectEntryWire {
 }
 
 /// Request body of `POST /projects/{id}/objects/batch`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BatchObjectsRequest {
     /// Objects to store; each is hash-validated before persistence.
     pub entries: Vec<ObjectEntryWire>,
 }
 
 /// Response of `POST /projects/{id}/objects/batch`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BatchObjectsResponse {
     /// Newly stored objects (duplicates are idempotent no-ops).
     pub stored: usize,
@@ -110,7 +110,7 @@ pub struct DeviceIdentity {
 /// The client declares what it already has; the server answers with what
 /// it is missing plus remote metadata. The client independently verifies
 /// every returned object's content hash before applying it.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct QueryMissingRequest {
     /// Object ids the client already holds locally.
     pub known_object_ids: Vec<ObjectId>,
@@ -125,7 +125,7 @@ pub struct QueryMissingRequest {
 /// Response of `POST /projects/{id}/objects/query-missing` (plan §28:
 /// missing encrypted objects, remote refs, policy metadata, environment
 /// metadata, signature/public-key material).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct QueryMissingResponse {
     /// Encrypted objects the client is missing.
     pub missing_objects: Vec<ObjectEntryWire>,
@@ -160,7 +160,7 @@ pub struct PutRefRequest {
 }
 
 /// Response body of a successful ref update.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PutRefResponse {
     /// Commit now recorded remotely.
     pub commit: CommitId,
@@ -176,7 +176,7 @@ pub struct CreateAgentRequest {
 }
 
 /// Agent registration response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreatedAgentResponse {
     /// Typed agent identity.
     pub agent_id: AgentId,

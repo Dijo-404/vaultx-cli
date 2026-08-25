@@ -2983,6 +2983,24 @@ dependencies = [
 [[package]]
 name = "vaultx-sync-client"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "hex",
+ "http",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tower",
+ "vaultx-control-plane",
+ "vaultx-crypto",
+ "vaultx-keyring",
+ "vaultx-repository",
+ "vaultx-types",
+]
 
 [[package]]
 name = "vaultx-testkit"
