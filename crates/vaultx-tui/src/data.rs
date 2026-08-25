@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vaultx_audit::{AppendStore as _, AuditEvent, AuditFilter, JsonlAppendStore};
@@ -36,56 +37,69 @@ const BROKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 pub struct SnapshotSource<'a> {
     services: &'a VaultxServices,
     env: Option<String>,
-    socket: Option<&'a Path>,
+}
+
+/// Named bundle produced by [`SnapshotSource::load_agents`]: agent rows
+/// plus the policy names and editor seed derived from the same documents.
+struct AgentsSnapshot {
+    agents: AgentsData,
+    policy_names: Vec<String>,
+    editor_seed: String,
+}
+
+/// Canonical location of the persistent session store within a project
+/// (`<vault>/sessions.json`); shared by the snapshot loader and the
+/// TUI's revoke path.
+#[must_use]
+pub fn session_store_path(services: &VaultxServices) -> PathBuf {
+    services.context().vault_dir().join("sessions.json")
+}
+
+/// Opens the persistent session store for read/revoke paths.
+///
+/// # Errors
+/// Returns the store's message when it cannot be opened.
+pub fn open_session_store(services: &VaultxServices) -> Result<FileSessionStore, String> {
+    FileSessionStore::open(session_store_path(services)).map_err(|e| e.to_string())
 }
 
 impl<'a> SnapshotSource<'a> {
-    /// Builds a source over an opened project.
+    /// Builds a source over an opened project. Broker reachability is
+    /// probed separately (once, at startup) rather than per refresh.
     #[must_use]
-    pub fn new(
-        services: &'a VaultxServices,
-        env: Option<String>,
-        socket: Option<&'a Path>,
-    ) -> Self {
-        Self {
-            services,
-            env,
-            socket,
-        }
+    pub fn new(services: &'a VaultxServices, env: Option<String>) -> Self {
+        Self { services, env }
     }
 
     /// Loads everything one UI refresh needs. Never fails overall:
     /// individual pieces degrade into notes rendered on the status line.
+    /// The broker probe is injected by the caller so refreshes never
+    /// re-probe (and never block the render loop).
     #[must_use]
-    pub fn load(&self) -> LoadedState {
+    pub fn load(&self, broker: BrokerStatus) -> LoadedState {
         let mut notes = Vec::new();
         let snapshot = self.load_snapshot(&mut notes);
         let diff = self.load_diff_lines(&mut notes);
-        let (agents, policy_names, editor_seed) = self.load_agents(&mut notes);
+        let agents_snapshot = self.load_agents(&mut notes);
         let audit = query_audit_rows(&self.audit_path(), OutcomeFilter::All, AUDIT_LIMIT)
             .unwrap_or_else(|reason| {
                 notes.push(format!("audit unavailable: {reason}"));
                 Vec::new()
             });
-        let broker = broker_status(self.socket);
 
         LoadedState {
             snapshot: Snapshot { notes, ..snapshot },
             diff,
-            agents,
+            agents: agents_snapshot.agents,
             audit,
             broker,
-            policy_names,
-            editor_seed,
+            policy_names: agents_snapshot.policy_names,
+            editor_seed: agents_snapshot.editor_seed,
         }
     }
 
     fn audit_path(&self) -> PathBuf {
         self.services.context().audit_path()
-    }
-
-    fn session_store_path(&self) -> PathBuf {
-        self.services.context().vault_dir().join("sessions.json")
     }
 
     fn load_snapshot(&self, notes: &mut Vec<String>) -> Snapshot {
@@ -177,7 +191,7 @@ impl<'a> SnapshotSource<'a> {
         redact_entries(self.services, &entries)
     }
 
-    fn load_agents(&self, notes: &mut Vec<String>) -> (AgentsData, Vec<String>, String) {
+    fn load_agents(&self, notes: &mut Vec<String>) -> AgentsSnapshot {
         let documents = match self.services.policies().load_policies() {
             Ok(documents) => documents,
             Err(err) => {
@@ -211,22 +225,36 @@ impl<'a> SnapshotSource<'a> {
 
         let capabilities = self.load_capabilities(notes);
 
+        // One audit read and one store open for the whole pass; rows are
+        // partitioned per actor below instead of re-querying per agent.
+        let now = unix_now_secs();
+        let session_store = open_session_store(self.services);
+        let mut audit_by_actor: BTreeMap<String, Vec<AuditRow>> = BTreeMap::new();
+        if let Ok(rows) = query_audit_rows(&self.audit_path(), OutcomeFilter::All, AUDIT_LIMIT) {
+            for row in rows {
+                audit_by_actor
+                    .entry(row.actor.clone())
+                    .or_default()
+                    .push(row);
+            }
+        }
+
         let mut details = BTreeMap::new();
         for row in &list {
             let Ok(full_id) = AgentId::parse(&format!("agent_{}", row.name)) else {
                 continue;
             };
             let attached = attached_documents(self.services, &documents, row.name.as_str());
-            let sessions = load_session_rows(
-                &self.session_store_path(),
-                full_id.as_str(),
-                unix_now_secs(),
-            );
+            let sessions = match &session_store {
+                Ok(store) => load_session_rows(store, full_id.as_str(), now),
+                Err(reason) => Err(reason.clone()),
+            };
             let agent_prefix = format!("agent:{}", row.name);
-            let audit = query_audit_rows(&self.audit_path(), OutcomeFilter::All, AUDIT_LIMIT)
+            let audit = audit_by_actor
+                .get(&agent_prefix)
+                .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|row| row.actor == agent_prefix)
                 .take(8)
                 .collect();
 
@@ -251,7 +279,11 @@ impl<'a> SnapshotSource<'a> {
             );
         }
 
-        (AgentsData { list, details }, policy_names, editor_seed)
+        AgentsSnapshot {
+            agents: AgentsData { list, details },
+            policy_names,
+            editor_seed,
+        }
     }
 
     /// Semantic capability names from `<project>/policy-packs`; a missing
@@ -469,16 +501,16 @@ fn action_label(action: vaultx_audit::AuditAction) -> &'static str {
     }
 }
 
-/// Classifies one agent's stored sessions into view rows.
+/// Classifies one agent's stored sessions into view rows against an
+/// already-opened store (one open per refresh, not one per agent).
 ///
 /// # Errors
-/// Returns the store's message when it cannot be opened or read.
+/// Returns the store's message when records cannot be read or parsed.
 pub fn load_session_rows(
-    store_path: &Path,
+    store: &FileSessionStore,
     agent_full_id: &str,
     now_secs: u64,
 ) -> Result<Vec<SessionRow>, String> {
-    let store = FileSessionStore::open(store_path.to_path_buf()).map_err(|e| e.to_string())?;
     let agent = AgentId::parse(agent_full_id).map_err(|e| e.to_string())?;
     let records = store.list_for_agent(&agent).map_err(|e| e.to_string())?;
     Ok(records
@@ -501,7 +533,8 @@ pub fn load_session_rows(
 }
 
 /// Probes the broker endpoint so panes can degrade gracefully when it is
-/// offline.
+/// offline. Called once at startup by the terminal loop; refresh paths
+/// reuse the stored result instead of re-probing.
 #[must_use]
 pub fn broker_status(socket: Option<&Path>) -> BrokerStatus {
     let endpoint = socket
@@ -513,22 +546,31 @@ pub fn broker_status(socket: Option<&Path>) -> BrokerStatus {
     }
 }
 
+/// One shared runtime for the single startup probe; building a fresh
+/// multi-thread runtime per call was the dominant refresh cost.
+static PROBE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn probe_runtime() -> &'static tokio::runtime::Runtime {
+    PROBE_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("shared tokio runtime for the startup broker probe")
+    })
+}
+
 fn probe_endpoint(endpoint: PathBuf) -> Result<String, String> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?
-        .block_on(async move {
-            let attempt = async {
-                let mut client = vaultx_broker_client::BrokerClient::connect(&endpoint)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                client.ping().await.map_err(|e| e.to_string())
-            };
-            tokio::time::timeout(BROKER_PROBE_TIMEOUT, attempt)
+    probe_runtime().block_on(async move {
+        let attempt = async {
+            let mut client = vaultx_broker_client::BrokerClient::connect(&endpoint)
                 .await
-                .map_err(|_| "timed out".to_owned())?
-        })
+                .map_err(|e| e.to_string())?;
+            client.ping().await.map_err(|e| e.to_string())
+        };
+        tokio::time::timeout(BROKER_PROBE_TIMEOUT, attempt)
+            .await
+            .map_err(|_| "timed out".to_owned())?
+    })
 }
 
 #[cfg(test)]

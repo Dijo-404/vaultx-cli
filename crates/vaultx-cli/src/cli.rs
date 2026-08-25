@@ -1535,15 +1535,15 @@ fn cmd_mcp_serve(
 }
 
 /// Launches the interactive TUI (plan §15/§38). The project is opened
-/// first so a bad directory maps onto the exit-3 class; everything else
-/// is delegated to `vaultx-tui`, which owns its own terminal handling.
+/// here so a bad directory maps onto the exit-3 class, and the opened
+/// services are handed to the UI instead of being reopened inside it.
 fn cmd_tui(project: &Path, env: Option<&str>, socket: Option<&Path>) -> Result<String, CliError> {
-    VaultxServices::open(project).map_err(|err| match err {
+    let services = VaultxServices::open(project).map_err(|err| match err {
         CoreError::NotARepository(path) => CliError::NotARepository(path),
         other => other.into(),
     })?;
     vaultx_tui::run(&vaultx_tui::TuiConfig {
-        project: project.to_path_buf(),
+        services: std::sync::Arc::new(services),
         env: env.map(str::to_owned),
         socket: socket.map(Path::to_path_buf),
     })

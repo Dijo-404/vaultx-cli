@@ -357,4 +357,51 @@ mod tests {
         assert!(!rendered.contains("+GET /v1/customers"));
         assert!(!rendered.contains(CANARY));
     }
+
+    #[test]
+    fn policy_delta_reports_deny_rule_removal_and_addition() {
+        use vaultx_policy::{
+            validate_policy, EnvironmentRules, HttpRules, PolicyDocument, Principal,
+            RequestConstraints, ResponseConstraints,
+        };
+        use vaultx_types::{CredentialRef, PolicyName};
+
+        fn document(deny_rules: &[(&str, &str)]) -> PolicyDocument {
+            let document = PolicyDocument {
+                name: PolicyName::parse("stripe").unwrap(),
+                principal: Principal::parse("agent:bot").unwrap(),
+                credential: CredentialRef::parse("deploy_token-1").unwrap(),
+                environment: EnvironmentRules::default(),
+                http: HttpRules {
+                    hosts: vec!["api.example.com".to_owned()],
+                    allow: vec![MethodPathRule {
+                        methods: vec![HttpMethod::GET],
+                        paths: vec!["/**".to_owned()],
+                    }],
+                    deny: deny_rules
+                        .iter()
+                        .map(|(_, path)| MethodPathRule {
+                            methods: vec![HttpMethod::DELETE],
+                            paths: vec![(*path).to_owned()],
+                        })
+                        .collect(),
+                },
+                request: RequestConstraints::default(),
+                response: ResponseConstraints::default(),
+            };
+            validate_policy(&document).expect("valid document");
+            document
+        }
+
+        let old = document(&[("DELETE", "/admin")]);
+        let new = document(&[("DELETE", "/admin/legacy")]);
+
+        let rendered: String = policy_delta(&old, &new)
+            .into_iter()
+            .map(|line| format!("{}{}", line.marker, line.text))
+            .collect();
+
+        assert!(rendered.contains("-(deny) DELETE /admin"));
+        assert!(rendered.contains("+(deny) DELETE /admin/legacy"));
+    }
 }

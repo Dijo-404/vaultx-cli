@@ -51,10 +51,6 @@ pub enum KeyCode {
     Backspace,
     /// Delete.
     Delete,
-    /// Home.
-    Home,
-    /// End.
-    End,
 }
 
 /// One key press with its control modifier.
@@ -647,16 +643,6 @@ impl TextBuffer {
         self.row = (self.row as i32 + delta).max(0) as usize;
         self.clamp_caret();
     }
-
-    /// Jumps to start of line.
-    pub fn home(&mut self) {
-        self.col = 0;
-    }
-
-    /// Jumps to end of line.
-    pub fn end(&mut self) {
-        self.col = self.lines[self.row].chars().count();
-    }
 }
 
 fn char_to_byte(line: &str, char_index: usize) -> usize {
@@ -883,8 +869,6 @@ fn apply_text_key(buffer: &mut TextBuffer, k: KeyInput) {
         KeyCode::Right => buffer.move_horizontal(1),
         KeyCode::Up => buffer.move_vertical(-1),
         KeyCode::Down => buffer.move_vertical(1),
-        KeyCode::Home => buffer.home(),
-        KeyCode::End => buffer.end(),
         KeyCode::Esc | KeyCode::Tab => {}
     }
 }
@@ -1104,6 +1088,19 @@ impl App {
     /// Handles one resize event; layout derivation happens on render.
     pub fn handle_resize(&mut self, width: u16, height: u16) {
         self.size = (width.max(1), height.max(1));
+    }
+
+    /// Replaces loaded data and clamps the agent/audit selections against
+    /// the new lengths so a shrinking snapshot never strands an index
+    /// outside its list.
+    pub fn swap_loaded(&mut self, loaded: LoadedState) {
+        self.loaded = loaded;
+        self.agent_selected = self
+            .agent_selected
+            .min(self.loaded.agents.list.len().saturating_sub(1));
+        self.audit_selected = self
+            .audit_selected
+            .min(self.loaded.audit.len().saturating_sub(1));
     }
 
     /// Focused dashboard pane (defaults to the first pane).
@@ -1691,5 +1688,100 @@ mod tests {
         app.editor.revalidate();
         assert!(!app.editor.can_apply());
         assert!(matches!(app.editor.validation, ValidationState::Invalid(_)));
+    }
+
+    #[test]
+    fn shrinking_reload_clamps_selections_and_keeps_keys_safe() {
+        let mut loaded = sample_loaded();
+        loaded.agents.list = vec![
+            AgentRow {
+                name: "bot-a".to_owned(),
+                enabled: true,
+            },
+            AgentRow {
+                name: "bot-b".to_owned(),
+                enabled: true,
+            },
+        ];
+        let mut app = App::with_size(loaded, DEFAULT_TERMINAL_SIZE);
+
+        // Walk both selections to the last rows of their lists.
+        send(&mut app, key('3'));
+        send(&mut app, press(KeyCode::Down));
+        assert_eq!(app.agent_selected, 1);
+        send(&mut app, key('5'));
+        send(&mut app, press(KeyCode::Down));
+        assert_eq!(app.audit_selected, 1);
+
+        // Shrink every backing list below the stale indices.
+        let mut shrunk = sample_loaded();
+        shrunk.agents.list.truncate(1);
+        shrunk.audit.clear();
+        app.swap_loaded(shrunk);
+
+        assert_eq!(app.agent_selected, 0);
+        assert_eq!(app.audit_selected, 0);
+
+        // Subsequent key handling over the shrunken data must not panic
+        // or push indices out of range.
+        send(&mut app, press(KeyCode::Up));
+        send(&mut app, press(KeyCode::Down));
+        assert_eq!(app.agent_selected, 0);
+        assert_eq!(app.audit_selected, 0);
+    }
+
+    #[test]
+    fn open_modal_swallows_every_key_except_confirm_and_cancel() {
+        let mut app = sample_app();
+        app.request_revoke_session("sess_abc");
+
+        // Tab, digits, refresh and quit are all inert while open.
+        assert_eq!(app.handle_key(press(KeyCode::Tab)), Effect::None);
+        assert_eq!(app.handle_key(key('3')), Effect::None);
+        assert_eq!(app.route, Route::Dashboard);
+        assert_eq!(app.handle_key(key('r')), Effect::None);
+        assert_eq!(app.handle_key(key('q')), Effect::None);
+        assert!(!app.quit_requested);
+        assert!(app.modal.is_some());
+
+        // The confirm path still answers afterwards.
+        assert_eq!(
+            app.handle_key(key('y')),
+            Effect::RevokeSession {
+                session_id: "sess_abc".to_owned()
+            }
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn text_buffer_edits_are_multibyte_safe() {
+        let mut buffer = TextBuffer::from_text("");
+        buffer.insert_char('h');
+        buffer.insert_char('é');
+        buffer.insert_char('日');
+        assert_eq!(buffer.text(), "hé日");
+        assert_eq!(buffer.col, 3);
+
+        // Backspace removes whole characters, never lone bytes.
+        buffer.backspace();
+        assert_eq!(buffer.text(), "hé");
+        assert_eq!(buffer.col, 2);
+
+        // Inserting before a multibyte tail keeps char boundaries aligned.
+        buffer.move_horizontal(-1);
+        buffer.insert_char('ü');
+        assert_eq!(buffer.text(), "hüé");
+        assert_eq!(buffer.col, 2);
+
+        // Delete forward removes exactly one character.
+        buffer.delete();
+        assert_eq!(buffer.text(), "hü");
+        assert_eq!(buffer.col, 2);
+
+        // Splitting between characters never cuts inside one.
+        buffer.move_horizontal(-1);
+        buffer.newline();
+        assert_eq!(buffer.lines, vec!["h", "ü"]);
     }
 }

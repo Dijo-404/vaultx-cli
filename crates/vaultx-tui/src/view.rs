@@ -1220,6 +1220,33 @@ mod tests {
     }
 
     #[test]
+    fn rendering_survives_out_of_range_selections_after_a_shrink() {
+        let mut app = sample_app();
+        // Deliberately stale indices pointing past the lists they index.
+        app.agent_selected = 9;
+        app.session_selected = 9;
+        app.audit_selected = 9;
+        app.diff_selected = 9;
+
+        // Shrink the backing data below those indices (a reload that
+        // removed rows) and render every route: nothing may panic.
+        app.loaded.audit.truncate(1);
+        app.loaded.diff.clear();
+
+        for route in [
+            Route::Dashboard,
+            Route::Diff,
+            Route::Agents,
+            Route::PolicyEditor,
+            Route::Audit,
+        ] {
+            app.route = route;
+            let screen = render_app(&app, 110, 30);
+            assert!(!screen.is_empty());
+        }
+    }
+
+    #[test]
     fn policy_editor_banner_flags_invalid_documents() {
         let mut loaded = sample_app().loaded;
         loaded.editor_seed = "name: [unclosed".to_owned();

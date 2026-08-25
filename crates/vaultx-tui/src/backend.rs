@@ -6,6 +6,7 @@
 
 use std::io::{stdout, Stdout};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -15,10 +16,10 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use vaultx_broker::{FileSessionStore, SessionStore as _};
+use vaultx_broker::SessionStore as _;
 use vaultx_core::VaultxServices;
 
-use crate::data::SnapshotSource;
+use crate::data::{self, SnapshotSource};
 use crate::error::TuiError;
 use crate::state::{App, Effect, KeyCode, KeyInput};
 use crate::view;
@@ -26,8 +27,9 @@ use crate::view;
 /// Launch configuration for [`run`], mirroring sibling CLI commands.
 #[derive(Clone, Debug)]
 pub struct TuiConfig {
-    /// Project directory to open.
-    pub project: PathBuf,
+    /// Already-opened project services; the CLI opens them first so its
+    /// exit-code mapping stays authoritative and the UI never reopens.
+    pub services: Arc<VaultxServices>,
     /// Environment whose pinned commit backs the dashboard.
     pub env: Option<String>,
     /// Broker endpoint override; probed for agent/audit status lines.
@@ -37,12 +39,14 @@ pub struct TuiConfig {
 /// Runs the interactive UI until the user quits.
 ///
 /// # Errors
-/// * [`TuiError::Core`] when `project` is not a vaultx repository.
 /// * [`TuiError::Terminal`] for terminal setup/render/event failures.
 pub fn run(config: &TuiConfig) -> Result<(), TuiError> {
-    let services = VaultxServices::open(&config.project)?;
-    let source = SnapshotSource::new(&services, config.env.clone(), config.socket.as_deref());
-    let mut app = App::with_size(source.load(), startup_size());
+    let services = &config.services;
+    let source = SnapshotSource::new(services, config.env.clone());
+    // One blocking probe before the loop starts; every refresh reuses
+    // this result so the render path never waits on the broker again.
+    let broker = data::broker_status(config.socket.as_deref());
+    let mut app = App::with_size(source.load(broker), startup_size());
 
     let _guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(stdout());
@@ -55,7 +59,7 @@ pub fn run(config: &TuiConfig) -> Result<(), TuiError> {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(input) = map_key(key) {
                         let effect = app.handle_key(input);
-                        apply_effect(&mut app, effect, &source, &services)?;
+                        apply_effect(&mut app, effect, &source, services)?;
                     }
                 }
                 Event::Resize(width, height) => app.handle_resize(width, height),
@@ -98,8 +102,6 @@ fn map_key(key: KeyEvent) -> Option<KeyInput> {
         CrosstermKeyCode::Right => KeyCode::Right,
         CrosstermKeyCode::Backspace => KeyCode::Backspace,
         CrosstermKeyCode::Delete => KeyCode::Delete,
-        CrosstermKeyCode::Home => KeyCode::Home,
-        CrosstermKeyCode::End => KeyCode::End,
         _ => return None,
     };
     Some(KeyInput {
@@ -144,7 +146,11 @@ fn apply_effect(
 }
 
 fn reload(app: &mut App, source: &SnapshotSource<'_>) {
-    app.loaded = source.load();
+    // Refreshes keep the one startup broker probe result; selections are
+    // clamped against the fresh lengths so a shrinking snapshot cannot
+    // strand an out-of-range index.
+    let broker = app.loaded.broker.clone();
+    app.swap_loaded(source.load(broker));
 }
 
 /// Revokes one session through the persistent session store. Failure
@@ -155,8 +161,7 @@ fn revoke_session(services: &VaultxServices, session_id: &str) -> Result<(), Str
 
     let id = SessionId::parse(session_id)
         .map_err(|_| "expected a full session id (`sess_...`)".to_owned())?;
-    let path = services.context().vault_dir().join("sessions.json");
-    let store = FileSessionStore::open(path).map_err(|e| e.to_string())?;
+    let store = data::open_session_store(services)?;
     store.revoke(&id).map_err(|err| match err {
         BrokerError::InvalidSession => "no such session".to_owned(),
         other => other.to_string(),
@@ -174,15 +179,21 @@ impl TerminalGuard {
     fn new() -> Result<Self, TuiError> {
         enable_raw_mode()?;
         let mut stdout = stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen)
-            .map_err(|e| TuiError::Terminal(std::io::Error::other(e.to_string())))?;
+        if let Err(err) = crossterm::execute!(stdout, EnterAlternateScreen) {
+            // Restore raw mode before surfacing the failure; otherwise
+            // the early return strands the terminal without echo.
+            let _ = disable_raw_mode();
+            return Err(TuiError::Terminal(std::io::Error::other(err.to_string())));
+        }
         Ok(Self { stdout })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        // Leave the alternate screen before dropping raw mode so the
+        // shell regains a normal terminal in the correct order.
         let _ = crossterm::execute!(self.stdout, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
     }
 }

@@ -11,7 +11,4 @@ pub enum TuiError {
     /// Terminal setup, event polling, or rendering failed.
     #[error("terminal i/o failure: {0}")]
     Terminal(#[from] std::io::Error),
-    /// The project could not be opened before the UI started.
-    #[error(transparent)]
-    Core(#[from] vaultx_core::CoreError),
 }
