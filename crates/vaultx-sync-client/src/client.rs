@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 use serde::de::DeserializeOwned;
 use vaultx_control_plane::model::RefState;
 use vaultx_control_plane::protocol::{
-    BatchObjectsRequest, BatchObjectsResponse, ObjectEntryWire, PutRefRequest, QueryMissingRequest,
-    QueryMissingResponse,
+    AuditIngestRequest, AuditIngestResult, BatchObjectsRequest, BatchObjectsResponse, IngestEvent,
+    ObjectEntryWire, PutRefRequest, QueryMissingRequest, QueryMissingResponse,
 };
 use vaultx_crypto::signature::{verify as verify_signature, VerifyingPublicKey};
 use vaultx_repository::object::{hash_canonical, ObjectEnvelope, ObjectType};
@@ -239,6 +239,63 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
         Ok(conflicts)
     }
 
+    /// Uploads client-supplied audit events to the project's server-side
+    /// audit chain. The response reports per-event acceptances and
+    /// positional rejections; a 200 is returned even for partial rejects.
+    ///
+    /// # Errors
+    /// [`SyncError`] for transport, protocol, or HTTP rejections (a
+    /// malformed envelope or over-limit batch fails with
+    /// [`SyncError::Api`]).
+    pub async fn upload_audit_events(
+        &self,
+        project: ProjectId,
+        events: Vec<IngestEvent>,
+    ) -> SyncResultOf<AuditIngestResult> {
+        self.send_json(
+            TransportRequest::post(format!("/projects/{project}/audit"), String::new()),
+            Some(&AuditIngestRequest { events }),
+        )
+        .await
+    }
+
+    /// Lists agent identities registered on the remote project.
+    ///
+    /// # Errors
+    /// [`SyncError`] for transport, protocol, or HTTP rejections.
+    pub async fn list_remote_agents(
+        &self,
+        project: ProjectId,
+    ) -> SyncResultOf<Vec<crate::RemoteAgentInfo>> {
+        self.send_json(
+            TransportRequest::get(format!("/projects/{project}/agents")),
+            None::<&()>,
+        )
+        .await
+    }
+
+    /// Applies remotely-known policy documents through the workspace's
+    /// optional policy seam. The server is authoritative only for names it
+    /// serves; local-only files are never enumerated or touched.
+    async fn apply_remote_policies(&self, project: &ProjectId) -> SyncResultOf<usize> {
+        let policies: Vec<vaultx_control_plane::model::PolicyDocument> = self
+            .send_json(
+                TransportRequest::get(format!("/projects/{project}/policies")),
+                None::<&()>,
+            )
+            .await?;
+        let mut applied = 0usize;
+        for policy in &policies {
+            if self
+                .workspace
+                .apply_remote_policy(policy.name.as_str(), &policy.document_json)?
+            {
+                applied += 1;
+            }
+        }
+        Ok(applied)
+    }
+
     /// Uploads objects the remote lacks after a local self-check that each
     /// envelope's canonical hash matches its content-derived id.
     async fn upload_missing_objects(
@@ -396,6 +453,9 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> SyncService for ControlPlaneSy
         };
         result.downloaded = downloaded_total;
         result.conflicts = self.reconcile_remote_refs(&response).await?;
+        // Policy convergence runs last: objects/refs first, then remote
+        // policy documents overwrite local copies whose content differs.
+        result.policies_applied = self.apply_remote_policies(&project).await?;
         Ok(result)
     }
 
@@ -1473,5 +1533,129 @@ mod tests {
             map_rejection(&unstructured),
             SyncError::Api { status: 401 }
         ));
+    }
+
+    fn ingest_event(actor: &str, action: &str) -> IngestEvent {
+        IngestEvent {
+            actor: actor.to_owned(),
+            action: action.to_owned(),
+            detail: serde_json::json!({ "via": "sync-client-test" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_audit_round_trips_with_partial_reject_mapping() {
+        let world = World::new();
+        let project = world.project.clone();
+
+        // One invalid entry (empty actor) must not abort its valid
+        // siblings; positions map back onto the request array.
+        let result = world
+            .client_a()
+            .upload_audit_events(
+                project.clone(),
+                vec![
+                    ingest_event("ci-bot", "secret-rotate"),
+                    ingest_event("   ", "http-request"),
+                    ingest_event("deploy-bot", "config-committed"),
+                ],
+            )
+            .await
+            .expect("ingest round trip");
+        assert_eq!(result.accepted, 2);
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(result.rejected[0].index, 1);
+        assert!(!result.rejected[0].reason.is_empty());
+
+        let stored = world.store.list_audit_events(&project).expect("audit");
+        assert_eq!(stored.len(), 3, "two ingested plus one internal marker");
+        assert_eq!(stored[0].actor, "ci-bot");
+        assert_eq!(stored[0].action, "secret-rotate");
+        assert_eq!(stored[0].sequence, 0);
+        assert_eq!(stored[0].prev_hash, None);
+        assert_eq!(stored[1].actor, "deploy-bot");
+        assert_eq!(stored[1].sequence, 1);
+
+        // A second batch continues the server-side chain from the tail.
+        let follow_up = world
+            .client_a()
+            .upload_audit_events(
+                project.clone(),
+                vec![ingest_event("ci-bot", "session-created")],
+            )
+            .await
+            .expect("second batch");
+        assert_eq!(follow_up.accepted, 1);
+        let stored = world.store.list_audit_events(&project).expect("audit");
+        let max_sequence = stored.iter().map(|e| e.sequence).max().expect("non-empty");
+        assert_eq!(max_sequence, 4);
+        for pair in stored.windows(2) {
+            assert_eq!(
+                pair[1].sequence,
+                pair[0].sequence + 1,
+                "sequences stay contiguous across batches"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_applies_differing_remote_policy_and_keeps_local_only_files() {
+        let world = World::new();
+        let project = world.project.clone();
+        let policy_name = vaultx_types::PolicyName::parse("read_only").expect("valid");
+        let v1 = r#"{"name":"read_only","version":1}"#;
+        world
+            .store
+            .upsert_policy(
+                &project,
+                &vaultx_control_plane::model::PolicyDocument {
+                    name: policy_name.clone(),
+                    document_json: v1.to_owned(),
+                },
+            )
+            .expect("seed remote policy");
+
+        // A pre-existing local-only policy file must never be touched by
+        // pulls: the server is authoritative only for names it serves.
+        let bob_policies_dir = world.bob_dir.path().join(".vaultx").join("policies");
+        std::fs::create_dir_all(&bob_policies_dir).expect("policies dir");
+        let local_only_path = bob_policies_dir.join("team_local.yaml");
+        std::fs::write(&local_only_path, b"name: team-local\n").expect("local-only seed");
+
+        // First pull writes the differing remote policy.
+        let pulled = world.client_b().pull(project.clone()).await.expect("pull");
+        assert_eq!(pulled.policies_applied, 1);
+        let served_path = bob_policies_dir.join(format!("{policy_name}.yaml"));
+        assert_eq!(
+            std::fs::read_to_string(&served_path).expect("applied policy"),
+            v1
+        );
+        assert_eq!(
+            std::fs::read_to_string(&local_only_path).expect("local-only intact"),
+            "name: team-local\n"
+        );
+
+        // An unchanged remote applies nothing on the next pull...
+        let pulled = world.client_b().pull(project.clone()).await.expect("pull");
+        assert_eq!(pulled.policies_applied, 0);
+
+        // ...while an updated remote document overwrites the local copy.
+        let v2 = r#"{"name":"read_only","version":2}"#;
+        world
+            .store
+            .upsert_policy(
+                &project,
+                &vaultx_control_plane::model::PolicyDocument {
+                    name: policy_name,
+                    document_json: v2.to_owned(),
+                },
+            )
+            .expect("update remote policy");
+        let pulled = world.client_b().pull(project.clone()).await.expect("pull");
+        assert_eq!(pulled.policies_applied, 1);
+        assert_eq!(
+            std::fs::read_to_string(&served_path).expect("updated policy"),
+            v2
+        );
     }
 }

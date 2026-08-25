@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+use sha2::{Digest, Sha256};
 use vaultx_types::{AgentId, AuditEventId, CommitId, ObjectId, PolicyName, ProjectId, WorkspaceId};
 
 use crate::error::ControlPlaneError;
@@ -16,7 +17,22 @@ use crate::model::{
     DeviceRecord, PolicyDocument, Principal, ProjectRecord, RefNamespace, RefState, UserRecord,
     WorkspaceMembership, WorkspaceRecord,
 };
-use crate::protocol::{AgentView, AuditEventView, EnvironmentMetadata, ObjectEntryWire};
+use crate::protocol::{
+    AgentView, AuditEventView, AuditIngestRejection, EnvironmentMetadata, IngestEvent,
+    ObjectEntryWire,
+};
+
+/// Maximum serialized size of one audit event's `detail` payload. Bounds
+/// a single event well below the transport body limit even inside large
+/// batches; larger payloads are refused per-event instead of failing the
+/// whole request.
+pub const MAX_AUDIT_DETAIL_BYTES: usize = 16 * 1024;
+
+/// Maximum length of an ingested event's `actor` field.
+const MAX_AUDIT_ACTOR_LEN: usize = 256;
+
+/// Maximum length of an ingested event's `action` field.
+const MAX_AUDIT_ACTION_LEN: usize = 128;
 
 /// Outcome of an atomic ref compare-and-swap.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,7 +272,8 @@ pub trait ControlPlaneStore: Send + Sync {
 
     // ---- audit ----
 
-    /// Appends an immutable audit event.
+    /// Appends an immutable audit event, linking it onto the project's
+    /// hash chain.
     ///
     /// # Errors
     /// Propagates storage failures.
@@ -270,6 +287,23 @@ pub trait ControlPlaneStore: Send + Sync {
 
     /// Audit events for `project`, oldest first.
     fn list_audit_events(&self, project: &ProjectId) -> StoreResult<Vec<AuditEventView>>;
+
+    /// Ingests a batch of client-supplied audit events under `project`,
+    /// assigning ids and extending the per-project sequence/hash chain.
+    ///
+    /// Validation is per event: valid entries are appended even when
+    /// siblings are refused; refusals carry the input index and a
+    /// static reason. An empty batch appends nothing and reports zero
+    /// acceptances.
+    ///
+    /// # Errors
+    /// Propagates storage failures (never per-event validation issues —
+    /// those surface as positional rejections in the returned pair).
+    fn append_events(
+        &self,
+        project: &ProjectId,
+        events: &[IngestEvent],
+    ) -> StoreResult<(usize, Vec<AuditIngestRejection>)>;
 
     // ---- sync state ----
 
@@ -326,6 +360,54 @@ struct AgentRow {
     display_name: String,
     policy_name: String,
     revoked: bool,
+}
+
+impl StoreState {
+    /// Appends one event onto `project_key`'s hash chain and returns the
+    /// stored view. Caller supplies content through `build` so internal
+    /// appends and ingestion share id/sequence/prev-hash assignment; must
+    /// be invoked while the store mutex is already held.
+    fn chain_append(
+        &mut self,
+        project_key: Option<&str>,
+        build: impl FnOnce(AuditEventView) -> AuditEventView,
+    ) -> StoreResult<AuditEventView> {
+        // The first event for a project chains onto genesis (`None`);
+        // every successor anchors to the recomputed canonical digest of
+        // the stored tail — exactly the bytes GET serves.
+        let (sequence, prev_hash) = match self
+            .audit
+            .iter()
+            .rev()
+            .find(|(p, _)| p.as_deref() == project_key)
+        {
+            Some((_, tail)) => (tail.sequence + 1, Some(tail_hash(tail)?)),
+            None => (0, None),
+        };
+        let event_id = fresh_entity_id(AuditEventId::PREFIX)?;
+        let view = build(AuditEventView {
+            event_id: AuditEventId::parse(&event_id)
+                .map_err(|_| ControlPlaneError::Storage("audit id".to_owned()))?,
+            actor: String::new(),
+            action: String::new(),
+            detail: serde_json::json!({}),
+            occurred_at_unix: now_unix(),
+            sequence,
+            prev_hash,
+        });
+        self.audit
+            .push((project_key.map(str::to_owned), view.clone()));
+        Ok(view)
+    }
+}
+
+/// Recomputes the canonical chain digest of an already-stored event:
+/// hex SHA-256 over its full serialized form (identity, sequence, and
+/// predecessor link included).
+fn tail_hash(event: &AuditEventView) -> Result<String, ControlPlaneError> {
+    serde_json::to_vec(event)
+        .map(|bytes| hex::encode(Sha256::digest(bytes)))
+        .map_err(|_| ControlPlaneError::Storage("audit serialization".to_owned()))
 }
 
 impl InMemoryControlPlaneStore {
@@ -748,20 +830,15 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         action: &str,
         detail_json: &str,
     ) -> StoreResult<AuditEventView> {
-        let event_id = fresh_entity_id(AuditEventId::PREFIX)?;
-        let view = AuditEventView {
-            event_id: AuditEventId::parse(&event_id)
-                .map_err(|_| ControlPlaneError::Storage("audit id".to_owned()))?,
-            actor: actor.to_owned(),
-            action: action.to_owned(),
-            detail: serde_json::from_str(detail_json)
-                .map_err(|_| ControlPlaneError::Storage("audit detail".to_owned()))?,
-            occurred_at_unix: now_unix(),
-        };
+        let detail = serde_json::from_str(detail_json)
+            .map_err(|_| ControlPlaneError::Storage("audit detail".to_owned()))?;
         self.lock()
-            .audit
-            .push((project.map(|p| p.as_str().to_owned()), view.clone()));
-        Ok(view)
+            .chain_append(project.map(|p| p.as_str()), |view| AuditEventView {
+                actor: actor.to_owned(),
+                action: action.to_owned(),
+                detail,
+                ..view
+            })
     }
 
     fn list_audit_events(&self, project: &ProjectId) -> StoreResult<Vec<AuditEventView>> {
@@ -772,6 +849,58 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .filter(|(p, _)| p.as_deref() == Some(project.as_str()))
             .map(|(_, v)| v.clone())
             .collect())
+    }
+
+    fn append_events(
+        &self,
+        project: &ProjectId,
+        events: &[IngestEvent],
+    ) -> StoreResult<(usize, Vec<AuditIngestRejection>)> {
+        let mut accepted = 0usize;
+        let mut rejected = Vec::new();
+        // One lock acquisition covers validation plus every append so the
+        // chain cannot interleave with concurrent writers mid-batch.
+        let mut state = self.lock();
+        for (index, event) in events.iter().enumerate() {
+            if event.actor.trim().is_empty() {
+                rejected.push(AuditIngestRejection {
+                    index,
+                    reason: "actor must not be empty".to_owned(),
+                });
+                continue;
+            }
+            if event.actor.chars().count() > MAX_AUDIT_ACTOR_LEN {
+                rejected.push(AuditIngestRejection {
+                    index,
+                    reason: "actor exceeds maximum length".to_owned(),
+                });
+                continue;
+            }
+            if event.action.is_empty() || event.action.chars().count() > MAX_AUDIT_ACTION_LEN {
+                rejected.push(AuditIngestRejection {
+                    index,
+                    reason: "action must be non-empty and bounded".to_owned(),
+                });
+                continue;
+            }
+            let detail_bytes = serde_json::to_vec(&event.detail).unwrap_or_default().len();
+            if detail_bytes > MAX_AUDIT_DETAIL_BYTES {
+                rejected.push(AuditIngestRejection {
+                    index,
+                    reason: "detail payload exceeds size limit".to_owned(),
+                });
+                continue;
+            }
+            let project_key = project.as_str();
+            state.chain_append(Some(project_key), |view| AuditEventView {
+                actor: event.actor.clone(),
+                action: event.action.clone(),
+                detail: event.detail.clone(),
+                ..view
+            })?;
+            accepted += 1;
+        }
+        Ok((accepted, rejected))
     }
 
     fn update_sync_state(
@@ -938,5 +1067,57 @@ mod tests {
         store
             .update_sync_state(&project, "ab12", Some(&CommitId::parse("cmt_x").unwrap()))
             .unwrap();
+    }
+
+    #[test]
+    fn ingested_events_chain_per_project_with_partial_rejects() {
+        use crate::protocol::IngestEvent;
+
+        let store = InMemoryControlPlaneStore::new();
+        let project = project();
+        let other = ProjectId::parse("proj_isolated").unwrap();
+
+        let events = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(actor, action)| IngestEvent {
+                    actor: (*actor).to_owned(),
+                    action: (*action).to_owned(),
+                    detail: serde_json::json!({}),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let (accepted, rejected) = store
+            .append_events(&project, &events(&[("bot-a", "one"), ("", "bad")]))
+            .unwrap();
+        assert_eq!((accepted, rejected.len()), (1, 1));
+        assert_eq!(rejected[0].index, 1);
+
+        // The second project's chain starts at genesis independently...
+        let (accepted, _) = store
+            .append_events(&other, &events(&[("bot-b", "solo")]))
+            .unwrap();
+        assert_eq!(accepted, 1);
+        // ...and both continue from their own tails.
+        let (accepted, _) = store
+            .append_events(&project, &events(&[("bot-a", "two")]))
+            .unwrap();
+        assert_eq!(accepted, 1);
+
+        let mine = store.list_audit_events(&project).unwrap();
+        let theirs = store.list_audit_events(&other).unwrap();
+        assert_eq!(
+            mine.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![0, 1],
+            "per-project sequences stay contiguous"
+        );
+        assert_eq!(
+            theirs.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![0]
+        );
+        for pair in mine.windows(2) {
+            assert_ne!(pair[0].prev_hash, pair[1].prev_hash);
+        }
     }
 }

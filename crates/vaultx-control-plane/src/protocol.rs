@@ -214,7 +214,7 @@ pub struct CreatedAgentResponse {
 }
 
 /// Agent view returned by `GET /projects/{id}/agents`. Tokens never echo.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentView {
     /// Typed agent identity.
     pub agent_id: AgentId,
@@ -227,7 +227,14 @@ pub struct AgentView {
 }
 
 /// Audit event view returned by `GET /projects/{id}/audit`.
-#[derive(Clone, Debug, Serialize)]
+///
+/// Every stored event — whether recorded internally by a route or
+/// accepted through `POST /projects/{id}/audit` — participates in one
+/// per-project hash chain: `sequence` numbers events contiguously from
+/// zero and `prev_hash` carries the hex SHA-256 over the canonical JSON
+/// serialization of the preceding event (`None` for the project's
+/// genesis event).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuditEventView {
     /// Typed audit event id.
     pub event_id: AuditEventId,
@@ -239,6 +246,64 @@ pub struct AuditEventView {
     pub detail: serde_json::Value,
     /// Unix seconds at ingestion.
     pub occurred_at_unix: u64,
+    /// Contiguous per-project position (genesis = 0).
+    #[serde(default)]
+    pub sequence: u64,
+    /// Hex SHA-256 over the preceding event's canonical form; `None` for
+    /// the genesis event.
+    #[serde(default)]
+    pub prev_hash: Option<String>,
+}
+
+/// One client-supplied audit event of `POST /projects/{id}/audit`.
+///
+/// Server-assigned identity fields (`event_id`, `sequence`, `prev_hash`,
+/// `occurred_at_unix`) are deliberately absent: the server mints them at
+/// ingestion so the chain it anchors is the chain it vouches for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IngestEvent {
+    /// Acting principal; must be non-empty.
+    pub actor: String,
+    /// Action code (e.g. `secret-rotate`); must be non-empty.
+    pub action: String,
+    /// Secret-free structured detail; defaults to an empty object when
+    /// omitted.
+    #[serde(default = "empty_audit_detail")]
+    pub detail: serde_json::Value,
+}
+
+fn empty_audit_detail() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// Request body of `POST /projects/{id}/audit`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuditIngestRequest {
+    /// Events to ingest; individually validated so valid entries are
+    /// accepted even when siblings are rejected.
+    pub events: Vec<IngestEvent>,
+}
+
+/// Why one ingested event was refused, reported by input position.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditIngestRejection {
+    /// Position of the offending event inside the request's `events`
+    /// array.
+    pub index: usize,
+    /// Static, secret-free refusal reason.
+    pub reason: String,
+}
+
+/// Response body of `POST /projects/{id}/audit`. A 200 status reports
+/// partial acceptance; only a malformed envelope is rejected outright
+/// with 400.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditIngestResult {
+    /// Events appended to the project's audit chain.
+    pub accepted: usize,
+    /// Refused events with their request positions and reasons.
+    #[serde(default)]
+    pub rejected: Vec<AuditIngestRejection>,
 }
 
 /// Deterministic message covered by the device attestation signature for

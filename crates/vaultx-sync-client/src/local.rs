@@ -82,6 +82,19 @@ pub trait LocalWorkspace: Send + Sync {
     /// # Errors
     /// [`SyncError`] when resolvable-but-unreadable.
     fn commit_parents(&self, id: &CommitId) -> Result<Option<Vec<CommitId>>, SyncError>;
+
+    /// Applies one remotely-served policy document under `name`, where
+    /// `yaml` is the server's canonical document text (canonical JSON,
+    /// which parses as YAML). Returns true when local content differed and
+    /// was overwritten; false when absent-difference meant no write. The
+    /// default implementation is a no-op so workspaces without policy
+    /// support keep compiling and report zero applied policies.
+    ///
+    /// # Errors
+    /// [`SyncError`] on filesystem failures.
+    fn apply_remote_policy(&self, _name: &str, _yaml: &str) -> Result<bool, SyncError> {
+        Ok(false)
+    }
 }
 
 /// Filesystem adapter over [`vaultx_repository::Repository`], reusing its
@@ -261,6 +274,23 @@ impl LocalWorkspace for FsWorkspace {
             Err(vaultx_repository::RepoError::ObjectNotFound(_)) => Ok(None),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn apply_remote_policy(&self, name: &str, yaml: &str) -> Result<bool, SyncError> {
+        // Mirrors the human-editable layout (`<root>/.vaultx/policies/
+        // <name>.yaml`) used by the policy ops service, so pulled policies
+        // load identically to locally authored ones. Policy names are
+        // validated `[a-z0-9_-]`, keeping the derived filename path-safe.
+        let dir = self.repo.vault_dir().join("policies");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{name}.yaml"));
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            if existing == yaml {
+                return Ok(false);
+            }
+        }
+        std::fs::write(&path, yaml)?;
+        Ok(true)
     }
 }
 
@@ -482,5 +512,58 @@ mod tests {
         assert!(is_ancestor_or_equal(&ws, &root, &child).expect("ancestry"));
         assert!(!is_ancestor_or_equal(&ws, &child, &root).expect("reverse"));
         assert!(is_ancestor_or_equal(&ws, &child, &child).expect("self"));
+    }
+
+    /// Minimal workspace implementing only the pre-policy surface: proves
+    /// the provided `apply_remote_policy` default keeps such impls
+    /// compiling and reports "not applied".
+    struct BareWorkspace;
+
+    impl LocalWorkspace for BareWorkspace {
+        fn known_object_ids(&self) -> Result<Vec<ObjectId>, SyncError> {
+            Ok(Vec::new())
+        }
+
+        fn canonical_bytes(&self, _id: &ObjectId) -> Result<Option<Vec<u8>>, SyncError> {
+            Ok(None)
+        }
+
+        fn apply_object(&self, _envelope: &ObjectEnvelope) -> Result<bool, SyncError> {
+            Ok(false)
+        }
+
+        fn all_refs(&self) -> Result<Vec<vaultx_control_plane::model::RefState>, SyncError> {
+            Ok(Vec::new())
+        }
+
+        fn read_ref(
+            &self,
+            _namespace: RefNamespace,
+            _name: &str,
+        ) -> Result<Option<CommitId>, SyncError> {
+            Ok(None)
+        }
+
+        fn apply_ref(
+            &self,
+            _namespace: RefNamespace,
+            _name: &str,
+            _commit: &CommitId,
+            _allow_protected_override: bool,
+        ) -> Result<RefApplyOutcome, SyncError> {
+            Ok(RefApplyOutcome::Applied)
+        }
+
+        fn commit_parents(&self, _id: &CommitId) -> Result<Option<Vec<CommitId>>, SyncError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn apply_remote_policy_defaults_to_not_applied() {
+        let bare = BareWorkspace;
+        assert!(!bare
+            .apply_remote_policy("read_only", "{}")
+            .expect("default is a no-op"));
     }
 }

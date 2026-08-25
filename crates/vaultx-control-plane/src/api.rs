@@ -2,9 +2,11 @@
 //!
 //! Every administrative route authorizes through
 //! [`crate::auth::ADMIN_CLASSES`] (control-plane sessions only); the
-//! data-plane sync route accepts [`crate::auth::SYNC_CLASSES`]. Agent
-//! session tokens are therefore structurally unable to reach any route
-//! here, satisfying the plan §39 route-surface separation note.
+//! data-plane sync surface accepts [`crate::auth::SYNC_CLASSES`] (the
+//! `query-missing` exchange plus the policy listing that pulls converge
+//! against). Agent session tokens are therefore structurally unable to
+//! reach any route here, satisfying the plan §39 route-surface separation
+//! note.
 
 use std::sync::Arc;
 
@@ -22,10 +24,10 @@ use crate::model::{
     DeviceRecord, PolicyDocument, Principal, RefState, WorkspaceMembership, WorkspaceRecord,
 };
 use crate::protocol::{
-    device_attestation_message, AgentView, AuditEventView, BatchObjectsRequest,
-    BatchObjectsResponse, CreateAgentRequest, CreatedAgentResponse, DeviceKeyFingerprint,
-    ObjectEntryWire, PutRefRequest, PutRefResponse, QueryMissingRequest, QueryMissingResponse,
-    SessionRequest, SessionResponse, WorkspaceView,
+    device_attestation_message, AgentView, AuditEventView, AuditIngestRequest, AuditIngestResult,
+    BatchObjectsRequest, BatchObjectsResponse, CreateAgentRequest, CreatedAgentResponse,
+    DeviceKeyFingerprint, ObjectEntryWire, PutRefRequest, PutRefResponse, QueryMissingRequest,
+    QueryMissingResponse, SessionRequest, SessionResponse, WorkspaceView,
 };
 use crate::store::{AgentSessionContext, ControlPlaneStore, RefCasOutcome};
 
@@ -80,7 +82,10 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}/policies", get(list_policies))
         .route("/projects/{id}/policies/{name}", put(put_policy))
         .route("/projects/{id}/agents", get(list_agents).post(create_agent))
-        .route("/projects/{id}/audit", get(project_audit))
+        .route(
+            "/projects/{id}/audit",
+            get(project_audit).post(ingest_audit),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -490,7 +495,11 @@ async fn list_policies(
     headers: HeaderMap,
     Path(project_id): Path<ProjectId>,
 ) -> HandlerResult<Vec<PolicyDocument>> {
-    let principal = auth::authorize(&*state.store, &headers, auth::ADMIN_CLASSES)?;
+    // Policy documents are part of the data plane as well as the admin
+    // plane: `query-missing` already serves them to sync principals so
+    // pulls can converge, so this dedicated listing accepts the same
+    // classes. Agent tokens remain rejected by class.
+    let principal = auth::authorize(&*state.store, &headers, auth::SYNC_CLASSES)?;
     require_project(&*state.store, &principal, &project_id)?;
     Ok(Json(state.store.list_policies(&project_id)?))
 }
@@ -586,6 +595,46 @@ async fn project_audit(
     Ok(Json(state.store.list_audit_events(&project_id)?))
 }
 
+/// `POST /projects/{id}/audit` — ingests client-supplied audit events
+/// onto the project's per-project sequence/hash chain.
+///
+/// Authorization matches the sibling write routes: a control-session
+/// (`vxs_`) token from a workspace member. Per-event validation failures
+/// are reported positionally inside a 200 response; only a malformed
+/// envelope (undecodable body or over-limit batch cardinality) fails the
+/// whole request with the structured error envelope. An empty batch is
+/// accepted as a no-op (`accepted: 0`) — consistent with the object
+/// upload route's idempotent-friendly semantics.
+async fn ingest_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<ProjectId>,
+    body: axum::body::Bytes,
+) -> HandlerResult<AuditIngestResult> {
+    let principal = auth::authorize(&*state.store, &headers, auth::ADMIN_CLASSES)?;
+    require_project(&*state.store, &principal, &project_id)?;
+    // The envelope is parsed manually so malformed JSON surfaces through
+    // the structured error envelope instead of the extractor's default.
+    let request: AuditIngestRequest = serde_json::from_slice(&body)
+        .map_err(|_| ControlPlaneError::BadRequest("malformed audit ingest envelope"))?;
+    if request.events.len() > MAX_LIST_ITEMS {
+        return Err(ControlPlaneError::BadRequest("too many events"));
+    }
+    let (accepted, rejected) = state.store.append_events(&project_id, &request.events)?;
+    state.store.append_audit_event(
+        Some(&project_id),
+        &principal.subject,
+        "audit.ingest",
+        &serde_json::json!({
+            "submitted": request.events.len(),
+            "accepted": accepted,
+            "rejected": rejected.len()
+        })
+        .to_string(),
+    )?;
+    Ok(Json(AuditIngestResult { accepted, rejected }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -600,7 +649,8 @@ mod tests {
     use super::*;
     use crate::model::{RefNamespace, UserRecord, WorkspaceRecord};
     use crate::protocol::{
-        device_attestation_message, ObjectEntryWire, PutRefRequest, SessionResponse,
+        device_attestation_message, AuditIngestRequest, IngestEvent, ObjectEntryWire,
+        PutRefRequest, SessionResponse,
     };
     use crate::store::InMemoryControlPlaneStore;
 
@@ -904,6 +954,11 @@ mod tests {
                 Some(r#"{"display_name":"bot","policy_name":"read_only"}"#.to_owned()),
             ),
             ("GET", format!("/projects/{project}/audit"), None),
+            (
+                "POST",
+                format!("/projects/{project}/audit"),
+                Some(r#"{"events":[]}"#.to_owned()),
+            ),
         ] {
             let (status, _) = call(&fx.app, method, &uri, Some(AGENT_TOKEN), body).await;
             assert_eq!(
@@ -1669,5 +1724,278 @@ mod tests {
                 "migration DDL missing table `{table}`"
             );
         }
+    }
+
+    /// Recomputes the canonical chain digest of a served event, mirroring
+    /// `store::tail_hash`: hex SHA-256 over the full serialized view.
+    fn chain_hash(event: &AuditEventView) -> String {
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(event).expect("serialization"),
+        ))
+    }
+
+    /// Fetches GET audit and asserts contiguous per-project sequencing and
+    /// hash linkage across every stored event, including internal ones.
+    async fn assert_chain_intact(app: &Router, project: &ProjectId) -> Vec<AuditEventView> {
+        let uri = format!("/projects/{project}/audit");
+        let (status, value) = call(app, "GET", &uri, Some(ALICE_TOKEN), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let events: Vec<AuditEventView> = serde_json::from_value(value).expect("event views");
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, index as u64, "sequences are contiguous");
+            match index {
+                0 => assert_eq!(event.prev_hash, None, "genesis has no predecessor"),
+                _ => assert_eq!(
+                    event.prev_hash.as_deref(),
+                    Some(chain_hash(&events[index - 1]).as_str()),
+                    "event {index} must anchor to its predecessor's digest"
+                ),
+            }
+        }
+        events
+    }
+
+    fn ingest_event(actor: &str, action: &str) -> IngestEvent {
+        IngestEvent {
+            actor: actor.to_owned(),
+            action: action.to_owned(),
+            detail: serde_json::json!({ "note": format!("{action} by {actor}") }),
+        }
+    }
+
+    /// Serializes an ingest request into a wire body.
+    fn ingest_body(request: AuditIngestRequest) -> String {
+        serde_json::to_string(&request).expect("serialize")
+    }
+
+    async fn post_audit(
+        app: &Router,
+        project: &ProjectId,
+        token: Option<&str>,
+        body: String,
+    ) -> (StatusCode, serde_json::Value) {
+        call(
+            app,
+            "POST",
+            &format!("/projects/{project}/audit"),
+            token,
+            Some(body),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn policy_listing_serves_sync_classes_but_never_agent_tokens() {
+        let fx = fixture();
+        fx.store
+            .upsert_policy(
+                &fx.project,
+                &crate::model::PolicyDocument {
+                    name: vaultx_types::PolicyName::parse("read_only").unwrap(),
+                    document_json: "{}".to_owned(),
+                },
+            )
+            .unwrap();
+
+        // Workload tokens are data-plane principals: they may read the
+        // policy listing their pulls converge against...
+        let workload_token = "vxw_workload_session";
+        fx.store
+            .issue_session(
+                workload_token,
+                &Principal {
+                    subject: "oidc:ci".to_owned(),
+                    class: crate::auth::TokenClass::WorkloadExchange,
+                },
+            )
+            .unwrap();
+        fx.store
+            .add_workspace_member(&WorkspaceMembership {
+                workspace: vaultx_types::WorkspaceId::parse("ws_api_test").expect("valid"),
+                user: "oidc:ci".to_owned(),
+                role: crate::model::ROLE_MEMBER.to_owned(),
+            })
+            .unwrap();
+        let uri = format!("/projects/{}/policies", fx.project);
+        let (status, value) = call(&fx.app, "GET", &uri, Some(workload_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value[0]["name"], "read_only");
+
+        // ...while agent tokens stay structurally excluded.
+        let (status, _) = call(&fx.app, "GET", &uri, Some(AGENT_TOKEN), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ingest_audit_chains_hashes_across_two_batches() {
+        let fx = fixture();
+        let first = AuditIngestRequest {
+            events: vec![
+                ingest_event("ci-bot", "secret-rotate"),
+                ingest_event("deploy-bot", "http-request"),
+            ],
+        };
+        let (status, value) = post_audit(
+            &fx.app,
+            &fx.project,
+            Some(ALICE_TOKEN),
+            serde_json::to_string(&first).expect("body"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["accepted"], 2);
+        assert_eq!(value["rejected"].as_array().expect("rejections").len(), 0);
+
+        // Second batch continues from the tail left by batch one plus the
+        // internal audit.ingest marker.
+        let second = AuditIngestRequest {
+            events: vec![ingest_event("ci-bot", "config-committed")],
+        };
+        let (status, value) = post_audit(
+            &fx.app,
+            &fx.project,
+            Some(ALICE_TOKEN),
+            serde_json::to_string(&second).expect("body"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["accepted"], 1);
+
+        let events = assert_chain_intact(&fx.app, &fx.project).await;
+        let actions: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                "secret-rotate",
+                "http-request",
+                "audit.ingest",
+                "config-committed",
+                "audit.ingest"
+            ],
+            "batches append in order with one internal ingest marker each"
+        );
+        assert_eq!(events[0].prev_hash, None);
+        for pair in events.windows(2) {
+            assert_eq!(
+                pair[1].prev_hash.as_deref(),
+                Some(chain_hash(&pair[0]).as_str())
+            );
+        }
+        // Ids are freshly minted `aud_<hex>` per event.
+        for event in &events {
+            assert!(event.event_id.as_str().starts_with("aud_"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_audit_reports_rejections_without_aborting_accepted_events() {
+        let fx = fixture();
+        let mut oversized = ingest_event("bulk-bot", "http-request");
+        oversized.detail =
+            serde_json::json!({ "blob": "x".repeat(crate::store::MAX_AUDIT_DETAIL_BYTES + 1) });
+        let request = AuditIngestRequest {
+            events: vec![
+                ingest_event("good-bot", "session-created"),
+                ingest_event("   ", "empty-actor"),
+                oversized,
+                ingest_event("good-bot", "session-revoked"),
+            ],
+        };
+        let (status, value) = post_audit(
+            &fx.app,
+            &fx.project,
+            Some(ALICE_TOKEN),
+            serde_json::to_string(&request).expect("body"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "partial rejects stay a 200");
+        assert_eq!(value["accepted"], 2);
+        let rejected = value["rejected"].as_array().expect("rejections");
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected[0]["index"], 1);
+        assert_eq!(rejected[0]["reason"], "actor must not be empty");
+        assert_eq!(rejected[1]["index"], 2);
+        assert_eq!(rejected[1]["reason"], "detail payload exceeds size limit");
+
+        // Only the accepted events landed, still chained.
+        let events = assert_chain_intact(&fx.app, &fx.project).await;
+        let actors: Vec<&str> = events.iter().map(|e| e.actor.as_str()).collect();
+        assert!(actors.contains(&"good-bot"));
+        assert!(!actors.iter().any(|a| a.trim().is_empty()));
+    }
+
+    #[tokio::test]
+    async fn ingest_audit_authorization_matches_sibling_write_routes() {
+        let fx = fixture();
+        let body = ingest_body(AuditIngestRequest {
+            events: vec![ingest_event("bot", "http-request")],
+        });
+
+        // Agent tokens never reach control-plane routes...
+        let (status, _) = post_audit(&fx.app, &fx.project, Some(AGENT_TOKEN), body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // ...and valid non-member sessions are forbidden like everywhere else.
+        fx.store
+            .issue_session(
+                "vxs_outsider_session",
+                &Principal {
+                    subject: "mallory".to_owned(),
+                    class: crate::auth::TokenClass::ControlSession,
+                },
+            )
+            .unwrap();
+        let (status, _) = post_audit(
+            &fx.app,
+            &fx.project,
+            Some("vxs_outsider_session"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Unknown tokens are unauthorized.
+        let (status, _) = post_audit(&fx.app, &fx.project, Some("vxs_ghost"), body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(fx.store.list_audit_events(&fx.project).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_ingest_envelope_is_structured_400_and_empty_batch_is_noop() {
+        let fx = fixture();
+
+        // Undecodable envelope: whole request fails with the structured
+        // error envelope (all-or-nothing), nothing appended.
+        let (status, value) = post_audit(
+            &fx.app,
+            &fx.project,
+            Some(ALICE_TOKEN),
+            r#"{"events":"nope"}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["error"]["code"], serde_json::json!("bad_request"));
+
+        let (status, _) = post_audit(
+            &fx.app,
+            &fx.project,
+            Some(ALICE_TOKEN),
+            "not json".to_owned(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Empty batch is accepted as a no-op rather than an error.
+        let (status, value) = post_audit(
+            &fx.app,
+            &fx.project,
+            Some(ALICE_TOKEN),
+            r#"{"events":[]}"#.to_owned(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["accepted"], 0);
+        assert_eq!(value["rejected"].as_array().expect("rejections").len(), 0);
+        assert_chain_intact(&fx.app, &fx.project).await;
     }
 }

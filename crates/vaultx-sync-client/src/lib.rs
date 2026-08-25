@@ -52,6 +52,13 @@ pub use transport::{ControlPlaneTransport, TransportRequest, TransportResponse};
 /// control-plane protocol so both wire ends share one type.
 pub use vaultx_control_plane::protocol::RefNamespace;
 
+/// Remote agent identity as served by `GET /projects/{id}/agents`.
+pub use vaultx_control_plane::protocol::AgentView as RemoteAgentInfo;
+
+/// Client-side audit event and ingestion result models shared with the
+/// control-plane protocol module.
+pub use vaultx_control_plane::protocol::{AuditIngestResult, IngestEvent};
+
 /// Outcome of one completed push or pull (plan §45).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncResult {
@@ -62,16 +69,22 @@ pub struct SyncResult {
     /// Ref disagreements surfaced for explicit merge/reconciliation; sync
     /// never silently chooses between competing revisions.
     pub conflicts: Vec<RefConflict>,
+    /// Remote policy documents applied locally during pull. The server is
+    /// authoritative for remotely-known names; local-only policy files are
+    /// never touched.
+    pub policies_applied: usize,
 }
 
 impl SyncResult {
-    /// A clean result with no transfers and no conflicts.
+    /// A clean result with no transfers, no conflicts, and no policies
+    /// applied.
     #[must_use]
     pub fn clean() -> Self {
         Self {
             uploaded: 0,
             downloaded: 0,
             conflicts: Vec::new(),
+            policies_applied: 0,
         }
     }
 
