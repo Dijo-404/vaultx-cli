@@ -1628,7 +1628,7 @@ impl App {
         // Hardened confirmation (plan §15): a destructive modal confirms
         // ONLY on an explicit `y`/`Y`. Bare Enter is cancel-neutral —
         // muscle-memory "Enter = yes" must never fire a destructive
-        // action; Esc/q/n cancel.
+        // action; n/Esc cancel (`q` stays inert inside modals).
         let confirmed = matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y'));
         let dismissed = matches!(
             k.code,
