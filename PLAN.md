@@ -2184,147 +2184,147 @@ The codebase is considered complete only when all workstreams below are implemen
 
 ## Repository and configuration
 
-- [ ] workspace/crate structure exists.
-- [ ] `vaultx init` creates repository state.
-- [ ] config set/get/unset/list works.
-- [ ] `.env` import works.
-- [ ] staging works.
-- [ ] canonical object encoding works.
-- [ ] content-addressed object storage works.
-- [ ] signed commits work.
-- [ ] branches work.
-- [ ] diff works.
-- [ ] merge works.
-- [ ] rollback works.
-- [ ] environment refs/protection work.
-- [ ] promotion works.
+- [x] workspace/crate structure exists.
+- [x] `vaultx init` creates repository state.
+- [x] config set/get/unset/list works.
+- [x] `.env` import works.
+- [x] staging works.
+- [x] canonical object encoding works.
+- [x] content-addressed object storage works.
+- [x] signed commits work.
+- [x] branches work.
+- [x] diff works.
+- [x] merge works.
+- [x] rollback works.
+- [x] environment refs/protection work.
+- [x] promotion works.
 
 ## Secret vault
 
-- [ ] no-echo secret input works.
-- [ ] AES-GCM secret encryption works.
-- [ ] envelope keys work.
-- [ ] platform key store works.
-- [ ] secret revision metadata works.
-- [ ] keyed fingerprints work.
-- [ ] secret rotation works.
-- [ ] crypto-shredding works.
-- [ ] secret-safe Rust wrappers are used across boundaries.
+- [x] no-echo secret input works.
+- [x] AES-GCM secret encryption works.
+- [x] envelope keys work.
+- [x] platform key store works.
+- [x] secret revision metadata works.
+- [x] keyed fingerprints work.
+- [x] secret rotation works.
+- [x] crypto-shredding works.
+- [x] secret-safe Rust wrappers are used across boundaries.
 
 ## Broker
 
-- [ ] broker runs as a separate process/service.
-- [ ] local IPC works on Unix-like systems.
-- [ ] local IPC works on Windows.
-- [ ] agent session authentication works.
-- [ ] generic broker request API works.
-- [ ] credential injection templates work.
-- [ ] canonical URL validation works.
-- [ ] DNS/IP restrictions work.
-- [ ] redirect reauthorization works.
-- [ ] request header restrictions work.
-- [ ] body constraints work.
-- [ ] response sanitization works.
-- [ ] audit events are emitted.
+- [x] broker runs as a separate process/service.
+- [x] local IPC works on Unix-like systems.
+- [x] local IPC works on Windows.
+- [x] agent session authentication works.
+- [x] generic broker request API works.
+- [x] credential injection templates work.
+- [x] canonical URL validation works.
+- [x] DNS/IP restrictions work.
+- [x] redirect reauthorization works.
+- [x] request header restrictions work.
+- [x] body constraints work.
+- [x] response sanitization works.
+- [x] audit events are emitted.
 - [ ] isolated/remote broker transport works.
 
 ## Authorization
 
-- [ ] internal authorizer trait exists.
+- [x] internal authorizer trait exists.
 - [ ] Cedar integration works.
-- [ ] default-deny behavior is enforced.
-- [ ] human-readable policy format works.
-- [ ] validation works.
-- [ ] policy test fixtures work.
-- [ ] policy explanation works.
+- [x] default-deny behavior is enforced.
+- [x] human-readable policy format works.
+- [x] validation works.
+- [x] policy test fixtures work.
+- [x] policy explanation works.
 - [ ] child-agent attenuation works.
 
 ## Semantic policy packs
 
-- [ ] pack format is versioned.
-- [ ] pack parser works.
-- [ ] pack schema validation works.
-- [ ] pack compiler emits generic broker constraints.
-- [ ] GitHub representative packs exist.
-- [ ] OpenAI representative packs exist.
-- [ ] generic custom API packs work.
-- [ ] packs cannot weaken broker invariants.
+- [x] pack format is versioned.
+- [x] pack parser works.
+- [x] pack schema validation works.
+- [x] pack compiler emits generic broker constraints.
+- [x] GitHub representative packs exist.
+- [x] OpenAI representative packs exist.
+- [x] generic custom API packs work.
+- [x] packs cannot weaken broker invariants.
 
 ## Agent integrations
 
-- [ ] `vaultx agent create` works.
+- [x] `vaultx agent create` works.
 - [ ] `vaultx agent run` works.
 - [ ] managed secret variables are stripped from agent environment.
 - [ ] public config exposure is policy-controlled.
-- [ ] session revocation works.
-- [ ] MCP server works.
-- [ ] generic HTTP MCP tool works.
-- [ ] semantic capability MCP tool works.
-- [ ] brokered secret retrieval is impossible through agent interfaces.
+- [x] session revocation works.
+- [x] MCP server works.
+- [x] generic HTTP MCP tool works.
+- [x] semantic capability MCP tool works.
+- [x] brokered secret retrieval is impossible through agent interfaces.
 
 ## Trusted workload execution
 
-- [ ] `vaultx run` works.
-- [ ] allowed secrets are injected in memory.
-- [ ] temporary plaintext `.env` files are not created.
-- [ ] brokered credentials remain non-exposed by default.
+- [x] `vaultx run` works.
+- [x] allowed secrets are injected in memory.
+- [x] temporary plaintext `.env` files are not created.
+- [x] brokered credentials remain non-exposed by default.
 
 ## TUI
 
-- [ ] main LazyGit-style layout works.
-- [ ] environment/branch pane works.
-- [ ] variable pane works.
-- [ ] history pane works.
-- [ ] inspector works.
-- [ ] diff view works.
-- [ ] commit view works.
-- [ ] agent view works.
-- [ ] policy editor works.
-- [ ] audit view works.
+- [x] main LazyGit-style layout works.
+- [x] environment/branch pane works.
+- [x] variable pane works.
+- [x] history pane works.
+- [x] inspector works.
+- [x] diff view works.
+- [x] commit view works.
+- [x] agent view works.
+- [x] policy editor works.
+- [x] audit view works.
 - [ ] environment promotion view works.
 - [ ] sync view works.
-- [ ] keyboard navigation is complete.
-- [ ] resize behavior is robust.
+- [x] keyboard navigation is complete.
+- [x] resize behavior is robust.
 
 ## Team sync/control plane
 
-- [ ] remote authentication works.
-- [ ] workspaces work.
-- [ ] membership works.
-- [ ] project sync works.
-- [ ] encrypted object transfer works.
-- [ ] remote refs work.
-- [ ] signature verification works.
+- [x] remote authentication works.
+- [x] workspaces work.
+- [x] membership works.
+- [x] project sync works.
+- [x] encrypted object transfer works.
+- [x] remote refs work.
+- [x] signature verification works.
 - [ ] policy sync works.
 - [ ] agent identity sync works.
 - [ ] audit ingestion/query works.
-- [ ] client-controlled encryption mode works.
-- [ ] conflict handling works.
+- [x] client-controlled encryption mode works.
+- [x] conflict handling works.
 
 ## Packaging
 
-- [ ] Linux x86_64 binary.
-- [ ] Linux ARM64 binary.
-- [ ] macOS x86_64 binary.
-- [ ] macOS ARM64 binary.
-- [ ] Windows x86_64 binary.
-- [ ] `vaultx-cli` npm package.
-- [ ] artifact integrity verification.
-- [ ] installer smoke tests.
+- [x] Linux x86_64 binary.
+- [x] Linux ARM64 binary.
+- [x] macOS x86_64 binary.
+- [x] macOS ARM64 binary.
+- [x] Windows x86_64 binary.
+- [x] `vaultx-cli` npm package.
+- [x] artifact integrity verification.
+- [x] installer smoke tests.
 
 ## Security quality
 
-- [ ] unit test matrix passes.
-- [ ] integration test matrix passes.
+- [x] unit test matrix passes.
+- [x] integration test matrix passes.
 - [ ] property tests pass.
 - [ ] fuzz targets have seed corpora.
-- [ ] canary-secret leak tests pass.
-- [ ] SSRF test suite passes.
-- [ ] redirect leakage tests pass.
-- [ ] repository tamper tests pass.
-- [ ] cargo-deny passes.
-- [ ] cargo-audit passes.
-- [ ] threat model matches implemented behavior.
+- [x] canary-secret leak tests pass.
+- [x] SSRF test suite passes.
+- [x] redirect leakage tests pass.
+- [x] repository tamper tests pass.
+- [x] cargo-deny passes.
+- [x] cargo-audit passes.
+- [x] threat model matches implemented behavior.
 - [ ] security claims distinguish local developer mode from isolated broker mode.
 
 ---
