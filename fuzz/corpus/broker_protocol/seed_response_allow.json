@@ -1,0 +1,1 @@
+{"request_id":"req_0123456789abcdef0123456789abcdef","status":201,"headers":[["content-type","application/json"],["x-request-id","up-42"]],"body":[123,34,111,107,34,58,116,114,117,101,125],"decision":"allow"}

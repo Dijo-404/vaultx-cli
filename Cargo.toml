@@ -19,6 +19,9 @@ members = [
     "crates/vaultx-mcp",
     "crates/vaultx-testkit",
 ]
+# The fuzz package links libfuzzer-sys and needs nightly-only link flags,
+# so it must never be built by stable workspace commands (plan §43).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,1 @@
+{"protocol":1,"session_token":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","credential":"stripe-secret-key","method":"GET","url":"https://api.stripe.com/v1/customers/cus_123","headers":[],"body":{"type":"none"},"capability_hint":null}

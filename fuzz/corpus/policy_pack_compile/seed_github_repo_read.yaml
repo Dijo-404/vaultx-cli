@@ -1,0 +1,11 @@
+format: 1
+name: github.repository.read
+provider: github
+request:
+  hosts: [api.github.com]
+  methods: [GET]
+  paths:
+    - "/repos/{owner}/{repo}/**"
+credential:
+  credential_ref: github-work-token
+  injection: bearer

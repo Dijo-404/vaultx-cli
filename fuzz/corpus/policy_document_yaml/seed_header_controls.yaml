@@ -1,0 +1,17 @@
+name: header-controls
+principal: agent:ci-runner
+credential: github-work-token
+http:
+  hosts: [api.github.com]
+  allow:
+    - methods: [GET, POST]
+      paths: [/repos/**, /orgs/*/repos]
+  deny:
+    - methods: [DELETE]
+      paths: ["/**"]
+request:
+  max_body_bytes: 65536
+  deny_headers: [cookie]
+response:
+  max_body_bytes: 1048576
+  redact_headers: [set-cookie, x-request-id]

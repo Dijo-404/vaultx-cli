@@ -1,0 +1,14 @@
+format: 1
+name: stripe.customer.read
+provider: stripe
+request:
+  hosts: [api.stripe.com]
+  methods: [GET]
+  paths:
+    - "/v1/customers/{id}"
+  variables:
+    id: string
+  query_allowlist: [expand, limit]
+credential:
+  credential_ref: stripe-secret-key
+  injection: bearer

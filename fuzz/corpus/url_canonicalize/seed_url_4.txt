@@ -1,0 +1,1 @@
+https://sub.domain.example:8443/a/../b%20c?x=%2fslash

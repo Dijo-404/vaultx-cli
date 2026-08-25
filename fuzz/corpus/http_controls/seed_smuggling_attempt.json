@@ -1,0 +1,1 @@
+{"headers":[["host","evil.example"],["transfer-encoding","chunked"],["connection","close"],["expect","100-continue"]],"content_type":"text/html","content_type_allowlist":["application/json"],"body":"[1,2,{\"authorization\":\"nope\"}]","redact_body_fields":[]}

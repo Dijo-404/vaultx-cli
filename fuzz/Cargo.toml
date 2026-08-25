@@ -1,0 +1,81 @@
+[package]
+name = "vaultx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+vaultx-repository = { path = "../crates/vaultx-repository" }
+vaultx-policy = { path = "../crates/vaultx-policy" }
+vaultx-policy-packs = { path = "../crates/vaultx-policy-packs" }
+vaultx-broker = { path = "../crates/vaultx-broker" }
+vaultx-http = { path = "../crates/vaultx-http" }
+
+# Avoid re-linking the workspace's dev-only crates; the fuzz package is
+# deliberately excluded from the main workspace (see root Cargo.toml).
+
+[[bin]]
+name = "repository_object_envelope"
+path = "fuzz_targets/repository_object_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "repository_manifest"
+path = "fuzz_targets/repository_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "repository_diff_merge"
+path = "fuzz_targets/repository_diff_merge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_document_yaml"
+path = "fuzz_targets/policy_document_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_pack_compile"
+path = "fuzz_targets/policy_pack_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "broker_protocol"
+path = "fuzz_targets/broker_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_canonicalize"
+path = "fuzz_targets/url_canonicalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_controls"
+path = "fuzz_targets/http_controls.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

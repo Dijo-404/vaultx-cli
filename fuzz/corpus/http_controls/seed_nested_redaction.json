@@ -1,0 +1,1 @@
+{"headers":[["set-cookie","session=abc"]],"redact":["set-cookie"],"body":{"deep":{"deeper":[{"secret":true}]}},"redact_body_fields":["secret"]}

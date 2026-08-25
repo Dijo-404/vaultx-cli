@@ -1,0 +1,8 @@
+name: multi-host-reader
+principal: agent:reader
+credential: generic-token
+http:
+  hosts: [api.github.com, api.stripe.com]
+  allow:
+    - methods: [GET]
+      paths: ["/v1/customers/{id}"]

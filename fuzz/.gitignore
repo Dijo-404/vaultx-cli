@@ -1,0 +1,6 @@
+# Local build artifacts (the package is workspace-excluded).
+/target/
+
+# Crash/artifact outputs produced by local cargo-fuzz runs.
+crashes/
+artifact-*

@@ -1,0 +1,12 @@
+name: coding-agent-github
+principal: agent:coding-agent
+credential: github-work-token
+environment:
+  allow: [env_development]
+http:
+  hosts: [api.github.com]
+  allow:
+    - methods: [GET]
+      paths: [/repos/acme/backend/**]
+request:
+  max_body_bytes: 262144

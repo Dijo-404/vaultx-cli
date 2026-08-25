@@ -1,0 +1,1 @@
+{"protocol":1,"session_token":"abcdefabcdefabcdefabcdefabcdefab","credential":"generic-token","method":"PUT","url":"https://files.example.com/upload/v1/blob","headers":[["content-type","application/octet-stream"]],"body":{"type":"bytes","data":[104,105,33]},"capability_hint":null}

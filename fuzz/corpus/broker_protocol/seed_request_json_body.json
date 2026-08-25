@@ -1,0 +1,1 @@
+{"protocol":1,"session_token":"0123456789abcdef0123456789abcdef","credential":"github-work-token","method":"POST","url":"https://api.github.com/repos/acme/backend/pulls","headers":[["accept","application/json"]],"body":{"type":"json","value":{"title":"Fix auth bug"}},"capability_hint":"github.pull_request.create"}
