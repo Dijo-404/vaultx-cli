@@ -135,11 +135,12 @@ impl<'a> SnapshotSource<'a> {
         match self.services.history().log(HISTORY_LIMIT) {
             Ok(entries) => {
                 snap.history = entries
-                    .into_iter()
+                    .iter()
                     .map(|entry| HistoryRow {
                         short: short_id(&entry.id),
                         message: first_line(&entry.message),
-                        author: entry.author,
+                        author: entry.author.clone(),
+                        delta: self.commit_delta(&entry.id),
                     })
                     .collect();
             }
@@ -147,6 +148,22 @@ impl<'a> SnapshotSource<'a> {
         }
 
         snap
+    }
+
+    /// Redacted secret/policy delta between one commit and its first
+    /// parent; empty for root commits or when history lookup fails.
+    fn commit_delta(&self, commit_id: &CommitId) -> Vec<RedactedLine> {
+        let Ok(detail) = self.services.history().show(commit_id) else {
+            return Vec::new();
+        };
+        let Some(parent) = detail.parents.first() else {
+            return Vec::new();
+        };
+        self.services
+            .history()
+            .diff_commits(parent, commit_id)
+            .map(|entries| redact_entries(self.services, &entries))
+            .unwrap_or_default()
     }
 
     fn load_diff_lines(&self, notes: &mut Vec<String>) -> Vec<RedactedLine> {
@@ -157,28 +174,7 @@ impl<'a> SnapshotSource<'a> {
                 return Vec::new();
             }
         };
-        let mut lines = Vec::new();
-        for entry in &entries {
-            // Policy changes upgrade to host/path/method deltas whenever
-            // both documents resolve from the repository object store;
-            // otherwise they stay metadata-only object deltas.
-            if let DiffEntry::PolicyChanged {
-                old_policy_object,
-                new_policy_object,
-                ..
-            } = entry
-            {
-                if let (Some(old), Some(new)) = (
-                    resolve_policy_document(self.services, old_policy_object),
-                    resolve_policy_document(self.services, new_policy_object),
-                ) {
-                    lines.extend(mask::policy_delta(&old, &new));
-                    continue;
-                }
-            }
-            lines.extend(mask::redact_diff(std::slice::from_ref(entry)));
-        }
-        lines
+        redact_entries(self.services, &entries)
     }
 
     fn load_agents(&self, notes: &mut Vec<String>) -> (AgentsData, Vec<String>, String) {
@@ -239,6 +235,7 @@ impl<'a> SnapshotSource<'a> {
                 AgentDetail {
                     full_id: full_id.as_str().to_owned(),
                     enabled: row.enabled,
+                    environment: derive_environment(&sessions, self.env.as_deref()),
                     policies: attached
                         .iter()
                         .map(|doc| doc.name.as_str().to_owned())
@@ -276,6 +273,52 @@ impl<'a> SnapshotSource<'a> {
             .filter_map(|file| load_pack(file).ok().map(|pack| pack.name))
             .collect()
     }
+}
+
+/// Effective environment shown for one agent: its latest usable session's
+/// environment, falling back to the active dashboard environment (or the
+/// documented default when even that is unknown).
+fn derive_environment(
+    sessions: &Result<Vec<SessionRow>, String>,
+    fallback: Option<&str>,
+) -> String {
+    if let Ok(rows) = sessions {
+        let chosen = rows
+            .iter()
+            .find(|row| row.status == SessionStatus::Active)
+            .or_else(|| rows.first());
+        if let Some(row) = chosen {
+            return row.environment.clone();
+        }
+    }
+    fallback.unwrap_or(DEFAULT_ENV).to_owned()
+}
+
+/// Redacts manifest-diff entries, upgrading resolvable policy changes to
+/// host/path/method deltas. Output is metadata-only by construction.
+fn redact_entries(services: &VaultxServices, entries: &[DiffEntry]) -> Vec<RedactedLine> {
+    let mut lines = Vec::new();
+    for entry in entries {
+        // Policy changes upgrade to host/path/method deltas whenever
+        // both documents resolve from the repository object store;
+        // otherwise they stay metadata-only object deltas.
+        if let DiffEntry::PolicyChanged {
+            old_policy_object,
+            new_policy_object,
+            ..
+        } = entry
+        {
+            if let (Some(old), Some(new)) = (
+                resolve_policy_document(services, old_policy_object),
+                resolve_policy_document(services, new_policy_object),
+            ) {
+                lines.extend(mask::policy_delta(&old, &new));
+                continue;
+            }
+        }
+        lines.extend(mask::redact_diff(std::slice::from_ref(entry)));
+    }
+    lines
 }
 
 /// Policies governing one agent: those named on its identity file first,
@@ -513,6 +556,39 @@ mod tests {
             metadata: SafeAuditMetadata::from_pairs([("http.method", "GET")])
                 .expect("valid metadata"),
         }
+    }
+
+    #[test]
+    fn derived_environment_prefers_active_session_then_fallback() {
+        let session = |id: &str, env: &str, status: SessionStatus| SessionRow {
+            session_id: id.to_owned(),
+            environment: env.to_owned(),
+            status,
+        };
+
+        let with_active = Ok(vec![
+            session("s1", "legacy", SessionStatus::Expired),
+            session("s2", "production", SessionStatus::Active),
+        ]);
+        assert_eq!(
+            derive_environment(&with_active, Some("development")),
+            "production"
+        );
+
+        let expired_only = Ok(vec![session("s1", "legacy", SessionStatus::Revoked)]);
+        assert_eq!(
+            derive_environment(&expired_only, Some("development")),
+            "legacy"
+        );
+
+        assert_eq!(
+            derive_environment(&Ok(Vec::new()), Some("development")),
+            "development"
+        );
+        assert_eq!(
+            derive_environment(&Err("store missing".to_owned()), None),
+            DEFAULT_ENV
+        );
     }
 
     #[test]

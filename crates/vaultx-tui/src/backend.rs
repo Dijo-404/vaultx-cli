@@ -42,7 +42,7 @@ pub struct TuiConfig {
 pub fn run(config: &TuiConfig) -> Result<(), TuiError> {
     let services = VaultxServices::open(&config.project)?;
     let source = SnapshotSource::new(&services, config.env.clone(), config.socket.as_deref());
-    let mut app = App::new(source.load());
+    let mut app = App::with_size(source.load(), startup_size());
 
     let _guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(stdout());
@@ -74,6 +74,12 @@ pub fn run(config: &TuiConfig) -> Result<(), TuiError> {
 
 fn event_ready(timeout: Duration) -> Result<bool, TuiError> {
     crossterm::event::poll(timeout).map_err(Into::into)
+}
+
+/// Measures the real terminal size once so the first frame already uses
+/// the correct layout; falls back to the documented default on failure.
+fn startup_size() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or(crate::state::DEFAULT_TERMINAL_SIZE)
 }
 
 fn read_event() -> Result<Event, TuiError> {

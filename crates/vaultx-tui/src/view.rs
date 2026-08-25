@@ -346,11 +346,28 @@ fn inspector_lines(app: &App) -> Vec<Line<'static>> {
             None => vec![Line::from("(no variables)")],
         },
         Pane::History => match snapshot.history.get(hist_sel) {
-            Some(row) => vec![
-                Line::from(format!("commit:   {}", row.short)),
-                Line::from(format!("author:   {}", row.author)),
-                Line::from(format!("message:  {}", row.message)),
-            ],
+            Some(row) => {
+                let mut lines = vec![
+                    Line::from(format!("commit:   {}", row.short)),
+                    Line::from(format!("author:   {}", row.author)),
+                    Line::from(format!("message:  {}", row.message)),
+                ];
+                if row.delta.is_empty() {
+                    lines.push(Line::from("delta:     none recorded"));
+                } else {
+                    lines.push(Line::from(format!(
+                        "delta ({} redacted lines):",
+                        row.delta.len()
+                    )));
+                    for line in &row.delta {
+                        lines.push(Line::from(Span::styled(
+                            format!("{} {}", line.marker, line.text),
+                            diff_style(line.marker),
+                        )));
+                    }
+                }
+                lines
+            }
             None => vec![Line::from("(no commits)")],
         },
     }
@@ -381,14 +398,47 @@ fn render_diff(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(app.diff_selected));
+    let selected = selected_index(app.diff_selected, app.loaded.diff.len());
+    state.select(Some(selected));
+
+    if !app.stacked_layout() {
+        f.render_stateful_widget(
+            List::new(items)
+                .block(block_for("staged diff", true))
+                .highlight_symbol(">"),
+            area,
+            &mut state,
+        );
+        return;
+    }
+
+    // Small terminal: the list sits above a wrapped detail of the
+    // selected line so long entries stay readable instead of clipping.
+    let rows = Layout::vertical([Constraint::Min(4), Constraint::Min(3)]).split(area);
     f.render_stateful_widget(
         List::new(items)
             .block(block_for("staged diff", true))
             .highlight_symbol(">"),
-        area,
+        rows[0],
         &mut state,
     );
+    let selected_line = &app.loaded.diff[selected];
+    let detail = format!("{} {}", selected_line.marker, selected_line.text);
+    f.render_widget(
+        Paragraph::new(detail)
+            .block(block_for("selected line", false))
+            .wrap(Wrap { trim: false }),
+        rows[1],
+    );
+}
+
+/// Selection index clamped into the current row count.
+fn selected_index(selected: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        selected.min(len - 1)
+    }
 }
 
 fn diff_style(marker: char) -> Style {
@@ -405,8 +455,7 @@ fn diff_style(marker: char) -> Style {
 // ---------------------------------------------------------------------------
 
 fn render_agents(f: &mut Frame, app: &App, area: Rect) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(25), Constraint::Percentage(75)]).split(area);
+    let (list_area, detail_area, policy_area) = agents_areas(area, app.stacked_layout());
 
     let items: Vec<ListItem> = app
         .loaded
@@ -432,7 +481,7 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 HIGHLIGHT
             }),
-        cols[0],
+        list_area,
         &mut state,
     );
 
@@ -454,13 +503,47 @@ fn render_agents(f: &mut Frame, app: &App, area: Rect) {
                 app.agent_focus == AgentFocus::Sessions,
             ))
             .wrap(Wrap { trim: false }),
-        cols[1],
+        detail_area,
+    );
+
+    // The inspector's third plan role: the focused agent's effective
+    // policy summary (hosts/methods/paths + capabilities), metadata only.
+    let policy_lines = match detail {
+        Some(detail) => agent_policy_lines(detail),
+        None => vec![Line::from("(no agent selected)")],
+    };
+    f.render_widget(
+        Paragraph::new(policy_lines)
+            .block(block_for("agent policy", false))
+            .wrap(Wrap { trim: false }),
+        policy_area,
     );
 }
 
-/// Builds the full agent detail text (plan §38 "Agent view"). Credential
-/// names carry the non-revealable marker; no code path can render
-/// brokered values because the loader never loads any.
+/// Agents-view regions: side-by-side list/detail with the policy
+/// inspector below, or fully stacked in small terminals so no section is
+/// clipped away.
+fn agents_areas(area: Rect, stacked: bool) -> (Rect, Rect, Rect) {
+    if !stacked {
+        let rows = Layout::vertical([Constraint::Min(4), Constraint::Percentage(35)]).split(area);
+        let cols = Layout::horizontal([Constraint::Percentage(25), Constraint::Percentage(75)])
+            .split(rows[0]);
+        (cols[0], cols[1], rows[1])
+    } else {
+        let chunks = Layout::vertical([
+            Constraint::Length(5),
+            Constraint::Min(4),
+            Constraint::Min(4),
+        ])
+        .split(area);
+        (chunks[0], chunks[1], chunks[2])
+    }
+}
+
+/// Builds the per-agent identity/session text (plan §38 "Agent view").
+/// Credential names carry the non-revealable marker; no code path can
+/// render brokered values because the loader never loads any. The policy
+/// surface itself lives in [`agent_policy_lines`].
 fn agent_detail_lines(
     detail: &crate::state::AgentDetail,
     session_selected: usize,
@@ -480,6 +563,7 @@ fn agent_detail_lines(
             session_status_marker(detail, session_selected),
             detail.session_summary()
         )),
+        Line::from(format!("environment: {}", detail.environment)),
     ];
 
     lines.push(Line::from("credentials:"));
@@ -488,18 +572,6 @@ fn agent_detail_lines(
     }
     for credential in &detail.credentials {
         lines.push(Line::from(format!("  {credential} {NON_REVEALABLE}")));
-    }
-
-    lines.push(list_section("allowed hosts", &detail.allowed_hosts));
-    lines.push(list_section("allowed methods", &detail.allowed_methods));
-    lines.push(list_section("allowed paths", &detail.allowed_paths));
-
-    lines.push(Line::from("semantic capabilities:"));
-    if detail.capabilities.is_empty() {
-        lines.push(Line::from("  —"));
-    }
-    for capability in &detail.capabilities {
-        lines.push(Line::from(format!("  {capability}")));
     }
 
     lines.push(Line::from("recent audit (allow/deny):"));
@@ -522,6 +594,26 @@ fn agent_detail_lines(
     lines
 }
 
+/// Effective policy surface of the focused agent: attached policies plus
+/// the allowed host/method/path unions and semantic capabilities.
+fn agent_policy_lines(detail: &crate::state::AgentDetail) -> Vec<Line<'static>> {
+    vec![
+        Line::from(if detail.policies.is_empty() {
+            "policies: —".to_owned()
+        } else {
+            format!("policies: {}", detail.policies.join(", "))
+        }),
+        list_section("allowed hosts", &detail.allowed_hosts),
+        list_section("allowed methods", &detail.allowed_methods),
+        list_section("allowed paths", &detail.allowed_paths),
+        Line::from(if detail.capabilities.is_empty() {
+            "semantic capabilities: —".to_owned()
+        } else {
+            format!("semantic capabilities: {}", detail.capabilities.join(", "))
+        }),
+    ]
+}
+
 fn session_status_marker(detail: &crate::state::AgentDetail, selected: usize) -> &'static str {
     match detail.sessions.as_ref() {
         Ok(rows) => rows.get(selected).map_or("", |row| row.status.label()),
@@ -542,12 +634,7 @@ fn list_section(title: &str, values: &[String]) -> Line<'static> {
 // ---------------------------------------------------------------------------
 
 fn render_policy_editor(f: &mut Frame, app: &App, area: Rect) {
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
-    render_validation_banner(f, &app.editor.validation, rows[0]);
-
     use crate::state::{EditorMode, FormField};
-    let cols =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
 
     let form_focused = app.editor.mode == EditorMode::Form;
     let fields = [
@@ -578,12 +665,33 @@ fn render_policy_editor(f: &mut Frame, app: &App, area: Rect) {
             first_line_or_empty(&buffer.lines),
         )));
     }
+
+    // Small terminals stack the two editing surfaces above the
+    // validation banner; large ones keep the side-by-side split with the
+    // banner pinned on top.
+    let (form_area, raw_area, banner_area) = if app.stacked_layout() {
+        let rows = Layout::vertical([
+            Constraint::Min(4),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        (rows[0], rows[1], rows[2])
+    } else {
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[1]);
+        (cols[0], cols[1], rows[0])
+    };
+
+    render_validation_banner(f, &app.editor.validation, banner_area);
+
     f.render_widget(
         Paragraph::new(form_lines).block(block_for(
             "form/tree (t: raw)",
             form_focused && !app.editor.editing_field,
         )),
-        cols[0],
+        form_area,
     );
 
     f.render_widget(
@@ -593,7 +701,7 @@ fn render_policy_editor(f: &mut Frame, app: &App, area: Rect) {
                 !form_focused || app.editor.editing_field,
             ))
             .wrap(Wrap { trim: false }),
-        cols[1],
+        raw_area,
     );
 }
 
@@ -648,30 +756,60 @@ fn render_audit(f: &mut Frame, app: &App, area: Rect) {
             let reason = row.deny_reason.as_deref().unwrap_or("");
             ListItem::new(Line::from(vec![
                 Span::styled(token.to_owned(), style),
+                // Denial category precedes the destination so it stays
+                // inside narrow viewports instead of clipping away.
                 Span::raw(format!(
-                    " #{:<4} {:<14} {:<22} {}{}",
+                    " #{:<4} {:<14} {:<18}{} {}",
                     row.sequence,
                     row.action,
-                    truncate(&row.actor, 22),
-                    row.destination.as_deref().unwrap_or(""),
+                    truncate(&row.actor, 18),
                     if reason.is_empty() {
                         String::new()
                     } else {
-                        format!(" ({reason})")
-                    }
+                        format!("({reason})")
+                    },
+                    row.destination.as_deref().unwrap_or(""),
                 )),
             ]))
         })
         .collect();
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(app.audit_selected));
+
+    if !app.stacked_layout() {
+        f.render_stateful_widget(
+            List::new(items)
+                .block(audit_block(app))
+                .highlight_symbol("> "),
+            area,
+            &mut state,
+        );
+        return;
+    }
+
+    // Small terminal: the outcome filter stays pinned above the
+    // scrolling event list so the active filter is never lost.
+    let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(area);
+    f.render_widget(
+        Paragraph::new(audit_filter_line(app)).block(block_for("audit filters", true)),
+        rows[0],
+    );
     f.render_stateful_widget(
         List::new(items)
-            .block(audit_block(app))
+            .block(block_for("audit", true))
             .highlight_symbol("> "),
-        area,
+        rows[1],
         &mut state,
     );
+}
+
+/// One-line summary of the active audit outcome filter.
+fn audit_filter_line(app: &App) -> String {
+    format!(
+        "filter: {} · f cycles · {} event(s)",
+        app.audit_filter.label(),
+        app.loaded.audit.len()
+    )
 }
 
 fn audit_block(app: &App) -> Block<'static> {
@@ -735,8 +873,48 @@ mod tests {
     use vaultx_types::{SecretRevisionId, VariableName};
 
     use crate::mask;
-    use crate::state::testing::{key, sample_app, send};
-    use crate::state::{App, BrokerStatus, LoadedState, Route, ValidationState, VariableRow};
+    use crate::state::testing::{key, press, sample_app, send};
+    use crate::state::{
+        AgentDetail, AgentRow, AgentsData, App, BrokerStatus, KeyCode, LoadedState, Route,
+        SessionRow, SessionStatus, ValidationState, VariableRow, DEFAULT_TERMINAL_SIZE,
+    };
+
+    /// One-agent fixture exercising every agents-view section.
+    fn agent_fixture() -> AgentsData {
+        let detail = AgentDetail {
+            full_id: "agent_ci-bot".to_owned(),
+            enabled: true,
+            environment: "production".to_owned(),
+            policies: vec!["stripe".to_owned()],
+            credentials: vec!["deploy_token".to_owned()],
+            allowed_hosts: vec!["api.example.com".to_owned()],
+            allowed_methods: vec!["GET".to_owned()],
+            allowed_paths: vec!["/v1/**".to_owned()],
+            capabilities: vec!["deploy.http".to_owned()],
+            sessions: Ok(vec![SessionRow {
+                session_id: "sess_abc".to_owned(),
+                environment: "production".to_owned(),
+                status: SessionStatus::Active,
+            }]),
+            audit: Vec::new(),
+        };
+        AgentsData {
+            list: vec![AgentRow {
+                name: "ci-bot".to_owned(),
+                enabled: true,
+            }],
+            details: [("ci-bot".to_owned(), detail)].into_iter().collect(),
+        }
+    }
+
+    /// Secret-revision delta used across the diff/inspector tests.
+    fn revision_change_entry() -> vaultx_core::DiffEntry {
+        vaultx_core::DiffEntry::SecretRevisionChanged {
+            name: VariableName::parse("STRIPE_KEY").unwrap(),
+            old_revision: SecretRevisionId::parse("sec_rev_000001").unwrap(),
+            new_revision: SecretRevisionId::parse("sec_rev_000002").unwrap(),
+        }
+    }
 
     /// Renders one frame into a `TestBackend` and returns the screen text.
     fn render_app(app: &App, width: u16, height: u16) -> String {
@@ -767,7 +945,7 @@ mod tests {
         assert!(render_app(&app, 120, 30).contains("broker offline"));
 
         // Fully default data must render without panicking.
-        let unprobed = App::new(LoadedState::default());
+        let unprobed = App::with_size(LoadedState::default(), DEFAULT_TERMINAL_SIZE);
         assert!(status_text(&unprobed).contains("broker offline"));
     }
 
@@ -809,6 +987,182 @@ mod tests {
             assert!(small.contains(title), "missing `{title}` in stacked layout");
         }
         assert!(small.contains("development"));
+    }
+
+    #[test]
+    fn history_selection_surfaces_redacted_delta_in_the_inspector() {
+        const CANARY: &str = "hunter2-plaintext-canary";
+        let entry = revision_change_entry();
+
+        // Focus the history pane (two tabs) and give its selected commit
+        // a loader-produced redacted delta.
+        let mut app = sample_app();
+        send(&mut app, press(KeyCode::Tab));
+        send(&mut app, press(KeyCode::Tab));
+        app.loaded.snapshot.history[0].delta = mask::redact_diff(std::slice::from_ref(&entry));
+
+        let screen = render_app(&app, 160, 48);
+        assert!(screen.contains("commit:   abc1234"));
+        assert!(screen.contains("delta (3 redacted lines)"));
+        assert!(screen.contains("- revision sec_rev_000001"));
+        assert!(screen.contains("+ revision sec_rev_000002"));
+        assert!(!screen.contains(CANARY));
+    }
+
+    #[test]
+    fn diff_view_stacks_list_above_selected_line_detail_when_small() {
+        let mut app = sample_app();
+        app.route = Route::Diff;
+        app.loaded.diff = mask::redact_diff(std::slice::from_ref(&revision_change_entry()));
+
+        let large = render_app(&app, 110, 30);
+        assert!(large.contains("staged diff"));
+        assert!(!large.contains("selected line"));
+
+        // Small terminal measurement drives the stacked split.
+        app.handle_resize(80, 24);
+        let small = render_app(&app, 80, 24);
+        assert!(
+            small.contains("staged diff"),
+            "missing list in stacked diff"
+        );
+        assert!(
+            small.contains("selected line"),
+            "missing detail in stacked diff"
+        );
+        assert!(small.contains("STRIPE_KEY"));
+    }
+
+    #[test]
+    fn agents_view_stacks_sections_and_shows_effective_policy_when_small() {
+        let mut app = sample_app();
+        app.loaded.agents = agent_fixture();
+        app.route = Route::Agents;
+
+        let large = render_app(&app, 130, 40);
+        for token in [
+            "agents",
+            "agent detail",
+            "agent policy",
+            "policies: stripe",
+            "allowed hosts: api.example.com",
+            "environment: production",
+        ] {
+            assert!(
+                large.contains(token),
+                "missing `{token}` in large agents view"
+            );
+        }
+
+        app.handle_resize(80, 24);
+        let small = render_app(&app, 80, 24);
+        for token in [
+            "agents",
+            "agent detail",
+            "agent policy",
+            "ci-bot",
+            "environment: production",
+            "sess_abc ACTIVE in production",
+            "policies: stripe",
+            "allowed hosts: api.example.com",
+            "allowed methods: GET",
+            "allowed paths: /v1/**",
+            "semantic capabilities: deploy.http",
+        ] {
+            assert!(
+                small.contains(token),
+                "missing `{token}` in stacked agents view"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_environment_line_renders_even_without_sessions() {
+        let detail = AgentDetail {
+            full_id: "agent_bot".to_owned(),
+            enabled: false,
+            environment: "development".to_owned(),
+            ..AgentDetail::default()
+        };
+        let mut app = sample_app();
+        app.loaded.agents = AgentsData {
+            list: vec![AgentRow {
+                name: "bot".to_owned(),
+                enabled: false,
+            }],
+            details: [("bot".to_owned(), detail)].into_iter().collect(),
+        };
+        app.route = Route::Agents;
+
+        let screen = render_app(&app, 110, 30);
+        assert!(screen.contains("environment: development"));
+        assert!(screen.contains("no sessions"));
+    }
+
+    #[test]
+    fn policy_editor_stacks_buffers_above_validation_banner_when_small() {
+        let mut valid = sample_app();
+        valid.route = Route::PolicyEditor;
+
+        let large_valid = render_app(&valid, 110, 30);
+        assert!(large_valid.contains("valid policy"));
+
+        valid.handle_resize(80, 24);
+        let small_valid = render_app(&valid, 80, 24);
+        for token in ["form/tree (t: raw)", "raw yaml", "valid policy"] {
+            assert!(
+                small_valid.contains(token),
+                "missing `{token}` in small policy editor"
+            );
+        }
+        let form_row = small_valid
+            .lines()
+            .position(|l| l.contains("form/tree"))
+            .expect("form pane");
+        let raw_row = small_valid
+            .lines()
+            .position(|l| l.contains("raw yaml"))
+            .expect("raw pane");
+        let banner_row = small_valid
+            .lines()
+            .position(|l| l.contains("valid policy"))
+            .expect("banner");
+        assert!(form_row < raw_row && raw_row < banner_row);
+
+        let mut loaded = sample_app().loaded;
+        loaded.editor_seed = "name: [unclosed".to_owned();
+        let mut invalid = App::with_size(loaded, DEFAULT_TERMINAL_SIZE);
+        invalid.route = Route::PolicyEditor;
+        invalid.handle_resize(80, 24);
+        let small_invalid = render_app(&invalid, 80, 24);
+        assert!(small_invalid.contains("INVALID"));
+        assert!(small_invalid.contains("apply blocked"));
+    }
+
+    #[test]
+    fn audit_view_stacks_filters_above_list_when_small() {
+        let mut app = sample_app();
+        app.route = Route::Audit;
+
+        let large = render_app(&app, 130, 30);
+        assert!(large.contains("audit [filter: all"));
+
+        app.handle_resize(80, 24);
+        let small = render_app(&app, 80, 24);
+        assert!(small.contains("audit filters"));
+        assert!(small.contains("filter: all"));
+        assert!(small.contains("ALLOW"));
+        assert!(small.contains("path_not_allowed"));
+
+        let filter_row = small
+            .lines()
+            .position(|l| l.contains("audit filters"))
+            .expect("filters pane");
+        let list_row = small
+            .lines()
+            .position(|l| l.contains("ALLOW"))
+            .expect("list row");
+        assert!(filter_row < list_row);
     }
 
     #[test]
@@ -869,14 +1223,14 @@ mod tests {
     fn policy_editor_banner_flags_invalid_documents() {
         let mut loaded = sample_app().loaded;
         loaded.editor_seed = "name: [unclosed".to_owned();
-        let mut invalid = App::new(loaded);
+        let mut invalid = App::with_size(loaded, DEFAULT_TERMINAL_SIZE);
         invalid.route = Route::PolicyEditor;
         assert!(!matches!(invalid.editor.validation, ValidationState::Valid));
         let bad_screen = render_app(&invalid, 110, 30);
         assert!(bad_screen.contains("INVALID"));
         assert!(bad_screen.contains("apply blocked"));
 
-        let mut valid = App::new(sample_app().loaded);
+        let mut valid = App::with_size(sample_app().loaded, DEFAULT_TERMINAL_SIZE);
         valid.route = Route::PolicyEditor;
         assert!(matches!(valid.editor.validation, ValidationState::Valid));
         assert!(render_app(&valid, 110, 30).contains("valid policy"));

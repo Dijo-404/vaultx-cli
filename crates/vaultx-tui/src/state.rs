@@ -19,6 +19,9 @@ use crate::mask::RedactedLine;
 pub const STACKED_MIN_WIDTH: u16 = 100;
 /// Terminal heights at or below this switch the dashboard to stacked mode.
 pub const STACKED_MIN_HEIGHT: u16 = 22;
+/// Assumed terminal size until the backend reports the real one at
+/// startup (or a resize event arrives).
+pub const DEFAULT_TERMINAL_SIZE: (u16, u16) = (120, 36);
 
 // ---------------------------------------------------------------------------
 // Input model (backend-agnostic)
@@ -267,6 +270,9 @@ pub struct HistoryRow {
     pub message: String,
     /// Author identity.
     pub author: String,
+    /// Redacted secret/policy delta against the parent commit (metadata
+    /// only, see `crate::mask`); empty for roots or unknown history.
+    pub delta: Vec<RedactedLine>,
 }
 
 /// Everything the chrome and dashboard need from one project load.
@@ -359,6 +365,9 @@ pub struct AgentDetail {
     pub full_id: String,
     /// Enablement flag.
     pub enabled: bool,
+    /// Environment the agent operates in (latest usable session), or the
+    /// active dashboard environment when unknown.
+    pub environment: String,
     /// Attached policy names.
     pub policies: Vec<String>,
     /// Logical credential names across attached policies.
@@ -382,6 +391,7 @@ impl Default for AgentDetail {
         Self {
             full_id: String::new(),
             enabled: false,
+            environment: String::new(),
             policies: Vec::new(),
             credentials: Vec::new(),
             allowed_hosts: Vec::new(),
@@ -429,7 +439,8 @@ pub struct AgentsData {
     pub details: BTreeMap<String, AgentDetail>,
 }
 
-/// Everything one refresh produces; [`crate::run`] feeds it to [`App::new`]
+/// Everything one refresh produces; [`crate::run`] feeds it to
+/// [`App::with_size`]
 /// and re-feeds after [`Effect::Refresh`].
 #[derive(Clone, Debug, Default)]
 pub struct LoadedState {
@@ -1053,9 +1064,12 @@ pub struct App {
 }
 
 impl App {
-    /// Builds the app around freshly loaded project data.
+    /// Builds the app around freshly loaded project data with an
+    /// explicit terminal size — pass [`DEFAULT_TERMINAL_SIZE`] when no
+    /// measurement is available, or the size queried at startup so small
+    /// terminals start stacked without waiting for a resize event.
     #[must_use]
-    pub fn new(loaded: LoadedState) -> Self {
+    pub fn with_size(loaded: LoadedState, size: (u16, u16)) -> Self {
         let base_yaml = if loaded.editor_seed.is_empty() {
             TEMPLATE_YAML.to_owned()
         } else {
@@ -1067,7 +1081,7 @@ impl App {
             quit_requested: false,
             status: String::new(),
             modal: None,
-            size: (120, 36),
+            size: (size.0.max(1), size.1.max(1)),
             loaded,
             selection: DashboardSelection::default(),
             diff_selected: 0,
@@ -1475,6 +1489,7 @@ pub(crate) mod testing {
                     short: "abc1234".to_owned(),
                     message: "add stripe key".to_owned(),
                     author: "dj".to_owned(),
+                    delta: Vec::new(),
                 }],
                 notes: Vec::new(),
             },
@@ -1505,13 +1520,13 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn sample_app() -> App {
-        App::new(sample_loaded())
+        App::with_size(sample_loaded(), DEFAULT_TERMINAL_SIZE)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{ctrl, key, press, sample_app, send};
+    use super::testing::{ctrl, key, press, sample_app, sample_loaded, send};
     use super::*;
 
     #[test]
@@ -1580,6 +1595,21 @@ mod tests {
     }
 
     #[test]
+    fn initial_size_comes_from_the_explicit_startup_measurement() {
+        let default_app = sample_app();
+        assert_eq!(default_app.size, (120, 36));
+        assert!(!default_app.stacked_layout());
+
+        let small = App::with_size(sample_loaded(), (80, 24));
+        assert_eq!(small.size, (80, 24));
+        assert!(small.stacked_layout());
+
+        // Degenerate measurements are clamped like resize events.
+        let degenerate = App::with_size(sample_loaded(), (0, 0));
+        assert_eq!(degenerate.size, (1, 1));
+    }
+
+    #[test]
     fn modal_decline_cancels_the_pending_action() {
         let mut app = sample_app();
         app.request_revoke_session("sess_abc");
@@ -1615,7 +1645,7 @@ mod tests {
     fn invalid_policy_blocks_apply_before_any_modal_opens() {
         let mut loaded = testing::sample_loaded();
         loaded.editor_seed = "name: [unclosed".to_owned();
-        let mut app = App::new(loaded);
+        let mut app = App::with_size(loaded, DEFAULT_TERMINAL_SIZE);
 
         send(&mut app, key('4'));
         assert!(!app.editor.can_apply());
