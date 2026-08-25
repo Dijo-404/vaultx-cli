@@ -623,6 +623,39 @@ pub fn render_pack_inspect(pack: &PolicyPack) -> String {
     lines.join("\n")
 }
 
+/// Renders one completed push/pull/sync. Conflicts carry namespace,
+/// name, both tips, and the refusal reason — never object payloads.
+#[must_use]
+pub fn render_sync_result(label: &str, result: &vaultx_sync_client::SyncResult) -> String {
+    let mut lines = vec![format!(
+        "{label}: uploaded {} object(s), downloaded {} object(s), {} policy/policies applied",
+        result.uploaded, result.downloaded, result.policies_applied
+    )];
+    if result.conflicts.is_empty() {
+        lines.push("conflicts: none".to_owned());
+    } else {
+        lines.push(format!("conflicts: {}", result.conflicts.len()));
+        for conflict in &result.conflicts {
+            let local = conflict
+                .local_commit
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string);
+            let remote = conflict
+                .remote_commit
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string);
+            lines.push(format!(
+                "  {}/{}: local={local} remote={remote} ({})",
+                conflict.namespace_name(),
+                conflict.name,
+                conflict.reason
+            ));
+        }
+        lines.push("nothing was forced; resolve the conflicts and retry".to_owned());
+    }
+    lines.join("\n")
+}
+
 /// Prefixes every line of a nested block with two spaces.
 fn indent(block: String) -> String {
     block

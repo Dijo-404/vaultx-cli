@@ -8,9 +8,9 @@
 //! codes.
 //!
 //! Handlers contain **parsing and presentation logic only** (plan §14,
-//! INV-016): all meaningful work goes through `vaultx-core` services.
-//! Command groups whose implementation is deferred are still declared so
-//! their names stay reserved in `--help`; invoking one returns
+//! INV-016): all meaningful work goes through `vaultx-core` services
+//! (and, for the team-sync surface, `crate::remoting`). Command groups
+//! without an implementation in this build still return
 //! [`CliError::NotImplemented`] (exit code 2).
 
 use std::path::{Path, PathBuf};
@@ -110,16 +110,6 @@ impl CliError {
             Self::ChildExit(code) => (*code).clamp(1, 255),
         }
     }
-}
-
-/// Catch-all argument collector for planned-but-unimplemented command
-/// groups. Everything after the group name is swallowed so a stub can be
-/// invoked exactly like its future real form.
-#[derive(Args, Debug)]
-pub struct StubArgs {
-    /// Trailing arguments (ignored by stubs).
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    pub args: Vec<String>,
 }
 
 /// The `vaultx` command-line interface.
@@ -372,20 +362,118 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
     },
-    /// Audit log inspection (planned).
-    Audit(StubArgs),
-    /// Remote repository configuration (planned).
-    Remote(StubArgs),
-    /// Authenticate against a remote workspace (planned).
-    Login(StubArgs),
-    /// Workspace management (planned).
-    Workspace(StubArgs),
-    /// Push local history upstream (planned).
-    Push(StubArgs),
-    /// Pull upstream history (planned).
-    Pull(StubArgs),
-    /// Synchronize with the control plane (planned).
-    Sync(StubArgs),
+    /// Authenticate against a control plane and store the session
+    /// outside the repository (re-login required after reboot).
+    Login {
+        /// Base URL of the control plane (`http(s)://host[:port]`).
+        #[arg(long, value_name = "URL")]
+        server: String,
+        /// Session token (`vxs_…`), or `-` to read it from stdin;
+        /// omitted: hidden prompt. Never stored inside the project.
+        #[arg(long, value_name = "-|TOKEN")]
+        token: Option<String>,
+    },
+    /// Manage named remotes bound to control-plane projects.
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
+    /// List or create workspaces on the logged-in control plane.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    /// Upload local objects and refs to the configured remote.
+    Push {
+        /// Also upload local audit events not yet uploaded.
+        #[arg(long)]
+        with_audit: bool,
+        /// Named remote to push to (default: `origin`, else the sole one).
+        #[arg(long, value_name = "NAME")]
+        remote: Option<String>,
+        /// Authorize updates to protected environment refs for this run.
+        #[arg(long)]
+        authorize_protected: bool,
+    },
+    /// Download remote objects and reconcile refs by ancestry.
+    Pull {
+        /// Conflict handling: `fast-forward` fails when refs diverged;
+        /// `ours` keeps local divergent tips and reports them.
+        #[arg(long, value_parser = parse_pull_strategy, value_name = "fast-forward|ours")]
+        strategy: Option<PullStrategy>,
+        /// Named remote to pull from (default: `origin`, else the sole one).
+        #[arg(long, value_name = "NAME")]
+        remote: Option<String>,
+        /// Authorize updates to protected environment refs for this run.
+        #[arg(long)]
+        authorize_protected: bool,
+    },
+    /// Push then pull in a single pass, reporting one combined summary.
+    Sync {
+        /// Conflict handling (see `pull`).
+        #[arg(long, value_parser = parse_pull_strategy, value_name = "fast-forward|ours")]
+        strategy: Option<PullStrategy>,
+        /// Named remote (default: `origin`, else the sole one).
+        #[arg(long, value_name = "NAME")]
+        remote: Option<String>,
+        /// Authorize updates to protected environment refs for this run.
+        #[arg(long)]
+        authorize_protected: bool,
+    },
+    /// Local audit log inspection.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+}
+
+/// `vaultx remote <subcommand>`.
+#[derive(Subcommand, Debug)]
+pub enum RemoteCommand {
+    /// Bind NAME to a control-plane project using the stored login.
+    Add {
+        /// Remote name (lowercase alphanumerics, `-`/`_`).
+        name: String,
+        /// Control-plane project id (`proj_…`) this repository syncs with.
+        #[arg(long, value_name = "PROJECT_ID")]
+        project: String,
+    },
+    /// List configured remotes as NAME / PROJECT / SERVER columns.
+    List,
+    /// Forget a configured remote.
+    Remove {
+        /// Remote name.
+        name: String,
+    },
+}
+
+/// `vaultx workspace <subcommand>`.
+#[derive(Subcommand, Debug)]
+pub enum WorkspaceCommand {
+    /// List workspaces visible to the stored session.
+    List,
+    /// Create a workspace owned by the authenticated principal.
+    Create {
+        /// Workspace name.
+        name: String,
+    },
+}
+
+/// `vaultx audit <subcommand>`.
+#[derive(Subcommand, Debug)]
+pub enum AuditCommand {
+    /// List local audit events newest-last as recorded in the JSONL chain.
+    List {
+        /// Only events by this principal (e.g. `agent:ci-bot`).
+        #[arg(long, value_name = "PRINCIPAL")]
+        actor: Option<String>,
+        /// Filter by decision outcome.
+        #[arg(long, value_parser = parse_outcome, value_name = "allow|deny")]
+        outcome: Option<bool>,
+        /// Maximum number of matched events to print.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
 }
 
 /// `vaultx env <subcommand>`.
@@ -892,13 +980,62 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             }
         },
         Command::Tui { env, socket } => cmd_tui(&cli.project, env.as_deref(), socket.as_deref()),
-        Command::Audit(_) => Err(CliError::NotImplemented("audit")),
-        Command::Remote(_) => Err(CliError::NotImplemented("remote")),
-        Command::Login(_) => Err(CliError::NotImplemented("login")),
-        Command::Workspace(_) => Err(CliError::NotImplemented("workspace")),
-        Command::Push(_) => Err(CliError::NotImplemented("push")),
-        Command::Pull(_) => Err(CliError::NotImplemented("pull")),
-        Command::Sync(_) => Err(CliError::NotImplemented("sync")),
+
+        // Team-sync surface (plan §39/§45).
+        Command::Login { server, token } => crate::remoting::cmd_login(server, token.as_deref()),
+        Command::Remote { command } => match command {
+            RemoteCommand::Add { name, project } => with_open(&cli.project, |s| {
+                crate::remoting::cmd_remote_add(s, name, project)
+            }),
+            RemoteCommand::List => with_open(&cli.project, crate::remoting::cmd_remote_list),
+            RemoteCommand::Remove { name } => with_open(&cli.project, |s| {
+                crate::remoting::cmd_remote_remove(s, name)
+            }),
+        },
+        Command::Workspace { command } => match command {
+            WorkspaceCommand::List => crate::remoting::cmd_workspace_list(),
+            WorkspaceCommand::Create { name } => crate::remoting::cmd_workspace_create(name),
+        },
+        Command::Push {
+            with_audit,
+            remote,
+            authorize_protected,
+        } => with_open(&cli.project, |s| {
+            crate::remoting::cmd_push(s, *with_audit, remote.as_deref(), *authorize_protected)
+        }),
+        Command::Pull {
+            strategy,
+            remote,
+            authorize_protected,
+        } => with_open(&cli.project, |s| {
+            crate::remoting::cmd_pull(
+                s,
+                strategy.unwrap_or_default(),
+                remote.as_deref(),
+                *authorize_protected,
+            )
+        }),
+        Command::Sync {
+            strategy,
+            remote,
+            authorize_protected,
+        } => with_open(&cli.project, |s| {
+            crate::remoting::cmd_sync(
+                s,
+                strategy.unwrap_or_default(),
+                remote.as_deref(),
+                *authorize_protected,
+            )
+        }),
+        Command::Audit { command } => match command {
+            AuditCommand::List {
+                actor,
+                outcome,
+                limit,
+            } => with_open(&cli.project, |s| {
+                crate::remoting::cmd_audit_list(s, actor.as_deref(), *outcome, *limit)
+            }),
+        },
     }
 }
 
@@ -1837,9 +1974,9 @@ fn cmd_agent_run(
 }
 
 /// Runs `future` to completion on a private multi-thread runtime. The
-/// CLI is otherwise synchronous; only broker process operations need a
-/// reactor.
-fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
+/// CLI is otherwise synchronous; broker process operations and the
+/// team-sync surface need a reactor.
+pub(crate) fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -2316,6 +2453,36 @@ fn parse_merge_strategy(raw: &str) -> Result<MergeStrategy, String> {
         "ours" => Ok(MergeStrategy::Ours),
         other => Err(format!(
             "unknown merge strategy `{other}` (expected `theirs` or `ours`)"
+        )),
+    }
+}
+
+/// How pull reacts when a remote ref diverged from local history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PullStrategy {
+    /// Fail the command with a conflict report (default).
+    #[default]
+    FastForward,
+    /// Keep local divergent tips; report them without failing.
+    Ours,
+}
+
+fn parse_pull_strategy(raw: &str) -> Result<PullStrategy, String> {
+    match raw {
+        "fast-forward" => Ok(PullStrategy::FastForward),
+        "ours" => Ok(PullStrategy::Ours),
+        other => Err(format!(
+            "unknown pull strategy `{other}` (expected `fast-forward` or `ours`)"
+        )),
+    }
+}
+
+fn parse_outcome(raw: &str) -> Result<bool, String> {
+    match raw {
+        "allow" => Ok(true),
+        "deny" => Ok(false),
+        other => Err(format!(
+            "unknown outcome `{other}` (expected `allow` or `deny`)"
         )),
     }
 }

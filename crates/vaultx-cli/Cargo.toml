@@ -15,21 +15,32 @@ path = "src/main.rs"
 [dependencies]
 base64 = { workspace = true }
 clap = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
 rpassword = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+vaultx-audit = { path = "../vaultx-audit" }
 vaultx-broker = { path = "../vaultx-broker" }
 vaultx-broker-client = { path = "../vaultx-broker-client" }
+vaultx-control-plane = { path = "../vaultx-control-plane" }
 vaultx-core = { path = "../vaultx-core" }
+vaultx-crypto = { path = "../vaultx-crypto" }
+vaultx-keyring = { path = "../vaultx-keyring" }
 vaultx-mcp = { path = "../vaultx-mcp" }
 vaultx-policy = { path = "../vaultx-policy" }
 vaultx-policy-packs = { path = "../vaultx-policy-packs" }
+vaultx-sync-client = { path = "../vaultx-sync-client" }
 vaultx-tui = { path = "../vaultx-tui" }
 vaultx-types = { path = "../vaultx-types" }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
 tempfile = { workspace = true }
-vaultx-crypto = { path = "../vaultx-crypto" }
+tower = { workspace = true }
 vaultx-repository = { path = "../vaultx-repository" }

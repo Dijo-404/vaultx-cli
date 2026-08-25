@@ -13,8 +13,8 @@ use vaultx_types::CommitId;
 use crate::cli::REVEAL_CONFIRMATION_PHRASE;
 use crate::cli::{typed_confirmation_matches, DELETE_REFS_CONFIRMATION_PHRASE};
 use crate::{
-    dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, McpCommand, PackCommand,
-    PolicyCommand, SecretCommand, StubArgs,
+    dispatch, AgentCommand, AuditCommand, Cli, CliError, Command, EnvCommand, McpCommand,
+    PackCommand, PolicyCommand, RemoteCommand, SecretCommand, WorkspaceCommand,
 };
 
 /// Isolates the process-wide XDG runtime directory so broker-endpoint
@@ -373,39 +373,613 @@ fn import_file_classification_output() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Team-sync surface (login/remote/workspace/push/pull/sync/audit list)
+//
+// Drives `dispatch` against a real in-process control plane: one axum
+// server bound to 127.0.0.1:0 for the whole binary, with per-test
+// workspaces/projects/sessions seeded into the shared store so parallel
+// tests never observe each other's server-side state. A process-wide
+// mutex serializes the tests because the session-token file under
+// XDG_RUNTIME_DIR is shared.
+// ---------------------------------------------------------------------------
+
+use vaultx_audit::{
+    AppendStore as _, AuditAction, AuditDecision, CorrelationId, JsonlAppendStore, NewAuditEvent,
+    SafeAuditMetadata,
+};
+use vaultx_control_plane::api::AppState as ControlPlaneState;
+use vaultx_control_plane::model::{Principal as ControlPrincipal, UserRecord, WorkspaceMembership};
+use vaultx_control_plane::store::{ControlPlaneStore as _, InMemoryControlPlaneStore};
+
+struct FakeControlPlane {
+    base_url: String,
+    store: std::sync::Arc<InMemoryControlPlaneStore>,
+}
+
+/// Serializes every team-sync test (shared session file + shared server).
+static TEAM_SYNC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn fake_control_plane() -> &'static FakeControlPlane {
+    static PLANE: OnceLock<FakeControlPlane> = OnceLock::new();
+    PLANE.get_or_init(|| {
+        isolated_xdg_runtime_dir();
+        let store = std::sync::Arc::new(InMemoryControlPlaneStore::new());
+        let app = vaultx_control_plane::api::router(ControlPlaneState::new(std::sync::Arc::clone(
+            &store,
+        )
+            as std::sync::Arc<dyn vaultx_control_plane::ControlPlaneStore>));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("server runtime");
+        let listener = runtime
+            .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        // The server thread owns the runtime for the rest of the process;
+        // it serves until exit, which is exactly the lifetime a hermetic
+        // fixture wants.
+        std::thread::spawn(move || {
+            runtime.block_on(async move { axum::serve(listener, app).await.expect("serve") });
+        });
+        FakeControlPlane {
+            base_url: format!("http://{addr}"),
+            store,
+        }
+    })
+}
+
+/// Seeds user/workspace/project/session for one test and returns
+/// `(project_id, session_token)`.
+fn seed_project(plane: &FakeControlPlane, tag: &str) -> (vaultx_types::ProjectId, String) {
+    use vaultx_types::WorkspaceId;
+    let workspace = WorkspaceId::parse(&format!("ws_{tag}")).expect("valid workspace id");
+    let project = vaultx_types::ProjectId::parse(&format!("proj_{tag}")).expect("valid project");
+    let login = format!("user-{tag}");
+    let token = format!("vxs_cli_{tag}_session");
+    plane
+        .store
+        .upsert_user(&UserRecord {
+            login: login.clone(),
+            display_name: None,
+            verifier: vaultx_control_plane::auth::hash_verifier("pw").expect("seed"),
+        })
+        .expect("seed user");
+    plane
+        .store
+        .create_workspace(&vaultx_control_plane::model::WorkspaceRecord {
+            id: workspace.clone(),
+            name: tag.to_owned(),
+            owner: login.clone(),
+        })
+        .expect("seed workspace");
+    plane
+        .store
+        .create_project(&vaultx_control_plane::model::ProjectRecord {
+            id: project.clone(),
+            workspace,
+            name: "core".to_owned(),
+        })
+        .expect("seed project");
+    plane
+        .store
+        .issue_session(
+            &token,
+            &ControlPrincipal {
+                subject: login,
+                class: vaultx_control_plane::auth::TokenClass::ControlSession,
+            },
+        )
+        .expect("seed session");
+    (project, token)
+}
+
+fn team_sync_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEAM_SYNC_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Full local setup for one sync test: initialized project + login +
+/// remote binding; returns the seeded project id.
+fn setup_synced_project(plane: &FakeControlPlane, tag: &str) -> (PathBuf, vaultx_types::ProjectId) {
+    let dir = tempfile::tempdir().expect("tempdir").keep();
+    init_in(&dir);
+    let (project, token) = seed_project(plane, tag);
+    dispatch(&cli(
+        &dir,
+        Command::Login {
+            server: plane.base_url.clone(),
+            token: Some(token),
+        },
+    ))
+    .expect("login succeeds");
+    dispatch(&cli(
+        &dir,
+        Command::Remote {
+            command: RemoteCommand::Add {
+                name: "origin".to_owned(),
+                project: project.to_string(),
+            },
+        },
+    ))
+    .expect("remote add succeeds");
+    (dir, project)
+}
+
+fn append_local_event(root: &Path, deny: bool) -> u64 {
+    let audit_path = root.join(".vaultx").join("audit").join("events.jsonl");
+    let store = JsonlAppendStore::open(audit_path);
+    let stored = store
+        .append(NewAuditEvent {
+            correlation_id: CorrelationId::generate().expect("correlation"),
+            actor: vaultx_policy::Principal::parse("agent:ci-bot").expect("principal"),
+            project: vaultx_types::ProjectId::parse("proj_core").expect("project"),
+            environment: None,
+            action: AuditAction::HttpRequest,
+            decision: if deny {
+                AuditDecision::Deny {
+                    reason: "path not allowed".to_owned(),
+                }
+            } else {
+                AuditDecision::Allow
+            },
+            credential: None,
+            destination: None,
+            capability: None,
+            policy_ids: Vec::new(),
+            metadata: SafeAuditMetadata::default(),
+        })
+        .expect("append");
+    stored.sequence
+}
+
 #[test]
-fn unsupported_groups_return_not_implemented_with_exit_two() {
+fn login_stores_credentials_and_rejects_bad_tokens() {
+    let _guard = team_sync_guard();
+    let plane = fake_control_plane();
+    let (_project, token) = seed_project(plane, "logintest");
+
+    // Start from a clean session state so the rejection is observable.
+    remove_session_file();
+
+    // A garbage token is rejected by the probe and nothing is stored.
     let dir = tempfile::tempdir().unwrap();
-    let stubs = [
-        // `broker` and `mcp` are implemented now; their subcommands are
-        // exercised in the dedicated tests below.
-        (
-            "audit",
-            Command::Audit(StubArgs {
-                args: vec!["list".into()],
-            }),
-        ),
-        ("remote", Command::Remote(StubArgs { args: Vec::new() })),
-        ("login", Command::Login(StubArgs { args: Vec::new() })),
-        (
-            "workspace",
-            Command::Workspace(StubArgs { args: Vec::new() }),
-        ),
-        ("push", Command::Push(StubArgs { args: Vec::new() })),
-        ("pull", Command::Pull(StubArgs { args: Vec::new() })),
-        ("sync", Command::Sync(StubArgs { args: Vec::new() })),
-    ];
-    for (group, command) in stubs {
-        // Stubs work anywhere — they never touch the filesystem, so run
-        // them against an uninitialized directory on purpose.
-        let err = dispatch(&cli(dir.path(), command)).unwrap_err();
-        assert!(
-            matches!(&err, CliError::NotImplemented(name) if *name == group),
-            "`{group}` must map to NotImplemented(\"{group}\"), got {err:?}"
-        );
-        assert_eq!(err.exit_code(), 2);
-        assert!(err.to_string().contains(group));
+    init_in(dir.path());
+    let err = dispatch(&cli(
+        dir.path(),
+        Command::Login {
+            server: plane.base_url.clone(),
+            token: Some("vxs_definitely_wrong".to_owned()),
+        },
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("rejected"), "got: {err}");
+    assert!(!session_file_exists(), "failed logins must store nothing");
+
+    // Non-http servers are refused before any credential material moves.
+    let err = dispatch(&cli(
+        dir.path(),
+        Command::Login {
+            server: "ftp://nope".to_owned(),
+            token: Some(token.clone()),
+        },
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CliError::Usage(ref text) if text.contains("http")));
+
+    // The valid token verifies and persists.
+    let out = dispatch(&cli(
+        dir.path(),
+        Command::Login {
+            server: plane.base_url.clone(),
+            token: Some(token),
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("authenticated against"), "got: {out}");
+    assert!(out.contains("credentials stored"), "got: {out}");
+
+    // Stored outside any repository, owner-only on unix.
+    let path = crate::remoting::session_path();
+    assert!(path.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "session file must be 0600");
     }
+
+    // workspace list now works through the same credentials.
+    let listed = dispatch(&cli(
+        dir.path(),
+        Command::Workspace {
+            command: WorkspaceCommand::List,
+        },
+    ))
+    .unwrap();
+    assert!(listed.contains("ws_logintest"), "got: {listed}");
+}
+
+#[test]
+fn push_uploads_objects_refs_and_reports_counts() {
+    let _guard = team_sync_guard();
+    let plane = fake_control_plane();
+    let (root, project) = setup_synced_project(plane, "pushtest");
+
+    dispatch(&cli(
+        &root,
+        Command::Set {
+            pairs: vec!["API_KEY=from-cli".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(&root, "seed config", None);
+
+    let out = dispatch(&cli(
+        &root,
+        Command::Push {
+            with_audit: false,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap();
+    assert!(
+        out.contains("uploaded 3 object(s)"),
+        "config+manifest+commit expected: {out}"
+    );
+    assert!(out.contains("conflicts: none"), "got: {out}");
+
+    // Server side really received objects and the main ref.
+    let head = head_commit_of(&root);
+    assert_eq!(
+        plane
+            .store
+            .get_ref_state(
+                &project,
+                vaultx_control_plane::model::RefNamespace::Heads,
+                "main"
+            )
+            .unwrap()
+            .map(|r| r.commit),
+        Some(head)
+    );
+    assert_eq!(plane.store.list_object_ids(&project).unwrap().len(), 3);
+
+    // Re-push is idempotent at the object level.
+    let again = dispatch(&cli(
+        &root,
+        Command::Push {
+            with_audit: false,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap();
+    assert!(again.contains("uploaded 0 object(s)"), "got: {again}");
+}
+
+#[test]
+fn pull_applies_remote_policy_into_vaultx_policies() {
+    let _guard = team_sync_guard();
+    let plane = fake_control_plane();
+    let (root, project) = setup_synced_project(plane, "pulltest");
+
+    plane
+        .store
+        .upsert_policy(
+            &project,
+            &vaultx_control_plane::model::PolicyDocument {
+                name: vaultx_types::PolicyName::parse("read_only").expect("policy name"),
+                document_json: "{}".to_owned(),
+            },
+        )
+        .expect("seed policy");
+
+    let out = dispatch(&cli(
+        &root,
+        Command::Pull {
+            strategy: None,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("1 policy/policies applied"), "got: {out}");
+    let policy_path = root.join(".vaultx").join("policies").join("read_only.yaml");
+    assert!(policy_path.is_file(), "pulled policy file must appear");
+    assert_eq!(
+        std::fs::read_to_string(policy_path).unwrap(),
+        "{}",
+        "file content mirrors the served document"
+    );
+}
+
+#[test]
+fn sync_round_trips_between_two_clones_with_one_summary() {
+    let _guard = team_sync_guard();
+    let plane = fake_control_plane();
+
+    // Workspace A commits and pushes.
+    let (root_a, project) = setup_synced_project(plane, "synctest");
+    let head_seed = {
+        dispatch(&cli(
+            &root_a,
+            Command::Set {
+                pairs: vec!["SHARED_VAR=v1".into()],
+            },
+        ))
+        .unwrap();
+        commit_ok(&root_a, "seed", None)
+    };
+    dispatch(&cli(
+        &root_a,
+        Command::Push {
+            with_audit: false,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap();
+
+    // Workspace B binds the same project and syncs down.
+    let root_b = tempfile::tempdir().expect("tempdir").keep();
+    init_in(&root_b);
+    let (_, token_b) = seed_project(plane, "synctestb");
+    // Grant B membership in the shared workspace.
+    plane
+        .store
+        .add_workspace_member(&WorkspaceMembership {
+            workspace: vaultx_types::WorkspaceId::parse("ws_synctest").expect("valid"),
+            user: "user-synctestb".to_owned(),
+            role: vaultx_control_plane::model::ROLE_MEMBER.to_owned(),
+        })
+        .expect("membership");
+    dispatch(&cli(
+        &root_b,
+        Command::Login {
+            server: plane.base_url.clone(),
+            token: Some(token_b),
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        &root_b,
+        Command::Remote {
+            command: RemoteCommand::Add {
+                name: "origin".to_owned(),
+                project: project.to_string(),
+            },
+        },
+    ))
+    .unwrap();
+
+    let out = dispatch(&cli(
+        &root_b,
+        Command::Sync {
+            strategy: None,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("sync:"), "single summary expected: {out}");
+    assert!(out.contains("downloaded 3 object(s)"), "got: {out}");
+    assert_eq!(head_commit_of(&root_b), head_seed);
+
+    // B's own device identity was registered by its sync attestation.
+    assert_eq!(
+        plane
+            .store
+            .list_devices_for_user("user-synctestb")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn audit_upload_tracks_watermark_and_reports_counts() {
+    let _guard = team_sync_guard();
+    let plane = fake_control_plane();
+    let (root, _project) = setup_synced_project(plane, "audupload");
+
+    let first = append_local_event(&root, false);
+    let second = append_local_event(&root, true);
+    assert_eq!(second, first + 1);
+
+    // Push --with-audit uploads both events and advances the watermark.
+    let out = dispatch(&cli(
+        &root,
+        Command::Push {
+            with_audit: true,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("audit: uploaded 2 event(s)"), "got: {out}");
+
+    let state = std::fs::read_to_string(root.join(".vaultx").join("sync-state.json")).unwrap();
+    assert!(
+        state.contains(&format!("\"last_uploaded_sequence\":{second}")),
+        "{state}"
+    );
+
+    // A further push uploads nothing new.
+    let out = dispatch(&cli(
+        &root,
+        Command::Push {
+            with_audit: true,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("audit: nothing new to upload"), "got: {out}");
+}
+
+#[test]
+fn audit_list_filters_by_outcome_actor_and_limit() {
+    let _guard = team_sync_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    append_local_event(root, false); // seq 0 allow
+    append_local_event(root, true); // seq 1 deny
+    append_local_event(root, false); // seq 2 allow
+
+    let all = dispatch(&cli(
+        root,
+        Command::Audit {
+            command: AuditCommand::List {
+                actor: None,
+                outcome: None,
+                limit: None,
+            },
+        },
+    ))
+    .unwrap();
+    assert!(all.contains("SEQ"), "table header: {all}");
+    assert_eq!(all.lines().count(), 4, "header + three rows: {all}");
+    // The deny reason must not be mistaken for an outcome cell.
+    let allow_rows = all
+        .lines()
+        .filter(|line| line.split_whitespace().nth(3) == Some("allow"))
+        .count();
+    assert_eq!(allow_rows, 2, "two allows expected: {all}");
+    assert!(all.contains("deny"), "got: {all}");
+
+    let denies = dispatch(&cli(
+        root,
+        Command::Audit {
+            command: AuditCommand::List {
+                actor: None,
+                outcome: Some(false),
+                limit: None,
+            },
+        },
+    ))
+    .unwrap();
+    assert!(denies.contains("deny"), "got: {denies}");
+    assert!(!denies.contains("\n0 "), "only the deny row: {denies}");
+
+    let limited = dispatch(&cli(
+        root,
+        Command::Audit {
+            command: AuditCommand::List {
+                actor: None,
+                outcome: None,
+                limit: Some(1),
+            },
+        },
+    ))
+    .unwrap();
+    assert!(limited.contains("agent:ci-bot"), "got: {limited}");
+    assert_eq!(limited.lines().count(), 2, "header + one row: {limited}");
+
+    let actor_filtered = dispatch(&cli(
+        root,
+        Command::Audit {
+            command: AuditCommand::List {
+                actor: Some("agent:nobody".to_owned()),
+                outcome: None,
+                limit: None,
+            },
+        },
+    ))
+    .unwrap();
+    assert_eq!(actor_filtered, "no audit events");
+}
+
+#[test]
+fn team_sync_commands_error_cleanly_without_configuration() {
+    let _guard = team_sync_guard();
+    let plane = fake_control_plane();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    // Establish the "never logged in" precondition: the session file is
+    // process-global, so earlier team-sync tests may have created one.
+    remove_session_file();
+
+    // No login at all: push/pull/sync/remote-add fail with guidance.
+    for command in [
+        Command::Push {
+            with_audit: false,
+            remote: None,
+            authorize_protected: false,
+        },
+        Command::Pull {
+            strategy: None,
+            remote: None,
+            authorize_protected: false,
+        },
+        Command::Sync {
+            strategy: None,
+            remote: None,
+            authorize_protected: false,
+        },
+    ] {
+        let err = dispatch(&cli(root, command)).unwrap_err();
+        assert!(
+            matches!(err, CliError::Usage(ref text) if text.contains("not logged in")),
+            "expected clean usage error, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    // Logged in but no remote configured: still clean.
+    let (_, token) = seed_project(plane, "noremo");
+    dispatch(&cli(
+        root,
+        Command::Login {
+            server: plane.base_url.clone(),
+            token: Some(token),
+        },
+    ))
+    .unwrap();
+    let err = dispatch(&cli(
+        root,
+        Command::Push {
+            with_audit: false,
+            remote: None,
+            authorize_protected: false,
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CliError::Usage(ref text) if text.contains("no remote configured")),
+        "got {err:?}"
+    );
+}
+
+fn session_file_exists() -> bool {
+    std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|base| {
+        PathBuf::from(base)
+            .join("vaultx")
+            .join("session.json")
+            .is_file()
+    })
+}
+
+fn remove_session_file() {
+    if session_file_exists() {
+        std::fs::remove_file(crate::remoting::session_path()).expect("remove session file");
+    }
+}
+
+fn head_commit_of(root: &Path) -> CommitId {
+    let repository = vaultx_repository::Repository::open(root).expect("open repo");
+    repository
+        .refs()
+        .read_ref(vaultx_repository::RefNamespace::Heads, "main")
+        .expect("read ref")
+        .expect("main ref exists")
 }
 
 #[test]
