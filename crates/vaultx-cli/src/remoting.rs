@@ -596,18 +596,11 @@ pub(crate) fn cmd_sync(
     authorize_protected: bool,
 ) -> Result<String, CliError> {
     let ctx = open_sync_context(services, remote, authorize_protected)?;
-    let pushed = run_push(&ctx)?;
-    let pulled = run_pull(&ctx)?;
-    let combined = SyncResult {
-        uploaded: pushed.uploaded,
-        downloaded: pulled.downloaded,
-        conflicts: {
-            let mut all = pushed.conflicts;
-            all.extend(pulled.conflicts);
-            all
-        },
-        policies_applied: pulled.policies_applied,
-    };
+    let combined = crate::cli::run_async(vaultx_sync_client::push_then_pull(
+        &ctx.client,
+        ctx.project_id.clone(),
+    ))
+    .map_err(map_sync_error)?;
     finish("sync", &combined, strategy)
 }
 

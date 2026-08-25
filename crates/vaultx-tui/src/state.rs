@@ -566,10 +566,11 @@ pub struct Modal {
 }
 
 impl Modal {
-    /// Footer hint rendered under the body.
+    /// Footer hint rendered under the body. Bare Enter is deliberately
+    /// NOT a confirm: destructive actions require the explicit `y`.
     #[must_use]
     pub fn hint(&self) -> &'static str {
-        "y confirm · n cancel"
+        "y confirm · n/esc cancel"
     }
 }
 
@@ -1139,6 +1140,10 @@ pub struct App {
     pub sync_selected: usize,
     /// Rendered lines from the most recent push/pull/sync run.
     pub sync_lines: Vec<String>,
+    /// True while a push/pull/sync runs in the background; u/d/s are
+    /// ignored (nothing queued) and the renderer may show a busy
+    /// indicator. Cleared by the backend when the operation settles.
+    pub sync_busy: bool,
     selection: DashboardSelection,
 }
 
@@ -1175,6 +1180,7 @@ impl App {
             promote_env_selected: 0,
             sync_selected: 0,
             sync_lines: Vec::new(),
+            sync_busy: false,
         }
     }
 
@@ -1190,14 +1196,19 @@ impl App {
         self.size = (width.max(1), height.max(1));
     }
 
-    /// Replaces loaded data and clamps the agent/audit/promote/sync
-    /// selections against the new lengths so a shrinking snapshot never
-    /// strands an index outside its list.
+    /// Replaces loaded data and clamps the agent/session/audit/promote/
+    /// sync selections against the new lengths so a shrinking snapshot
+    /// never strands an index outside its list.
     pub fn swap_loaded(&mut self, loaded: LoadedState) {
         self.loaded = loaded;
         self.agent_selected = self
             .agent_selected
             .min(self.loaded.agents.list.len().saturating_sub(1));
+        let session_len = self
+            .focused_agent_detail()
+            .and_then(|detail| detail.sessions.as_ref().ok())
+            .map_or(0, Vec::len);
+        self.session_selected = self.session_selected.min(session_len.saturating_sub(1));
         self.audit_selected = self
             .audit_selected
             .min(self.loaded.audit.len().saturating_sub(1));
@@ -1534,10 +1545,29 @@ impl App {
     /// Sync-view keys: u/d/s run push/pull/sync through the shared sync
     /// client, arrows move the remote-row highlight (display only — the
     /// actions resolve their remote exactly like the CLI does), Esc
-    /// returns to the dashboard.
+    /// returns to the dashboard. While an operation is in flight u/d/s
+    /// are inert — nothing is queued; navigation stays live.
     fn sync_key(&mut self, k: KeyInput) -> Effect {
         if k.ctrl {
             return Effect::None;
+        }
+        if self.sync_busy {
+            return match k.code {
+                KeyCode::Char('u') | KeyCode::Char('d') | KeyCode::Char('s') => Effect::None,
+                KeyCode::Esc => {
+                    self.switch_route(Route::Dashboard);
+                    Effect::None
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    scroll(
+                        &mut self.sync_selected,
+                        self.loaded.sync.remotes.len(),
+                        vertical_delta(k),
+                    );
+                    Effect::None
+                }
+                _ => Effect::None,
+            };
         }
         match k.code {
             KeyCode::Char('u') => Effect::Push,
@@ -1595,10 +1625,11 @@ impl App {
     }
 
     fn handle_modal_key(&mut self, k: KeyInput) -> Effect {
-        let confirmed = matches!(
-            k.code,
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
-        );
+        // Hardened confirmation (plan §15): a destructive modal confirms
+        // ONLY on an explicit `y`/`Y`. Bare Enter is cancel-neutral —
+        // muscle-memory "Enter = yes" must never fire a destructive
+        // action; Esc/q/n cancel.
+        let confirmed = matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y'));
         let dismissed = matches!(
             k.code,
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N')
@@ -2164,6 +2195,32 @@ mod tests {
     }
 
     #[test]
+    fn bare_enter_never_confirms_a_destructive_modal() {
+        let mut app = sample_app();
+        send(&mut app, key('6'));
+        send(&mut app, press(KeyCode::Tab));
+        send(&mut app, press(KeyCode::Down)); // production is protected
+        let _ = app.handle_key(press(KeyCode::Enter));
+        assert!(app.modal.is_some());
+
+        // Enter alone is cancel-neutral: nothing fires, modal stays up.
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), Effect::None);
+        assert!(app.modal.is_some());
+        assert!(!app.status.contains("promoting"));
+
+        // Only the explicit key confirms.
+        assert_eq!(
+            app.handle_key(key('y')),
+            Effect::Promote {
+                from_ref: "feature/login".to_owned(),
+                to_env: "production".to_owned(),
+                force: true,
+            }
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
     fn promote_enter_with_no_selections_reports_instead_of_panicking() {
         let mut loaded = sample_loaded();
         loaded.branches.clear();
@@ -2181,6 +2238,25 @@ mod tests {
         let mut app = sample_app();
         send(&mut app, key('7'));
 
+        assert_eq!(app.handle_key(key('u')), Effect::Push);
+        assert_eq!(app.handle_key(key('d')), Effect::Pull);
+        assert_eq!(app.handle_key(key('s')), Effect::SyncAll);
+    }
+
+    #[test]
+    fn busy_sync_ignores_repeated_action_keys_and_navigation_stays_live() {
+        let mut app = sample_app();
+        send(&mut app, key('7'));
+
+        // Simulate the backend marking an operation in flight.
+        app.sync_busy = true;
+        assert_eq!(app.handle_key(key('u')), Effect::None);
+        assert_eq!(app.handle_key(key('d')), Effect::None);
+        assert_eq!(app.handle_key(key('s')), Effect::None);
+
+        // Nothing queued: clearing busy restores exactly one effect per
+        // key, not the three swallowed ones.
+        app.sync_busy = false;
         assert_eq!(app.handle_key(key('u')), Effect::Push);
         assert_eq!(app.handle_key(key('d')), Effect::Pull);
         assert_eq!(app.handle_key(key('s')), Effect::SyncAll);
@@ -2207,6 +2283,78 @@ mod tests {
         assert_eq!(app.promote_ref_selected, 0);
         assert_eq!(app.promote_env_selected, 0);
         assert_eq!(app.sync_selected, 0);
+    }
+
+    #[test]
+    fn shrinking_sessions_clamps_the_session_highlight() {
+        let session = |id: &str| SessionRow {
+            session_id: id.to_owned(),
+            environment: "production".to_owned(),
+            status: SessionStatus::Active,
+        };
+        let detail = |sessions: Vec<SessionRow>| AgentDetail {
+            full_id: "agent_bot".to_owned(),
+            environment: "production".to_owned(),
+            sessions: Ok(sessions),
+            ..AgentDetail::default()
+        };
+
+        let mut loaded = sample_loaded();
+        loaded.agents = AgentsData {
+            list: vec![AgentRow {
+                name: "bot".to_owned(),
+                enabled: true,
+            }],
+            details: [(
+                "bot".to_owned(),
+                detail(vec![session("s1"), session("s2"), session("s3")]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mut app = App::with_size(loaded, DEFAULT_TERMINAL_SIZE);
+
+        // Walk the session highlight to the last row.
+        send(&mut app, key('3'));
+        send(&mut app, press(KeyCode::Tab));
+        send(&mut app, press(KeyCode::Down));
+        send(&mut app, press(KeyCode::Down));
+        assert_eq!(app.session_selected, 2);
+
+        // A reload that leaves one session clamps the highlight back.
+        let mut shrunk = sample_loaded();
+        shrunk.agents = AgentsData {
+            list: vec![AgentRow {
+                name: "bot".to_owned(),
+                enabled: true,
+            }],
+            details: [("bot".to_owned(), detail(vec![session("s1")]))]
+                .into_iter()
+                .collect(),
+        };
+        app.swap_loaded(shrunk);
+        assert_eq!(app.session_selected, 0);
+
+        // An agent whose sessions became unavailable resets it to 0 too.
+        let mut broken = sample_loaded();
+        broken.agents = AgentsData {
+            list: vec![AgentRow {
+                name: "bot".to_owned(),
+                enabled: true,
+            }],
+            details: [(
+                "bot".to_owned(),
+                AgentDetail {
+                    sessions: Err("store missing".to_owned()),
+                    ..AgentDetail::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        send(&mut app, press(KeyCode::Down));
+        app.swap_loaded(broken);
+        assert_eq!(app.session_selected, 0);
     }
 
     #[test]

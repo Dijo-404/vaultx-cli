@@ -52,6 +52,8 @@ pub fn run(config: &TuiConfig) -> Result<(), TuiError> {
     let _guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
+    // Handle of the at-most-one background sync operation.
+    let mut pending_sync: Option<PendingSync> = None;
 
     loop {
         terminal.draw(|frame| view::render(frame, &app))?;
@@ -60,7 +62,7 @@ pub fn run(config: &TuiConfig) -> Result<(), TuiError> {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(input) = map_key(key) {
                         let effect = app.handle_key(input);
-                        apply_effect(&mut app, effect, &source, services)?;
+                        apply_effect(&mut app, effect, &source, services, &mut pending_sync)?;
                     }
                 }
                 Event::Resize(width, height) => app.handle_resize(width, height),
@@ -69,6 +71,9 @@ pub fn run(config: &TuiConfig) -> Result<(), TuiError> {
                 _ => {}
             }
         }
+        // Settle a finished background sync without ever blocking the
+        // loop; while it runs, drawing and resize/route keys stay live.
+        poll_pending_sync(&mut app, &source, &mut pending_sync);
         if app.quit_requested {
             break;
         }
@@ -111,12 +116,16 @@ fn map_key(key: KeyEvent) -> Option<KeyInput> {
     })
 }
 
-/// Executes one state-machine effect against the real services.
+/// Executes one state-machine effect against the real services. Sync
+/// effects do NOT run inline: they spawn onto the shared runtime and
+/// hand their handle back through `pending`, which [`run`] polls each
+/// tick so the render path never blocks on the network.
 fn apply_effect(
     app: &mut App,
     effect: Effect,
     source: &SnapshotSource<'_>,
     services: &VaultxServices,
+    pending: &mut Option<PendingSync>,
 ) -> Result<(), TuiError> {
     match effect {
         Effect::None | Effect::Quit => {}
@@ -165,62 +174,124 @@ fn apply_effect(
                 app.status = format!("promote failed: {err}");
             }
         },
-        Effect::Push => run_sync_action(app, source, services, "push", SyncAction::Push),
-        Effect::Pull => run_sync_action(app, source, services, "pull", SyncAction::Pull),
-        Effect::SyncAll => run_sync_action(app, source, services, "sync", SyncAction::SyncAll),
+        Effect::Push => start_sync_action(app, services, SyncAction::Push, pending),
+        Effect::Pull => start_sync_action(app, services, SyncAction::Pull, pending),
+        Effect::SyncAll => start_sync_action(app, services, SyncAction::SyncAll, pending),
     }
     Ok(())
 }
 
 /// Which shared sync operation one action runs.
-enum SyncAction {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncAction {
     Push,
     Pull,
     SyncAll,
 }
 
-/// Opens the shared sync context and runs one push/pull/sync through
-/// [`vaultx_sync_client`] — the exact same hardened client the CLI uses.
-/// Results land as lines in `app.sync_lines`; failures surface on the
-/// status line (error text is secret-free by construction).
-fn run_sync_action(
-    app: &mut App,
-    source: &SnapshotSource<'_>,
-    services: &VaultxServices,
-    label: &str,
-    action: SyncAction,
-) {
-    let ctx = services.context();
-    let opened = vaultx_sync_client::open_sync_context(ctx.root(), ctx.vault_dir(), None, false);
-    let opened = match opened {
-        Ok(opened) => opened,
-        Err(err) => {
-            app.sync_lines.clear();
-            app.status = format!("{label} failed: {err}");
-            return;
+impl SyncAction {
+    /// Status-line label while the operation is in flight.
+    fn busy_label(self) -> &'static str {
+        match self {
+            Self::Push => "pushing…",
+            Self::Pull => "pulling…",
+            Self::SyncAll => "syncing…",
         }
-    };
+    }
+
+    /// Result label used in the summary lines.
+    fn result_label(self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::Pull => "pull",
+            Self::SyncAll => "sync",
+        }
+    }
+}
+
+/// One sync operation running in the background on the shared runtime.
+/// The terminal loop polls `job` each tick; nothing ever blocks the
+/// render path.
+pub(crate) struct PendingSync {
+    action: SyncAction,
+    job: tokio::task::JoinHandle<
+        Result<vaultx_sync_client::SyncResult, vaultx_sync_client::SyncError>,
+    >,
+}
+
+/// Opens the shared sync context (fast, synchronous) and spawns the
+/// push/pull/sync future onto the shared runtime WITHOUT blocking. Sets
+/// the explicit busy flag plus a status-line marker; the renderer shows
+/// the indicator until [`poll_pending_sync`] settles the job.
+fn start_sync_action(
+    app: &mut App,
+    services: &VaultxServices,
+    action: SyncAction,
+    pending: &mut Option<PendingSync>,
+) {
+    // One in-flight operation at a time; the state machine already
+    // refuses u/d/s while busy, so this is defense in depth.
+    if pending.is_some() || app.sync_busy {
+        return;
+    }
+    let ctx = services.context();
+    let opened =
+        match vaultx_sync_client::open_sync_context(ctx.root(), ctx.vault_dir(), None, false) {
+            Ok(opened) => opened,
+            Err(err) => {
+                app.sync_lines.clear();
+                app.status = format!("{} failed: {err}", action.result_label());
+                return;
+            }
+        };
+    app.sync_busy = true;
+    app.status = action.busy_label().to_owned();
     let project = opened.project_id.clone();
-    let outcome = data::run_blocking(async {
+    let job = data::spawn_shared(async move {
         match action {
             SyncAction::Push => opened.client.push(project).await,
             SyncAction::Pull => opened.client.pull(project).await,
             SyncAction::SyncAll => {
-                let pushed = opened.client.push(project.clone()).await?;
-                let pulled = opened.client.pull(project).await?;
-                Ok(vaultx_sync_client::SyncResult {
-                    uploaded: pushed.uploaded,
-                    downloaded: pulled.downloaded,
-                    conflicts: {
-                        let mut all = pushed.conflicts;
-                        all.extend(pulled.conflicts);
-                        all
-                    },
-                    policies_applied: pulled.policies_applied,
-                })
+                vaultx_sync_client::push_then_pull(&opened.client, project).await
             }
         }
     });
+    *pending = Some(PendingSync { action, job });
+}
+
+/// Polls an in-flight sync job without blocking. When the future has
+/// finished, the outcome lands exactly where the blocking version put
+/// it: summary lines in `app.sync_lines`, errors on the status line,
+/// snapshots refreshed after a converged pull/sync, and the busy flag
+/// cleared.
+fn poll_pending_sync(
+    app: &mut App,
+    source: &SnapshotSource<'_>,
+    pending: &mut Option<PendingSync>,
+) {
+    if !pending.as_ref().is_some_and(|p| p.job.is_finished()) {
+        return;
+    }
+    let PendingSync { action, job } = pending.take().expect("finished job checked");
+    // The task is finished, so this resolves immediately; a panicking
+    // task (never expected) degrades to a status-line transport error.
+    let outcome = data::run_blocking(job).unwrap_or_else(|join| {
+        Err(vaultx_sync_client::SyncError::Transport(format!(
+            "background sync task failed: {join}"
+        )))
+    });
+    finish_sync_action(app, source, action, outcome);
+}
+
+/// Applies a settled sync outcome to the app state.
+fn finish_sync_action(
+    app: &mut App,
+    source: &SnapshotSource<'_>,
+    action: SyncAction,
+    outcome: Result<vaultx_sync_client::SyncResult, vaultx_sync_client::SyncError>,
+) {
+    app.sync_busy = false;
+    let label = action.result_label();
     match outcome {
         Ok(result) => {
             app.sync_lines = sync_result_lines(label, &result);
@@ -286,5 +357,91 @@ impl Drop for TerminalGuard {
         // shell regains a normal terminal in the correct order.
         let _ = crossterm::execute!(self.stdout, LeaveAlternateScreen);
         let _ = disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+    use vaultx_core::VaultxServices;
+
+    use crate::state::{App, BrokerStatus, DEFAULT_TERMINAL_SIZE};
+
+    use super::*;
+
+    /// Settled pull outcome used by the fake-free completion tests.
+    fn settled_pull(
+        uploaded: usize,
+    ) -> Result<vaultx_sync_client::SyncResult, vaultx_sync_client::SyncError> {
+        Ok(vaultx_sync_client::SyncResult {
+            uploaded,
+            downloaded: 0,
+            conflicts: Vec::new(),
+            policies_applied: 0,
+        })
+    }
+
+    #[test]
+    fn settled_pull_refreshes_snapshots_and_clears_busy() {
+        let dir = TempDir::new().expect("temp dir");
+        let services = VaultxServices::init(dir.path()).expect("init project");
+        services.config().set_config("A", "1").expect("config");
+        services
+            .history()
+            .commit("baseline", "user:e")
+            .expect("commit");
+        services
+            .environments()
+            .create_environment("development")
+            .expect("env");
+
+        let source = SnapshotSource::new(&services, None);
+        let mut app = App::with_size(source.load(BrokerStatus::default()), DEFAULT_TERMINAL_SIZE);
+        assert_eq!(app.loaded.snapshot.envs.len(), 1);
+
+        // Simulate a stale in-memory snapshot while a pull settles.
+        app.sync_busy = true;
+        app.loaded.snapshot.envs = Vec::new();
+
+        finish_sync_action(&mut app, &source, SyncAction::Pull, settled_pull(2));
+
+        assert!(!app.sync_busy, "busy must clear on completion");
+        assert_eq!(
+            app.sync_lines[0],
+            "pull: uploaded 2 object(s), downloaded 0 object(s)"
+        );
+        // The snapshot was refreshed from services, restoring real rows.
+        assert_eq!(app.loaded.snapshot.envs.len(), 1);
+        assert_eq!(
+            app.status,
+            "pull: uploaded 2 object(s), downloaded 0 object(s)"
+        );
+    }
+
+    #[test]
+    fn failed_sync_surfaces_error_without_touching_snapshots() {
+        let dir = TempDir::new().expect("temp dir");
+        let services = VaultxServices::init(dir.path()).expect("init project");
+        services.config().set_config("A", "1").expect("config");
+        services
+            .history()
+            .commit("baseline", "user:e")
+            .expect("commit");
+
+        let source = SnapshotSource::new(&services, None);
+        let mut app = App::with_size(source.load(BrokerStatus::default()), DEFAULT_TERMINAL_SIZE);
+        app.sync_busy = true;
+
+        finish_sync_action(
+            &mut app,
+            &source,
+            SyncAction::Push,
+            Err(vaultx_sync_client::SyncError::Transport("boom".to_owned())),
+        );
+
+        assert!(!app.sync_busy);
+        assert!(app.sync_lines.is_empty());
+        assert!(app.status.contains("push failed"));
+        assert!(app.status.contains("boom"));
     }
 }

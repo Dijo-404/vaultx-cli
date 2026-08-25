@@ -588,12 +588,15 @@ pub fn broker_status(socket: Option<&Path>) -> BrokerStatus {
     }
 }
 
-/// One shared runtime for the single startup probe; building a fresh
-/// multi-thread runtime per call was the dominant refresh cost.
-static PROBE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+/// One shared multi-thread runtime for every async operation the TUI
+/// runs: the startup broker probe and background sync actions. Building
+/// a fresh runtime per call was the dominant refresh cost, and a shared
+/// handle lets sync futures be spawned (never block_on'd) so the render
+/// loop keeps ticking while they run.
+static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn probe_runtime() -> &'static tokio::runtime::Runtime {
-    PROBE_RUNTIME.get_or_init(|| {
+    SHARED_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -601,10 +604,21 @@ fn probe_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// Blocks on one async operation (sync push/pull/sync) using the shared
-/// runtime so refresh paths and actions never spawn extra runtimes.
+/// Blocks on one already-completed-or-short async operation using the
+/// shared runtime. Startup-only: the broker probe. Sync actions are
+/// spawned via [`spawn_shared`] instead so they never stall the loop.
 pub(crate) fn run_blocking<F: std::future::Future>(future: F) -> F::Output {
     probe_runtime().block_on(future)
+}
+
+/// Spawns `future` onto the shared runtime without blocking; the caller
+/// polls the returned handle for completion each tick.
+pub(crate) fn spawn_shared<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    probe_runtime().spawn(future)
 }
 
 fn probe_endpoint(endpoint: PathBuf) -> Result<String, String> {

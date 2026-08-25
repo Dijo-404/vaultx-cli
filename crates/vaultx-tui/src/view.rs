@@ -97,7 +97,7 @@ pub fn status_text(app: &App) -> String {
 pub fn binding_pairs(app: &App) -> Vec<(String, String)> {
     if app.modal.is_some() {
         return vec![
-            ("y/enter".to_owned(), "confirm".to_owned()),
+            ("y".to_owned(), "confirm".to_owned()),
             ("n/esc".to_owned(), "cancel".to_owned()),
         ];
     }
@@ -146,11 +146,17 @@ pub fn binding_pairs(app: &App) -> Vec<(String, String)> {
             base.insert(0, ("tab".to_owned(), "ref/env".to_owned()));
             base.insert(1, ("↑↓".to_owned(), "select".to_owned()));
             base.insert(2, ("enter".to_owned(), "promote".to_owned()));
+            base.insert(3, ("esc".to_owned(), "back".to_owned()));
         }
         Route::Sync => {
+            if app.sync_busy {
+                base.insert(0, ("…".to_owned(), "sync running".to_owned()));
+                return base;
+            }
             base.insert(0, ("u".to_owned(), "push".to_owned()));
             base.insert(1, ("d".to_owned(), "pull".to_owned()));
             base.insert(2, ("s".to_owned(), "sync".to_owned()));
+            base.insert(3, ("esc".to_owned(), "back".to_owned()));
         }
     }
     base
@@ -965,6 +971,13 @@ fn render_sync(f: &mut Frame, app: &App, area: Rect) {
             DENY_STYLE.add_modifier(Modifier::BOLD)
         },
     ))];
+    // Busy indicator: an operation is running in the background.
+    if app.sync_busy {
+        lines.push(Line::from(Span::styled(
+            "⟳ working…",
+            HIGHLIGHT.add_modifier(Modifier::BOLD),
+        )));
+    }
     if app.loaded.sync.remotes.is_empty() {
         lines.push(Line::from("(no remotes configured)"));
     }
@@ -1388,7 +1401,7 @@ mod tests {
         app.request_revoke_session("sess_abc");
         let screen = render_app(&app, 100, 30);
         assert!(screen.contains("revoke session"));
-        assert!(screen.contains("y confirm · n cancel"));
+        assert!(screen.contains("y confirm · n/esc cancel"));
     }
 
     #[test]
@@ -1525,6 +1538,16 @@ mod tests {
         offline.route = Route::Sync;
         offline.loaded.sync.logged_in = false;
         assert!(render_app(&offline, 110, 30).contains("login: missing"));
+
+        // In-flight operations show the busy indicator and swap the
+        // binding bar to a non-actionable hint.
+        let mut busy = sample_app();
+        busy.route = Route::Sync;
+        busy.sync_busy = true;
+        let screen = render_app(&busy, 110, 30);
+        assert!(screen.contains("⟳ working…"));
+        assert!(binding_pairs(&busy).contains(&("…".to_owned(), "sync running".to_owned())));
+        assert!(!binding_pairs(&busy).contains(&("u".to_owned(), "push".to_owned())));
     }
 
     #[test]

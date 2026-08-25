@@ -180,3 +180,147 @@ pub trait SyncService {
         project: ProjectId,
     ) -> impl std::future::Future<Output = Result<SyncResult, SyncError>> + Send;
 }
+
+/// Runs push then pull against `client` and folds both outcomes into one
+/// summary: transfer counts add up, pull's applied-policy count wins,
+/// and conflicts keep their submission order (push conflicts first).
+/// This is THE aggregation rule; every surface (CLI `sync`, TUI sync
+/// view) calls it so none can drift.
+///
+/// # Errors
+/// Propagates the first [`SyncError`]; a failed push aborts before any
+/// pull starts.
+pub async fn push_then_pull<S: SyncService>(
+    client: &S,
+    project: ProjectId,
+) -> Result<SyncResult, SyncError> {
+    let pushed = client.push(project.clone()).await?;
+    let pulled = client.pull(project).await?;
+    let mut conflicts = pushed.conflicts;
+    conflicts.extend(pulled.conflicts);
+    Ok(SyncResult {
+        uploaded: pushed.uploaded,
+        downloaded: pulled.downloaded,
+        conflicts,
+        policies_applied: pulled.policies_applied,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pre-canned operation outcome; rebuilt into fresh values per call
+    /// because [`SyncError`] deliberately is not `Clone`.
+    #[derive(Clone)]
+    enum Outcome {
+        Ok {
+            uploaded: usize,
+            downloaded: usize,
+            conflicts: Vec<(&'static str, &'static str)>,
+            policies_applied: usize,
+        },
+        ErrTransport,
+    }
+
+    /// Deterministic fake service so the aggregation rule is asserted
+    /// without any transport.
+    struct FakeSyncService {
+        push_outcome: Outcome,
+        pull_outcome: Outcome,
+    }
+
+    impl FakeSyncService {
+        fn materialize(&self, outcome: &Outcome) -> Result<SyncResult, SyncError> {
+            match outcome {
+                Outcome::Ok {
+                    uploaded,
+                    downloaded,
+                    conflicts,
+                    policies_applied,
+                } => Ok(SyncResult {
+                    uploaded: *uploaded,
+                    downloaded: *downloaded,
+                    conflicts: conflicts
+                        .iter()
+                        .map(|(namespace_name, name)| RefConflict {
+                            namespace: if *namespace_name == "environments" {
+                                RefNamespace::Environments
+                            } else {
+                                RefNamespace::Heads
+                            },
+                            name: (*name).to_owned(),
+                            local_commit: None,
+                            remote_commit: None,
+                            reason: ConflictReason::Diverged,
+                        })
+                        .collect(),
+                    policies_applied: *policies_applied,
+                }),
+                Outcome::ErrTransport => Err(SyncError::Transport("boom".to_owned())),
+            }
+        }
+    }
+
+    impl SyncService for FakeSyncService {
+        async fn push(&self, _project: ProjectId) -> Result<SyncResult, SyncError> {
+            self.materialize(&self.push_outcome)
+        }
+
+        async fn pull(&self, _project: ProjectId) -> Result<SyncResult, SyncError> {
+            self.materialize(&self.pull_outcome)
+        }
+    }
+
+    #[tokio::test]
+    async fn push_then_pull_adds_counts_and_keeps_conflict_order() {
+        let service = FakeSyncService {
+            push_outcome: Outcome::Ok {
+                uploaded: 3,
+                downloaded: 0,
+                conflicts: vec![("heads", "main")],
+                policies_applied: 0,
+            },
+            pull_outcome: Outcome::Ok {
+                uploaded: 0,
+                downloaded: 2,
+                conflicts: vec![("heads", "feature"), ("environments", "production")],
+                policies_applied: 4,
+            },
+        };
+        let project = ProjectId::parse("proj_combine").expect("valid");
+
+        let combined = push_then_pull(&service, project).await.expect("combined");
+
+        assert_eq!(combined.uploaded, 3);
+        assert_eq!(combined.downloaded, 2);
+        assert_eq!(combined.policies_applied, 4);
+        // Submission order preserved: push conflicts first, then pull's.
+        let names: Vec<String> = combined
+            .conflicts
+            .iter()
+            .map(|c| format!("{}/{}", c.namespace_name(), c.name))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["heads/main", "heads/feature", "environments/production"]
+        );
+    }
+
+    #[tokio::test]
+    async fn push_then_pull_aborts_before_pulling_when_push_fails() {
+        let service = FakeSyncService {
+            push_outcome: Outcome::ErrTransport,
+            pull_outcome: Outcome::Ok {
+                uploaded: 0,
+                downloaded: 9,
+                conflicts: Vec::new(),
+                policies_applied: 9,
+            },
+        };
+        let project = ProjectId::parse("proj_combine").expect("valid");
+
+        let outcome = push_then_pull(&service, project).await;
+        assert!(matches!(outcome, Err(SyncError::Transport(_))));
+    }
+}
