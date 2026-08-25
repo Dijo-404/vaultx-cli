@@ -303,14 +303,16 @@ vaultx agent revoke coding-agent
 The agent child process receives:
 
 ```text
-VAULTX_AGENT_ID
-VAULTX_SESSION_TOKEN
+VAULTX_AGENT
+VAULTX_BROKER_SESSION
 VAULTX_BROKER_ENDPOINT
+VAULTX_PROJECT
+VAULTX_ENVIRONMENT
 ```
 
 and explicitly allowed non-sensitive configuration.
 
-It does not receive brokered secret values.
+It does not receive brokered secret values. Managed variable names (secrets and brokered credentials) are stripped from the inherited environment, and the broker session is minted for the duration of the child process only: it is revoked as soon as the child exits, so `vaultx agent run` leaves no live capability behind.
 
 ## Broker requests
 

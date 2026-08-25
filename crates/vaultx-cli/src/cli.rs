@@ -20,8 +20,8 @@ use thiserror::Error;
 
 use vaultx_broker::SessionStore as _;
 use vaultx_core::{
-    BrokeredBinding, CommitSummary, CoreError, MergeOutcome, MergeStrategy, SecretString,
-    VaultxServices,
+    AgentSummary, BrokeredBinding, CommitSummary, CoreError, MergeOutcome, MergeStrategy,
+    SecretString, VaultxServices,
 };
 use vaultx_types::model::{InjectionTemplateId, VariableKind};
 use vaultx_types::{CommitId, CredentialRef, ProviderName, VariableName};
@@ -459,12 +459,14 @@ pub enum AgentCommand {
     /// Run a command in a sanitized brokered environment for one agent
     /// (plan §17).
     ///
-    /// A scoped broker session is minted for the agent+environment and
-    /// handed to the child only through its environment: committed
-    /// config values plus `VAULTX_*` broker/identity metadata are
-    /// injected, while every managed variable name (secret, brokered,
-    /// dynamic) is stripped from the inherited parent environment. The
-    /// child's exit code becomes vaultx's own.
+    /// A scoped broker session is minted for the duration of the child
+    /// process and handed to it only through its environment; the
+    /// session is revoked as soon as the child exits, so no live
+    /// capability is left behind. Committed config values plus
+    /// `VAULTX_*` broker/identity metadata are injected, while every
+    /// managed variable name (secret, brokered, dynamic) is stripped
+    /// from the inherited parent environment. The child's exit code
+    /// becomes vaultx's own.
     Run {
         /// Agent bare name owning the broker session.
         name: String,
@@ -473,7 +475,8 @@ pub enum AgentCommand {
         #[arg(long, value_name = "ENV")]
         env: Option<String>,
         /// Optional time-to-live in seconds for the minted broker
-        /// session; expired sessions validate like revoked ones.
+        /// session (belt-and-braces for a child that must be killed from
+        /// outside); the session is revoked when the child exits.
         #[arg(long, value_name = "SECS")]
         ttl_secs: Option<u64>,
         /// Command to execute and its arguments, after `--`.
@@ -1338,14 +1341,35 @@ fn cmd_promote(
     Ok(format!("promoted {from} -> {to_env}"))
 }
 
+/// Maps a finished child's status onto the dispatch outcome, shared by
+/// every workload-execution command (`run`, `agent run`): zero prints
+/// nothing extra, nonzero becomes [`CliError::ChildExit`] carrying the
+/// child's own code, and signal death maps to the conventional 128+N on
+/// unix.
+fn child_exit_outcome(status: std::process::ExitStatus) -> Result<String, CliError> {
+    match status.code() {
+        Some(0) => Ok(String::new()),
+        Some(code) => Err(CliError::ChildExit(code)),
+        // Killed by a signal (unix): report the conventional 128+N code.
+        #[cfg(unix)]
+        None => {
+            use std::os::unix::process::ExitStatusExt as _;
+            let signal = status.signal().unwrap_or(0);
+            Err(CliError::ChildExit(128 + signal))
+        }
+        // No exit-code concept on this platform; fall back to failure.
+        #[cfg(not(unix))]
+        None => Err(CliError::ChildExit(1)),
+    }
+}
+
 /// Executes `COMMAND` (plan §16) with committed config values from the
 /// environment's pinned commit injected as extra environment variables.
 ///
 /// Secrets, brokered credentials, and dynamic providers are skipped
 /// entirely — they are never decrypted into a child environment. The
 /// child inherits the parent environment; its exit status becomes the
-/// dispatch outcome: zero prints nothing extra, nonzero maps onto
-/// [`CliError::ChildExit`].
+/// dispatch outcome via [`child_exit_outcome`].
 fn cmd_run(
     services: &VaultxServices,
     env: Option<&str>,
@@ -1384,20 +1408,7 @@ fn cmd_run(
             "cannot execute {program}: {err}"
         ))))
     })?;
-    match status.code() {
-        Some(0) => Ok(String::new()),
-        Some(code) => Err(CliError::ChildExit(code)),
-        // Killed by a signal (unix): report the conventional 128+N code.
-        #[cfg(unix)]
-        None => {
-            use std::os::unix::process::ExitStatusExt as _;
-            let signal = status.signal().unwrap_or(0);
-            Err(CliError::ChildExit(128 + signal))
-        }
-        // No exit-code concept on this platform; fall back to failure.
-        #[cfg(not(unix))]
-        None => Err(CliError::ChildExit(1)),
-    }
+    child_exit_outcome(status)
 }
 
 /// Broker probe timeout; a wedged broker must not stall diagnostics.
@@ -1617,15 +1628,10 @@ fn environment_id_for(
     Ok((bare.to_owned(), id))
 }
 
-#[allow(clippy::type_complexity)]
-fn cmd_agent_session_create(
-    services: &VaultxServices,
-    name: &str,
-    env: Option<&str>,
-    ttl_secs: Option<u64>,
-) -> Result<String, CliError> {
-    // Refuse sessions for unknown or disabled agents before minting a
-    // token the broker would immediately reject.
+/// Shared session-minting gate: refuses unknown or disabled agents
+/// before any token material exists. Used by `agent session create` and
+/// the integrated runner.
+fn ensure_active_agent(services: &VaultxServices, name: &str) -> Result<AgentSummary, CliError> {
     let summary = services
         .agents()
         .list_agents()?
@@ -1637,6 +1643,17 @@ fn cmd_agent_session_create(
             "agent `{name}` is disabled; enable it before creating sessions"
         )));
     }
+    Ok(summary)
+}
+
+#[allow(clippy::type_complexity)]
+fn cmd_agent_session_create(
+    services: &VaultxServices,
+    name: &str,
+    env: Option<&str>,
+    ttl_secs: Option<u64>,
+) -> Result<String, CliError> {
+    ensure_active_agent(services, name)?;
     let agent_id = services.agents().inspect(name)?;
 
     let store = open_session_store(services)?;
@@ -1695,6 +1712,20 @@ fn cmd_agent_session_revoke(
 /// `broker_source::build_production_engine`.
 const LOCAL_PROJECT_ID: &str = "proj_local";
 
+/// Normalizes an env-var name for the managed-name containment check:
+/// exact form on unix, ASCII lowercase on windows where the env
+/// namespace is case-insensitive. Names are inserted case-preserved;
+/// only the membership test is normalized.
+#[cfg(not(windows))]
+fn normalized_env_name(name: &str) -> String {
+    name.to_owned()
+}
+
+#[cfg(windows)]
+fn normalized_env_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 /// Executes `COMMAND` for one agent inside a sanitized brokered
 /// environment (plan §17).
 ///
@@ -1709,8 +1740,18 @@ const LOCAL_PROJECT_ID: &str = "proj_local";
 /// Every managed variable name in the pinned manifest is scrubbed from
 /// the inherited parent environment regardless of kind — by-construction
 /// via `env_clear`, so a polluted parent value can never survive. No
-/// plaintext `.env` file is written. The child's exit status maps onto
-/// dispatch exactly like [`cmd_run`] does.
+/// plaintext `.env` file is written.
+///
+/// # Session lifecycle
+///
+/// The broker session is minted for the duration of the child process
+/// and revoked afterwards: after a successful exit, a nonzero exit,
+/// signal death, and a spawn failure alike, the capability is revoked
+/// best-effort so `agent run` never leaves a live session behind
+/// (revocation failures never mask the run's own outcome). The optional
+/// `--ttl-secs` stays as belt-and-braces for a wedged child that must be
+/// killed from outside. The child's exit status maps onto dispatch
+/// exactly like [`cmd_run`] does via [`child_exit_outcome`].
 fn cmd_agent_run(
     services: &VaultxServices,
     name: &str,
@@ -1722,19 +1763,7 @@ fn cmd_agent_run(
         .split_first()
         .ok_or_else(|| CliError::Usage("agent run requires a command after `--`".into()))?;
 
-    // Refuse unknown or disabled agents before minting any session
-    // material (same gate as `agent session create`).
-    let summary = services
-        .agents()
-        .list_agents()?
-        .into_iter()
-        .find(|agent| agent.name == name)
-        .ok_or_else(|| CliError::Usage(format!("unknown agent `{name}`")))?;
-    if !summary.enabled {
-        return Err(CliError::Usage(format!(
-            "agent `{name}` is disabled; enable it before creating sessions"
-        )));
-    }
+    ensure_active_agent(services, name)?;
     let agent_id = services.agents().inspect(name)?;
 
     let bare_env = env.unwrap_or(DEFAULT_SECRET_ENV);
@@ -1757,19 +1786,23 @@ fn cmd_agent_run(
         .show(&commit)?
         .entries
         .into_iter()
-        .map(|entry| entry.name)
+        .map(|entry| normalized_env_name(&entry.name))
         .collect();
 
-    // Scoped session through the same store as `agent session create`.
+    // Scoped one-shot session through the same store as
+    // `agent session create`.
     let (_, environment_id) = environment_id_for(env)?;
-    let (_session_id, raw_token) = open_session_store(services)?
+    let store = open_session_store(services)?;
+    let (session_id, raw_token) = store
         .create_expiring(&agent_id.name, &environment_id, ttl_secs)
         .map_err(map_session_error)?;
 
     // Child environment assembled fully in memory; nothing touches disk.
     let mut child_env: std::collections::HashMap<std::ffi::OsString, std::ffi::OsString> =
         std::env::vars_os()
-            .filter(|(key, _)| !managed_names.contains(key.to_string_lossy().as_ref()))
+            .filter(|(key, _)| {
+                !managed_names.contains(&normalized_env_name(&key.to_string_lossy()))
+            })
             .collect();
     for (name, value) in config_values {
         child_env.insert(name.into(), value.into());
@@ -1790,25 +1823,17 @@ fn cmd_agent_run(
     for (key, value) in &child_env {
         child.env(key, value);
     }
-    let status = child.status().map_err(|err| {
-        CliError::Runtime(CoreError::Io(std::io::Error::other(format!(
-            "cannot execute {program}: {err}"
-        ))))
-    })?;
-    match status.code() {
-        Some(0) => Ok(String::new()),
-        Some(code) => Err(CliError::ChildExit(code)),
-        // Killed by a signal (unix): report the conventional 128+N code.
-        #[cfg(unix)]
-        None => {
-            use std::os::unix::process::ExitStatusExt as _;
-            let signal = status.signal().unwrap_or(0);
-            Err(CliError::ChildExit(128 + signal))
-        }
-        // No exit-code concept on this platform; fall back to failure.
-        #[cfg(not(unix))]
-        None => Err(CliError::ChildExit(1)),
-    }
+    let outcome = match child.status() {
+        Ok(status) => child_exit_outcome(status),
+        Err(err) => Err(CliError::Runtime(CoreError::Io(std::io::Error::other(
+            format!("cannot execute {program}: {err}"),
+        )))),
+    };
+    // One-shot semantics: whatever happened above, no live capability is
+    // left behind; revoke errors are swallowed so they can never mask
+    // the run's own result.
+    let _ = store.revoke(&session_id);
+    outcome
 }
 
 /// Runs `future` to completion on a private multi-thread runtime. The
@@ -2491,5 +2516,25 @@ mod helper_tests {
             resolve_commit_prefix("", &log),
             Err(CliError::Usage(text)) if text.contains("must not be empty")
         ));
+    }
+
+    #[test]
+    fn managed_env_name_normalization_matches_platform_semantics() {
+        // Unix env names are case-sensitive: the exact form is kept.
+        #[cfg(not(windows))]
+        {
+            assert_eq!(normalized_env_name("GITHUB_TOKEN"), "GITHUB_TOKEN");
+            assert_eq!(normalized_env_name("github_token"), "github_token");
+            assert_eq!(normalized_env_name("GitHub_Token"), "GitHub_Token");
+        }
+        // Windows env names are case-insensitive: membership keys fold
+        // to ASCII lowercase (insertion stays case-preserved).
+        #[cfg(windows)]
+        {
+            assert_eq!(normalized_env_name("GITHUB_TOKEN"), "github_token");
+            assert_eq!(normalized_env_name("GitHub_Token"), "github_token");
+            // Non-ASCII bytes are left untouched; only ASCII case folds.
+            assert_eq!(normalized_env_name("ÄHNE"), "Ähne");
+        }
     }
 }

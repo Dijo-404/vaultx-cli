@@ -2806,6 +2806,7 @@ fn snapshot_tree(root: &Path) -> Vec<PathBuf> {
 #[test]
 fn run_injects_config_and_broker_metadata_but_not_secret_values() {
     let _runtime = isolated_xdg_runtime_dir();
+    let _serial = lock_env();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     seed_agent_run_fixture(root);
@@ -2928,6 +2929,7 @@ fn run_strips_parent_managed_names_even_when_set_in_parent_env() {
 #[cfg(unix)]
 #[test]
 fn run_propagates_child_exit_code() {
+    let _serial = lock_env();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     seed_agent_run_fixture(root);
@@ -2939,6 +2941,70 @@ fn run_propagates_child_exit_code() {
     .unwrap_err();
     assert!(matches!(err, CliError::ChildExit(7)), "{err:?}");
     assert_eq!(err.exit_code(), 7);
+}
+
+/// Dispatches sessions-list for the fixture agent and fails if any
+/// stored session still renders as `active`.
+fn assert_no_active_sessions(root: &Path) {
+    let listed = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::SessionsList {
+                name: "runner-bot".into(),
+            },
+        },
+    ))
+    .unwrap_or_else(|err| panic!("sessions-list failed: {err}"));
+    assert!(
+        !listed.contains("active"),
+        "live capability left behind:\n{listed}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_leaves_no_active_session_after_spawn_failure_exit_or_success() {
+    let _runtime = isolated_xdg_runtime_dir();
+    let _serial = lock_env();
+
+    // I-1: a nonexistent program fails at spawn time, AFTER the session
+    // was minted — the runner must revoke it instead of orphaning a live
+    // capability.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_agent_run_fixture(root);
+    let err = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Run {
+                name: "runner-bot".into(),
+                env: None,
+                ttl_secs: None,
+                command: vec!["definitely-not-a-program-xyz".into()],
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CliError::Runtime(_)), "{err:?}");
+    assert_no_active_sessions(root);
+
+    // I-2, success path: after a clean child exit no live session is
+    // left either (the stored record shows `revoked`).
+    dispatch(&cli(
+        root,
+        agent_run("runner-bot", None, "true".to_string()),
+    ))
+    .unwrap_or_else(|err| panic!("agent run failed: {err}"));
+    assert_no_active_sessions(root);
+
+    // I-2, failure path: nonzero exit revokes too.
+    let err = dispatch(&cli(
+        root,
+        agent_run("runner-bot", None, "exit 5".to_string()),
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CliError::ChildExit(5)), "{err:?}");
+    assert_no_active_sessions(root);
 }
 
 #[test]
