@@ -589,6 +589,12 @@ fn login_stores_credentials_and_rejects_bad_tokens() {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "session file must be 0600");
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "runtime session dir must be 0700");
     }
 
     // workspace list now works through the same credentials.
@@ -920,6 +926,7 @@ fn normalize_server_enforces_https_off_loopback() {
     assert!(normalize_server("http://localhost:8080").is_ok());
     assert!(normalize_server("http://127.0.0.1:9000/").is_ok());
     assert!(normalize_server("http://[::1]:9000").is_ok());
+    assert!(normalize_server("http://[::1]").is_ok());
     let err = normalize_server("http://sync.corp.example.com").unwrap_err();
     assert!(err.to_string().contains("https"), "got: {err}");
 }
