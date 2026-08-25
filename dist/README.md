@@ -32,5 +32,12 @@ postinstall step detects platform/architecture, downloads the matching
 release artifact, verifies its SHA-256 against the embedded checksum map
 *before* marking it executable, and errors clearly on unsupported
 platforms. The JavaScript installer contains no secret-management
-implementation; set `VAULTX_RELEASES_BASE` to override the download
-base URL for forks or air-gapped mirrors.
+implementation; set `VAULTX_CLI_REPOSITORY=owner/name` to point forks or
+air-gapped mirrors at a different release repository.
+
+Before `npm publish`, embed the release digests into the package (the
+installer refuses to install when its checksum map is incomplete):
+
+```sh
+sha256sum dist/* | node npm/scripts/embed-checksums.js
+```

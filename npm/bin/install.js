@@ -96,6 +96,10 @@ function getWithRedirects(url) {
   return new Promise((resolve, reject) => {
     let remaining = MAX_REDIRECTS;
     const requestOnce = (target) => {
+      if (new URL(target).protocol !== 'https:') {
+        reject(new Error(`Refusing non-HTTPS download URL: ${target}`));
+        return;
+      }
       const req = https.get(target, { timeout: REQUEST_TIMEOUT_MS }, (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
