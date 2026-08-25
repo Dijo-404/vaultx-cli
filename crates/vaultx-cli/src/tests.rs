@@ -5,6 +5,7 @@
 //! without stdio.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use vaultx_core::{CoreError, MergeStrategy};
 use vaultx_types::CommitId;
@@ -15,6 +16,24 @@ use crate::{
     dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, McpCommand, PackCommand,
     PolicyCommand, SecretCommand, StubArgs,
 };
+
+/// Isolates the process-wide XDG runtime directory so broker-endpoint
+/// probes never observe (or disturb) a developer's live broker socket.
+/// The value is process-global by nature; every CLI test wants the same
+/// empty isolation, so a lazily-created leaked temp dir is correct.
+fn isolated_xdg_runtime_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir()
+            .expect("tempdir for runtime isolation")
+            .keep();
+        // SAFETY-adjacent note: `set_var` mutates process-global state;
+        // edition 2021 exposes it as safe and every test in this binary
+        // intends the same value, so races are benign.
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        dir
+    })
+}
 
 /// Builds a `Cli` pointing at `project` with the given command.
 fn cli(project: &Path, command: Command) -> Cli {
@@ -1586,6 +1605,7 @@ fn promote_success_then_protected_refusal_exit_codes() {
 
 #[test]
 fn doctor_fresh_repo_passes_and_tampered_object_exits_nonzero() {
+    let _runtime = isolated_xdg_runtime_dir();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     init_in(root);

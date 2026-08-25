@@ -1695,7 +1695,24 @@ fn cmd_broker_serve(services: VaultxServices, socket: Option<&Path>) -> Result<S
         // which forbids dropping runtimes in place.
         let reactor = tokio::runtime::Handle::current();
         let serve = tokio::task::spawn_blocking(move || reactor.block_on(server.serve()));
-        let _ = tokio::signal::ctrl_c().await;
+        // Graceful exit on both interactive stop (SIGINT) and service
+        // manager stop (SIGTERM): the socket file is unlinked by
+        // `serve`, so a killed-but-not-shutdown broker must not leave a
+        // stale endpoint behind.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate())
+                .map_err(|err| CliError::Runtime(CoreError::Io(err)))?;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
         trigger();
         eprintln!("vaultx broker shutting down");
         match serve.await {
