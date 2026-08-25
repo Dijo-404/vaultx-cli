@@ -186,6 +186,23 @@ pub enum Command {
         file: PathBuf,
     },
 
+    /// Export committed variables as .env-style lines (plan §33): config
+    /// values literally, protected values as inert placeholders unless
+    /// the explicit reveal path is taken.
+    Export {
+        /// Output format (currently only `env`).
+        #[arg(long, value_name = "FORMAT", default_value = "env")]
+        format: String,
+        /// Include decrypted plaintext of plain secrets after typed
+        /// confirmation. Brokered credentials always stay placeholders.
+        #[arg(long)]
+        reveal_secrets: bool,
+        /// Non-interactive consent for `--reveal-secrets`; replaces the
+        /// typed confirmation when stdin is not a terminal.
+        #[arg(long)]
+        yes_i_want_plaintext_secrets: bool,
+    },
+
     /// Confirm staged variables are part of the next commit.
     Add {
         /// Variable name to confirm.
@@ -331,6 +348,18 @@ pub enum Command {
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
+    },
+    /// Audit repository integrity and optionally repair severed refs
+    /// (plan §Recovery). Never mutates objects.
+    Recover {
+        /// Delete refs whose target commits are unresolvable, after
+        /// listing them and requiring typed confirmation.
+        #[arg(long)]
+        fix: bool,
+        /// Non-interactive consent for `--fix` ref deletion; replaces the
+        /// typed confirmation when stdin is not a terminal.
+        #[arg(long)]
+        yes_delete_unresolvable_refs: bool,
     },
     /// Launch the interactive terminal UI dashboard.
     Tui {
@@ -651,6 +680,13 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
         Command::Unset { names } => with_open(&cli.project, |s| cmd_unset(s, names)),
         Command::List => with_open(&cli.project, cmd_list),
         Command::Import { file } => with_open(&cli.project, |s| cmd_import(s, file)),
+        Command::Export {
+            format,
+            reveal_secrets,
+            yes_i_want_plaintext_secrets,
+        } => with_open(&cli.project, |s| {
+            cmd_export(s, format, *reveal_secrets, *yes_i_want_plaintext_secrets)
+        }),
         Command::Add { name, all } => {
             with_open(&cli.project, |s| cmd_add(s, name.as_deref(), *all))
         }
@@ -742,7 +778,13 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
         },
 
         // Implemented history/environment commands.
-        Command::Doctor => with_open(&cli.project, cmd_doctor),
+        Command::Doctor => with_open(&cli.project, |s| cmd_doctor(&cli.project, s)),
+        Command::Recover {
+            fix,
+            yes_delete_unresolvable_refs,
+        } => with_open(&cli.project, |s| {
+            cmd_recover(s, *fix, *yes_delete_unresolvable_refs)
+        }),
         Command::Merge {
             branch,
             into,
@@ -1322,9 +1364,40 @@ fn cmd_run(
     }
 }
 
-fn cmd_doctor(services: &VaultxServices) -> Result<String, CliError> {
+/// Broker probe timeout; a wedged broker must not stall diagnostics.
+const BROKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Async core of the broker connectivity probe (kept separate so tests
+/// can drive it on their own runtime).
+async fn probe_broker_async(endpoint: PathBuf) -> vaultx_core::BrokerProbe {
+    let attempt = async {
+        let mut client = vaultx_broker_client::BrokerClient::connect(&endpoint)
+            .await
+            .map_err(|err| err.to_string())?;
+        client.ping().await.map_err(|err| err.to_string())
+    };
+    match tokio::time::timeout(BROKER_PROBE_TIMEOUT, attempt).await {
+        Ok(Ok(version)) => vaultx_core::BrokerProbe::Reachable { version },
+        Ok(Err(reason)) => vaultx_core::BrokerProbe::Unreachable { reason },
+        Err(_) => vaultx_core::BrokerProbe::Unreachable {
+            reason: "timed out".to_owned(),
+        },
+    }
+}
+
+/// One-shot lightweight IPC handshake against `endpoint`.
+fn broker_probe(endpoint: &Path) -> vaultx_core::BrokerProbe {
+    run_async(probe_broker_async(endpoint.to_path_buf()))
+}
+
+fn cmd_doctor(project: &Path, services: &VaultxServices) -> Result<String, CliError> {
     use vaultx_core::CheckStatus;
-    let outcomes = services.doctor().run();
+    let endpoint = resolve_endpoint(project, None);
+    let probe = broker_probe(&endpoint);
+    let outcomes = services
+        .doctor()
+        .with_broker_probe(endpoint.display().to_string(), probe)
+        .run();
     let rendered = vaultx_core::render_checks(&outcomes);
     if outcomes
         .iter()
@@ -1333,6 +1406,131 @@ fn cmd_doctor(services: &VaultxServices) -> Result<String, CliError> {
         Err(CliError::Diagnostics(rendered))
     } else {
         Ok(rendered)
+    }
+}
+
+/// Typed confirmation phrase required before plaintext secret export.
+pub(crate) const REVEAL_CONFIRMATION_PHRASE: &str = "REVEAL";
+/// Typed confirmation phrase required before deleting unresolvable refs.
+pub(crate) const DELETE_REFS_CONFIRMATION_PHRASE: &str = "DELETE";
+
+/// Case/whitespace-tolerant comparison of a typed confirmation line.
+#[must_use]
+pub(crate) fn typed_confirmation_matches(typed: &str, phrase: &str) -> bool {
+    typed.trim() == phrase
+}
+
+/// High-friction authorization gate shared by every disclosure or
+/// destructive path: interactive terminals must type an explicit phrase;
+/// non-interactive callers must pass the dedicated consent flag.
+///
+/// The prompt goes to stderr because stdout carries command output.
+fn authorize_high_friction_action(
+    description: &str,
+    phrase: &str,
+    non_interactive_consent: bool,
+    consent_flag: &str,
+) -> Result<(), CliError> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        return if non_interactive_consent {
+            Ok(())
+        } else {
+            Err(CliError::Usage(format!(
+                "{description} requires explicit authorization; on a non-interactive terminal \
+                 pass {consent_flag} to accept"
+            )))
+        };
+    }
+    eprintln!("WARNING: this action is high-friction by design.");
+    eprintln!("{description}");
+    eprintln!("Type {phrase} to confirm:");
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|err| CliError::Usage(format!("cannot read confirmation: {err}")))?;
+    if typed_confirmation_matches(&line, phrase) {
+        Ok(())
+    } else {
+        Err(CliError::Usage(
+            "confirmation phrase did not match; action refused".into(),
+        ))
+    }
+}
+
+/// Plan §33 export over the HEAD manifest. Safe mode renders config
+/// values literally and everything protected as placeholders; the reveal
+/// path additionally decrypts plain secrets but never brokered
+/// credentials.
+fn cmd_export(
+    services: &VaultxServices,
+    format: &str,
+    reveal_secrets: bool,
+    yes_i_want_plaintext_secrets: bool,
+) -> Result<String, CliError> {
+    if format != "env" {
+        return Err(CliError::Usage(format!(
+            "unsupported export format `{format}` (only `env`)"
+        )));
+    }
+    if reveal_secrets {
+        authorize_high_friction_action(
+            "Exporting plaintext secret values. Anyone with access to this output gains the \
+             real credentials.",
+            REVEAL_CONFIRMATION_PHRASE,
+            yes_i_want_plaintext_secrets,
+            "--yes-i-want-plaintext-secrets",
+        )?;
+    }
+    let entries = services.export().export(reveal_secrets)?;
+    if entries.is_empty() {
+        return Ok("nothing committed to export".to_owned());
+    }
+    Ok(entries
+        .iter()
+        .map(vaultx_core::render_export_entry)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Plan §Recovery audit; `--fix` deletes listed unresolvable refs only
+/// after confirmation and never touches objects.
+fn cmd_recover(
+    services: &VaultxServices,
+    fix: bool,
+    yes_delete_unresolvable_refs: bool,
+) -> Result<String, CliError> {
+    let mut report = services.recovery().audit()?;
+    let mut removed = 0usize;
+    if fix && !report.unresolvable_refs.is_empty() {
+        let listing = report
+            .unresolvable_refs
+            .iter()
+            .map(|r| format!("{}/{} -> {}", r.namespace, r.name, r.commit))
+            .collect::<Vec<_>>()
+            .join(", ");
+        authorize_high_friction_action(
+            &format!(
+                "Deleting {count} unresolvable ref(s): {listing}. History objects are never \
+                 modified.",
+                count = report.unresolvable_refs.len()
+            ),
+            DELETE_REFS_CONFIRMATION_PHRASE,
+            yes_delete_unresolvable_refs,
+            "--yes-delete-unresolvable-refs",
+        )?;
+        let targets = std::mem::take(&mut report.unresolvable_refs);
+        removed = services.recovery().fix_unresolvable_refs(&targets)?;
+    }
+    // Re-audit after repairs so the verdict reflects post-fix state.
+    if removed > 0 {
+        report = services.recovery().audit()?;
+    }
+    let rendered = crate::output::render_recovery_report(&report, removed);
+    if report.is_clean() {
+        Ok(rendered)
+    } else {
+        Err(CliError::Diagnostics(rendered))
     }
 }
 

@@ -54,17 +54,50 @@ pub struct CheckOutcome {
     pub detail: String,
 }
 
+/// Outcome of one lightweight broker IPC handshake probe. The probe
+/// itself is executed by the caller (CLI/TUI own the async runtime);
+/// the doctor only classifies the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrokerProbe {
+    /// The endpoint answered a protocol ping.
+    Reachable {
+        /// Broker-reported protocol version.
+        version: String,
+    },
+    /// The endpoint could not be reached or did not answer.
+    Unreachable {
+        /// Secret-free failure reason (OS error text, timeout, ...).
+        reason: String,
+    },
+}
+
 /// Health diagnostics over an opened project context.
-#[derive(Clone, Copy, Debug)]
+///
+/// Broker connectivity is classified from an injected
+/// [`BrokerProbe`]; without one (`DoctorService::new`) that check
+/// reports itself as not probed instead of inventing a verdict.
+#[derive(Clone, Debug)]
 pub struct DoctorService<'a> {
     ctx: &'a ProjectContext,
+    broker_probe: Option<(String, BrokerProbe)>,
 }
 
 impl<'a> DoctorService<'a> {
     /// Builds a service operating on `ctx`.
     #[must_use]
     pub const fn new(ctx: &'a ProjectContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            broker_probe: None,
+        }
+    }
+
+    /// Attaches a resolved endpoint plus its handshake outcome so
+    /// [`DoctorService::run`] can classify real broker connectivity.
+    #[must_use]
+    pub fn with_broker_probe(mut self, endpoint: String, probe: BrokerProbe) -> Self {
+        self.broker_probe = Some((endpoint, probe));
+        self
     }
 
     /// Runs every check in stable order.
@@ -78,6 +111,8 @@ impl<'a> DoctorService<'a> {
             self.check_policy_validity(),
             self.check_broker_socket(),
             self.check_remote_config(),
+            self.check_sync_consistency(),
+            self.check_broker_connectivity(),
         ]
     }
 
@@ -101,14 +136,14 @@ impl<'a> DoctorService<'a> {
         let text = match std::fs::read_to_string(&path) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return outcome(
-                    "signing key",
+                    "signing key availability",
                     CheckStatus::Pass,
                     "no device signing key yet; generated on first commit",
                 );
             }
             Err(err) => {
                 return outcome(
-                    "signing key",
+                    "signing key availability",
                     CheckStatus::Fail,
                     format!("cannot read .vaultx/{DEVICE_KEY_FILE}: {err}"),
                 );
@@ -126,9 +161,13 @@ impl<'a> DoctorService<'a> {
                     .map_err(|err| err.to_string())
             });
         match load {
-            Ok(()) => outcome("signing key", CheckStatus::Pass, "device identity loads"),
+            Ok(()) => outcome(
+                "signing key availability",
+                CheckStatus::Pass,
+                "device identity loads",
+            ),
             Err(reason) => outcome(
-                "signing key",
+                "signing key availability",
                 CheckStatus::Fail,
                 format!(".vaultx/{DEVICE_KEY_FILE} is unusable: {reason}"),
             ),
@@ -221,16 +260,106 @@ impl<'a> DoctorService<'a> {
         }
     }
 
+    /// Presence + permission sanity of the project-local broker socket.
+    /// On unix a world-writable socket would let any local user speak to
+    /// (or squat) the endpoint, so it downgrades the verdict to WARN.
     fn check_broker_socket(&self) -> CheckOutcome {
         let path = self.ctx.vault_dir().join(BROKER_SOCKET_FILE);
-        if path.exists() {
-            outcome("broker", CheckStatus::Pass, "broker socket present")
-        } else {
-            outcome(
-                "broker",
+        if !path.exists() {
+            return outcome(
+                "broker socket permissions",
                 CheckStatus::Warn,
                 "broker not running (no socket at .vaultx/broker.sock)",
-            )
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                let mode = metadata.permissions().mode();
+                if mode & 0o002 != 0 {
+                    return outcome(
+                        "broker socket permissions",
+                        CheckStatus::Warn,
+                        format!(
+                            ".vaultx/{BROKER_SOCKET_FILE} is world-writable (mode {:o}); \
+                             tighten it before trusting agent traffic",
+                            mode & 0o777
+                        ),
+                    );
+                }
+            }
+        }
+        outcome(
+            "broker socket permissions",
+            CheckStatus::Pass,
+            "broker socket present; not world-writable",
+        )
+    }
+
+    /// Plan §44 sync consistency: compares local refs against a locally
+    /// recorded last-sync snapshot when one exists. No snapshot format is
+    /// persisted by any current component, so a configured remote without
+    /// one reports a deferred-integration WARN rather than inventing
+    /// state.
+    fn check_sync_consistency(&self) -> CheckOutcome {
+        let remote_path = self.ctx.vault_dir().join(REMOTE_CONFIG_FILE);
+        if !remote_path.is_file() {
+            return outcome(
+                "sync consistency",
+                CheckStatus::Pass,
+                "no remote configured",
+            );
+        }
+        match std::fs::read_to_string(&remote_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        {
+            Some(_) => outcome(
+                "sync consistency",
+                CheckStatus::Warn,
+                "remote configured but no last-sync snapshot exists locally; \
+                 nothing to compare yet",
+            ),
+            None => outcome(
+                "sync consistency",
+                CheckStatus::Warn,
+                ".vaultx/remote.json exists but does not parse as JSON; inspect it manually",
+            ),
+        }
+    }
+
+    /// Classifies the injected handshake probe against the resolved
+    /// endpoint. A missing endpoint socket stays advisory; a present-but-
+    /// unresponsive endpoint means something claims to be running and is
+    /// broken, which blocks.
+    fn check_broker_connectivity(&self) -> CheckOutcome {
+        let name = "broker connectivity";
+        let Some((endpoint, probe)) = self.broker_probe.as_ref() else {
+            return outcome(name, CheckStatus::Warn, "not probed in this context");
+        };
+        let socket_exists = std::path::Path::new(endpoint).exists();
+        match probe {
+            BrokerProbe::Reachable { version } => outcome(
+                name,
+                CheckStatus::Pass,
+                format!("handshake ok at {endpoint} (version {version})"),
+            ),
+            BrokerProbe::Unreachable { reason } => {
+                if socket_exists {
+                    outcome(
+                        name,
+                        CheckStatus::Fail,
+                        format!("endpoint at {endpoint} unreachable: {reason}"),
+                    )
+                } else {
+                    outcome(
+                        name,
+                        CheckStatus::Warn,
+                        format!("no socket at {endpoint}; broker not running"),
+                    )
+                }
+            }
         }
     }
 
@@ -300,8 +429,10 @@ mod tests {
         );
         for expected in [
             "repository integrity",
-            "signing key",
+            "signing key availability",
             "keyring availability",
+            "sync consistency",
+            "broker connectivity",
         ] {
             assert!(
                 outcomes.iter().any(|o| o.name == expected),
@@ -312,7 +443,7 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .any(|o| o.name == "broker" && o.status == CheckStatus::Warn),
+                .any(|o| o.name == "broker socket permissions" && o.status == CheckStatus::Warn),
             "{outcomes:?}"
         );
         assert!(
@@ -320,6 +451,24 @@ mod tests {
                 .iter()
                 .any(|o| o.name == "remote" && o.status == CheckStatus::Warn),
             "{outcomes:?}"
+        );
+
+        // A fresh project reports sync as clean with no remote, and the
+        // unprobed broker connectivity check stays advisory.
+        let sync = outcomes
+            .iter()
+            .find(|o| o.name == "sync consistency")
+            .unwrap();
+        assert_eq!(sync.status, CheckStatus::Pass);
+        assert!(sync.detail.contains("no remote configured"), "{sync:?}");
+        let connectivity = outcomes
+            .iter()
+            .find(|o| o.name == "broker connectivity")
+            .unwrap();
+        assert_eq!(connectivity.status, CheckStatus::Warn);
+        assert!(
+            connectivity.detail.contains("not probed"),
+            "{connectivity:?}"
         );
 
         // Rendered output carries status labels and never key material.
@@ -372,7 +521,7 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .any(|o| o.name == "signing key" && o.status == CheckStatus::Fail),
+                .any(|o| o.name == "signing key availability" && o.status == CheckStatus::Fail),
             "{outcomes:?}"
         );
 
@@ -381,7 +530,7 @@ mod tests {
         assert!(
             outcomes
                 .iter()
-                .any(|o| o.name == "signing key" && o.status == CheckStatus::Pass),
+                .any(|o| o.name == "signing key availability" && o.status == CheckStatus::Pass),
             "{outcomes:?}"
         );
     }
@@ -456,6 +605,128 @@ mod tests {
             !ctx.vault_dir().join(ROOT_KEY_FILE).exists(),
             "doctor must never recreate a lost root wrapping key"
         );
+    }
+
+    #[test]
+    fn broker_connectivity_classifies_injected_probe_outcomes() {
+        let (_guard, ctx) = temp_ctx();
+        let endpoint = ctx.vault_dir().join(BROKER_SOCKET_FILE);
+
+        // Reachable handshake passes with the version echoed back.
+        let outcomes = DoctorService::new(&ctx)
+            .with_broker_probe(
+                endpoint.display().to_string(),
+                BrokerProbe::Reachable {
+                    version: "9.9.9".to_owned(),
+                },
+            )
+            .run();
+        let check = outcomes
+            .iter()
+            .find(|o| o.name == "broker connectivity")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.detail.contains("handshake ok") && check.detail.contains("9.9.9"));
+
+        // Unreachable without a socket stays advisory.
+        std::fs::remove_file(&endpoint).ok();
+        let outcomes = DoctorService::new(&ctx)
+            .with_broker_probe(
+                endpoint.display().to_string(),
+                BrokerProbe::Unreachable {
+                    reason: "connection refused".to_owned(),
+                },
+            )
+            .run();
+        let check = outcomes
+            .iter()
+            .find(|o| o.name == "broker connectivity")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("no socket"), "{check:?}");
+
+        // Unreachable WITH a socket present means a stale/broken
+        // endpoint: blocking failure naming the reason, no secret
+        // material involved.
+        std::fs::write(&endpoint, b"stale").unwrap();
+        let outcomes = DoctorService::new(&ctx)
+            .with_broker_probe(
+                endpoint.display().to_string(),
+                BrokerProbe::Unreachable {
+                    reason: "connection refused".to_owned(),
+                },
+            )
+            .run();
+        let check = outcomes
+            .iter()
+            .find(|o| o.name == "broker connectivity")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check.detail.contains("unreachable") && check.detail.contains("connection refused"),
+            "{check:?}"
+        );
+    }
+
+    #[test]
+    fn sync_consistency_passes_without_remote_and_warns_with_uncomparable_remote() {
+        let (_guard, ctx) = temp_ctx();
+
+        // Fresh project: clean pass, explicitly "no remote configured".
+        let outcomes = DoctorService::new(&ctx).run();
+        let sync = outcomes
+            .iter()
+            .find(|o| o.name == "sync consistency")
+            .unwrap();
+        assert_eq!(sync.status, CheckStatus::Pass);
+        assert_eq!(sync.detail, "no remote configured");
+
+        // A configured remote with no local snapshot is deferred, not
+        // broken; an unparsable remote file is flagged for inspection.
+        std::fs::write(ctx.vault_dir().join(REMOTE_CONFIG_FILE), "{}").unwrap();
+        let outcomes = DoctorService::new(&ctx).run();
+        let sync = outcomes
+            .iter()
+            .find(|o| o.name == "sync consistency")
+            .unwrap();
+        assert_eq!(sync.status, CheckStatus::Warn);
+        assert!(sync.detail.contains("no last-sync snapshot"), "{sync:?}");
+
+        std::fs::write(ctx.vault_dir().join(REMOTE_CONFIG_FILE), "not json at all").unwrap();
+        let outcomes = DoctorService::new(&ctx).run();
+        let sync = outcomes
+            .iter()
+            .find(|o| o.name == "sync consistency")
+            .unwrap();
+        assert_eq!(sync.status, CheckStatus::Warn);
+        assert!(sync.detail.contains("does not parse"), "{sync:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_writable_socket_downgrades_socket_permissions_to_warn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_guard, ctx) = temp_ctx();
+        let path = ctx.vault_dir().join(BROKER_SOCKET_FILE);
+
+        std::fs::write(&path, b"sock").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let outcomes = DoctorService::new(&ctx).run();
+        let check = outcomes
+            .iter()
+            .find(|o| o.name == "broker socket permissions")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("world-writable"), "{check:?}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let outcomes = DoctorService::new(&ctx).run();
+        let check = outcomes
+            .iter()
+            .find(|o| o.name == "broker socket permissions")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Pass, "{check:?}");
     }
 
     fn render_lines(outcomes: &[CheckOutcome]) -> Vec<String> {

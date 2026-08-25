@@ -27,4 +27,7 @@ vaultx-types = { path = "../vaultx-types" }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+vaultx-crypto = { path = "../vaultx-crypto" }
+vaultx-repository = { path = "../vaultx-repository" }

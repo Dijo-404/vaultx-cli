@@ -15,8 +15,8 @@ use std::path::Path;
 
 use vaultx_core::{
     AgentIdentityFile, AgentSummary, CommitDetail, CommitSummary, DiffEntry, EntrySummary,
-    EnvironmentSummary, ImportReport, MergeConflictSet, RollbackReport, SecretMetadata,
-    StatusReport,
+    EnvironmentSummary, ImportReport, MergeConflictSet, RecoveryReport, RollbackReport,
+    SecretMetadata, StatusReport,
 };
 use vaultx_policy_packs::PolicyPack;
 use vaultx_types::model::{InjectionTemplateId, VariableKind};
@@ -630,4 +630,44 @@ fn indent(block: String) -> String {
         .map(|line| format!("  {line}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Renders the grouped `vaultx recover` report. Findings carry
+/// identifiers only — never secret material.
+#[must_use]
+pub fn render_recovery_report(report: &RecoveryReport, removed_refs: usize) -> String {
+    let mut lines = Vec::new();
+    if report.is_clean() && removed_refs == 0 {
+        lines.push("recover: no findings; repository is consistent".to_owned());
+        return lines.join("\n");
+    }
+    for r in &report.unresolvable_refs {
+        lines.push(format!(
+            "unresolvable ref: {}/{} -> {}",
+            r.namespace, r.name, r.commit
+        ));
+    }
+    for f in &report.signature_failures {
+        match &f.commit {
+            Some(commit) => lines.push(format!("signature finding: {commit}: {}", f.reason)),
+            None => lines.push(format!("signature finding: {}", f.reason)),
+        }
+    }
+    for (name, revision) in &report.missing_secret_revisions {
+        lines.push(format!("missing secret revision: {name} {revision}"));
+    }
+    if removed_refs > 0 {
+        lines.push(format!("removed {removed_refs} unresolvable ref(s)"));
+    }
+    lines.push(if report.is_clean() {
+        "summary: repository consistent after repair".to_owned()
+    } else {
+        format!(
+            "summary: {} finding(s)",
+            report.unresolvable_refs.len()
+                + report.signature_failures.len()
+                + report.missing_secret_revisions.len()
+        )
+    });
+    lines.join("\n")
 }

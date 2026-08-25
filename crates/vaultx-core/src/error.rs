@@ -81,6 +81,16 @@ pub enum CoreError {
     /// decide whether to rotate or restore it.
     #[error("device signing key at .vaultx/device.key is unusable: {0}")]
     DeviceKey(String),
+    /// A secret revision referenced by a manifest (or history) has no
+    /// record under `.vaultx/secrets/`; the value it stood for cannot be
+    /// resolved.
+    #[error("secret revision {revision} referenced by `{name}` is missing")]
+    MissingRevision {
+        /// Variable name the manifest entry binds.
+        name: String,
+        /// Revision id with no backing record.
+        revision: String,
+    },
     /// Underlying repository failure.
     #[error(transparent)]
     Repo(#[from] RepoError),

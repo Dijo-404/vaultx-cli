@@ -129,6 +129,18 @@ impl VaultxServices {
     pub const fn doctor(&self) -> crate::doctor::DoctorService<'_> {
         crate::doctor::DoctorService::new(&self.ctx)
     }
+
+    /// Plan §33 export with placeholder safety.
+    #[must_use]
+    pub const fn export(&self) -> crate::export::ExportService<'_> {
+        crate::export::ExportService::new(&self.ctx)
+    }
+
+    /// Plan §Recovery audit and conservative ref repair.
+    #[must_use]
+    pub const fn recovery(&self) -> crate::recover::RecoveryService<'_> {
+        crate::recover::RecoveryService::new(&self.ctx)
+    }
 }
 
 #[cfg(test)]

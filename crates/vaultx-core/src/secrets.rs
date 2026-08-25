@@ -481,6 +481,50 @@ impl<'a> SecretService<'a> {
         self.decrypt_record(&latest)
     }
 
+    /// Decrypts the plaintext of one specific revision, matched against
+    /// the variable name the caller believes owns it.
+    ///
+    /// Trusted-path only ([INV-020]). Brokered revisions are refused
+    /// outright (INV-003): their values never leave the broker's injection
+    /// path. Destroyed revisions fail with [`CoreError::SecretDestroyed`].
+    ///
+    /// # Errors
+    /// * [`CoreError::MissingRevision`] when no record carries `revision`.
+    /// * [`CoreError::SecretNotFound`] when the record's bound name
+    ///   differs from the given `name` (record/manifest divergence).
+    /// * [`CoreError::InconsistentBinding`] for brokered records.
+    /// * [`CoreError::SecretDestroyed`] for destroyed revisions.
+    pub fn reveal_revision(
+        &self,
+        name: &VariableName,
+        revision: &SecretRevisionId,
+    ) -> CoreResult<Zeroizing<Vec<u8>>> {
+        let record = self
+            .scan_records(None)?
+            .into_iter()
+            .find(|record| record.id == *revision)
+            .ok_or_else(|| CoreError::MissingRevision {
+                name: name.to_string(),
+                revision: revision.to_string(),
+            })?;
+        if record.name != *name {
+            return Err(CoreError::SecretNotFound(name.to_string()));
+        }
+        if record.kind == VariableKind::Brokered {
+            return Err(CoreError::InconsistentBinding(format!(
+                "brokered credential `{}` values are never revealed outside the broker",
+                record
+                    .brokered
+                    .as_ref()
+                    .map_or_else(|| record.name.to_string(), |b| b.credential_ref.to_string())
+            )));
+        }
+        if record.state == SecretRevisionState::Destroyed {
+            return Err(CoreError::SecretDestroyed(record.name.to_string()));
+        }
+        self.decrypt_record(&record)
+    }
+
     /// Lists secrets bound in one environment (names, kinds, states only),
     /// sorted by name. Never returns values.
     ///

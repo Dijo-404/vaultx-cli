@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use vaultx_core::{CoreError, MergeStrategy};
 use vaultx_types::CommitId;
 
+use crate::cli::REVEAL_CONFIRMATION_PHRASE;
+use crate::cli::{typed_confirmation_matches, DELETE_REFS_CONFIRMATION_PHRASE};
 use crate::{
     dispatch, AgentCommand, Cli, CliError, Command, EnvCommand, McpCommand, PackCommand,
     PolicyCommand, SecretCommand, StubArgs,
@@ -1591,6 +1593,9 @@ fn doctor_fresh_repo_passes_and_tampered_object_exits_nonzero() {
     let out = dispatch(&cli(root, Command::Doctor)).unwrap();
     assert!(out.contains("PASS repository integrity"), "{out}");
     assert!(out.contains("WARN broker"), "{out}");
+    assert!(out.contains("broker connectivity"), "{out}");
+    assert!(out.contains("PASS sync consistency"), "{out}");
+    assert!(out.contains("no remote configured"), "{out}");
     assert!(out.contains("WARN remote"), "{out}");
     assert!(out.contains("summary:"), "{out}");
     assert!(!out.contains("FAIL"), "fresh repo must not fail: {out}");
@@ -1616,7 +1621,7 @@ fn doctor_fresh_repo_passes_and_tampered_object_exits_nonzero() {
         CliError::Diagnostics(report) => {
             assert!(report.contains("FAIL repository integrity"), "{report}");
             assert!(
-                report.contains("summary: 2 passed, 4 warned, 1 failed"),
+                report.contains("summary: 3 passed, 5 warned, 1 failed"),
                 "exact summary expected:\n{report}"
             );
         }
@@ -2180,4 +2185,478 @@ fn mcp_serve_maps_unknown_project_and_agent_onto_error_classes() {
         matches!(&err, CliError::Runtime(CoreError::Io(io)) if io.to_string().contains("unknown agent `ghost-agent`")),
         "{err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Export (plan §33) — placeholder safety and the reveal path
+// ---------------------------------------------------------------------------
+
+/// Seeds a project with one literal config value, one plain secret, and
+/// one brokered credential, all committed at HEAD. The secret values are
+/// canaries scanned for in every rendered output.
+fn seed_export_fixture(root: &Path, canary_secret: &str, canary_brokered: &str) {
+    use vaultx_types::model::{InjectionTemplateId, VariableKind};
+
+    let services = open_services(root);
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["PORT=8080".into()],
+        },
+    ))
+    .unwrap();
+    services
+        .secrets()
+        .set_secret(
+            "API_TOKEN",
+            &vaultx_core::SecretString::copy_from(canary_secret),
+            VariableKind::Secret,
+            "development",
+            None,
+        )
+        .unwrap();
+    services
+        .secrets()
+        .set_secret(
+            "GITHUB_CRED",
+            &vaultx_core::SecretString::copy_from(canary_brokered),
+            VariableKind::Brokered,
+            "development",
+            Some(vaultx_core::BrokeredBinding {
+                credential_ref: vaultx_types::CredentialRef::parse("github-token").unwrap(),
+                injection: InjectionTemplateId::Bearer,
+                provider_hint: None,
+            }),
+        )
+        .unwrap();
+    commit_ok(root, "seed export fixture", None);
+}
+
+#[test]
+fn safe_export_renders_placeholders_and_never_leaks_canary_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    seed_export_fixture(root, "canary-plain-hunter3", "canary-brokered-hunter4");
+
+    let out = dispatch(&cli(
+        root,
+        Command::Export {
+            format: "env".into(),
+            reveal_secrets: false,
+            yes_i_want_plaintext_secrets: false,
+        },
+    ))
+    .unwrap();
+
+    // Literal config values pass through; protected values are inert
+    // placeholders.
+    assert!(out.contains("PORT=8080"), "{out}");
+    assert!(out.contains("API_TOKEN=<vaultx:secret>"), "{out}");
+    assert!(out.contains("GITHUB_CRED=<vaultx:brokered>"), "{out}");
+    // Canary leak scan across the entire rendered output.
+    assert!(!out.contains("canary-plain"), "plaintext leaked: {out}");
+    assert!(
+        !out.contains("canary-brokered"),
+        "brokered value leaked: {out}"
+    );
+}
+
+#[test]
+fn reveal_export_emits_plain_secrets_but_brokered_stays_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    seed_export_fixture(root, "canary-plain-hunter3", "canary-brokered-hunter4");
+
+    let out = dispatch(&cli(
+        root,
+        Command::Export {
+            format: "env".into(),
+            reveal_secrets: true,
+            yes_i_want_plaintext_secrets: true,
+        },
+    ))
+    .unwrap();
+
+    // The plain secret's real value appears...
+    assert!(out.contains("API_TOKEN=canary-plain-hunter3"), "{out}");
+    // ...but the brokered credential NEVER does (INV-002/INV-003).
+    assert!(out.contains("GITHUB_CRED=<vaultx:brokered>"), "{out}");
+    assert!(
+        !out.contains("canary-brokered"),
+        "brokered value leaked: {out}"
+    );
+}
+
+#[test]
+fn reveal_export_without_consent_fails_on_non_tty_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    seed_export_fixture(root, "canary-plain-hunter3", "canary-brokered-hunter4");
+
+    // Test processes have non-terminal stdin, so the typed-confirmation
+    // branch is unreachable and only the flag may authorize.
+    let err = dispatch(&cli(
+        root,
+        Command::Export {
+            format: "env".into(),
+            reveal_secrets: true,
+            yes_i_want_plaintext_secrets: false,
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text)
+            if text.contains("--yes-i-want-plaintext-secrets") && text.contains("authorization")),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn export_unknown_format_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    let err = dispatch(&cli(
+        root,
+        Command::Export {
+            format: "json".into(),
+            reveal_secrets: false,
+            yes_i_want_plaintext_secrets: false,
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("`json`")),
+        "{err:?}"
+    );
+
+    // An empty HEAD exports cleanly as an empty notice.
+    let out = dispatch(&cli(
+        root,
+        Command::Export {
+            format: "env".into(),
+            reveal_secrets: false,
+            yes_i_want_plaintext_secrets: false,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("nothing committed to export"), "{out}");
+}
+
+#[test]
+fn typed_confirmation_matching_is_trimmed_and_exact() {
+    assert!(typed_confirmation_matches(
+        "REVEAL\n",
+        REVEAL_CONFIRMATION_PHRASE
+    ));
+    assert!(typed_confirmation_matches(
+        "  REVEAL  ",
+        REVEAL_CONFIRMATION_PHRASE
+    ));
+    assert!(!typed_confirmation_matches(
+        "reveal",
+        REVEAL_CONFIRMATION_PHRASE
+    ));
+    assert!(!typed_confirmation_matches(
+        "YES",
+        REVEAL_CONFIRMATION_PHRASE
+    ));
+    assert!(typed_confirmation_matches(
+        "DELETE\n",
+        DELETE_REFS_CONFIRMATION_PHRASE
+    ));
+}
+
+#[test]
+fn reveal_of_missing_revision_names_the_variable_without_leaking_values() {
+    use vaultx_types::SecretRevisionId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    seed_export_fixture(root, "canary-plain-hunter3", "canary-brokered-hunter4");
+
+    // Sever the revision record for API_TOKEN by committing a fresh
+    // manifest binding at a nonexistent revision id (export reads HEAD).
+    let ghost = SecretRevisionId::parse(
+        "sec_rev_deadbeefcafebabe00000000000000000000000000000000000000000000",
+    )
+    .unwrap();
+    let services = open_services(root);
+    let name = vaultx_types::VariableName::parse("API_TOKEN").unwrap();
+    services
+        .context()
+        .repository()
+        .add(name, vaultx_repository_manifest_entry_secret(ghost))
+        .unwrap();
+    drop(services);
+    commit_ok(root, "binds a ghost revision", None);
+
+    let err = dispatch(&cli(
+        root,
+        Command::Export {
+            format: "env".into(),
+            reveal_secrets: true,
+            yes_i_want_plaintext_secrets: true,
+        },
+    ))
+    .unwrap_err();
+    match &err {
+        CliError::Runtime(CoreError::MissingRevision { name, .. }) => {
+            assert_eq!(name, "API_TOKEN");
+        }
+        other => panic!("expected MissingRevision, got {other:?}"),
+    }
+}
+
+/// Helper keeping the `ManifestEntry` import local to these tests.
+fn vaultx_repository_manifest_entry_secret(
+    revision: vaultx_types::SecretRevisionId,
+) -> vaultx_repository::ManifestEntry {
+    vaultx_repository::ManifestEntry::Secret { revision }
+}
+
+// ---------------------------------------------------------------------------
+// Recover (plan §Recovery)
+// ---------------------------------------------------------------------------
+
+use vaultx_repository::RefNamespace as RecoveryRefNamespace;
+
+#[test]
+fn recover_healthy_repo_reports_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["A=1".into()],
+        },
+    ))
+    .unwrap();
+    store_secret(root, "TOKEN", "v");
+    commit_ok(root, "healthy history", None);
+
+    let out = dispatch(&cli(
+        root,
+        Command::Recover {
+            fix: false,
+            yes_delete_unresolvable_refs: false,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("no findings"), "{out}");
+}
+
+#[test]
+fn recover_detects_severed_ref_and_fix_requires_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["A=1".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "good commit", None);
+
+    // Plant a ref whose target was never persisted.
+    let ghost =
+        CommitId::parse("cmt_1111111122222222333333334444444455555555666666667777777788888888")
+            .unwrap();
+    open_services(root)
+        .context()
+        .repository()
+        .refs()
+        .write_ref(RecoveryRefNamespace::Heads, "broken", &ghost)
+        .unwrap();
+
+    // Plain recover reports the finding and exits nonzero.
+    let err = dispatch(&cli(
+        root,
+        Command::Recover {
+            fix: false,
+            yes_delete_unresolvable_refs: false,
+        },
+    ))
+    .unwrap_err();
+    match &err {
+        CliError::Diagnostics(report) => {
+            assert!(
+                report.contains("unresolvable ref: heads/broken"),
+                "{report}"
+            );
+            assert!(report.contains(&ghost.as_str()[..16]), "{report}");
+        }
+        other => panic!("expected Diagnostics, got {other:?}"),
+    }
+
+    // --fix without consent (non-tty stdin) is refused; the ref remains.
+    let err = dispatch(&cli(
+        root,
+        Command::Recover {
+            fix: true,
+            yes_delete_unresolvable_refs: false,
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("--yes-delete-unresolvable-refs")),
+        "{err:?}"
+    );
+    assert!(
+        open_services(root)
+            .context()
+            .repository()
+            .refs()
+            .read_ref(RecoveryRefNamespace::Heads, "broken")
+            .unwrap()
+            .is_some(),
+        "refusal must leave the severed ref in place"
+    );
+
+    // With the escape-hatch flag the ref is deleted; objects stay intact.
+    let out = dispatch(&cli(
+        root,
+        Command::Recover {
+            fix: true,
+            yes_delete_unresolvable_refs: true,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("removed 1 unresolvable ref(s)"), "{out}");
+    assert!(out.contains("repository consistent after repair"), "{out}");
+    assert!(
+        open_services(root)
+            .context()
+            .repository()
+            .refs()
+            .read_ref(RecoveryRefNamespace::Heads, "broken")
+            .unwrap()
+            .is_none(),
+        "the severed ref must be gone after --fix"
+    );
+    // INV-013: repair never mutates objects.
+    open_services(root)
+        .context()
+        .repository()
+        .objects()
+        .verify_all()
+        .expect("object store untouched by fix");
+}
+
+#[test]
+fn recover_flags_foreign_signed_commit_objects() {
+    use vaultx_crypto::signature::SigningKeyPair;
+    use vaultx_repository::history::History as RepoHistory;
+    use vaultx_repository::{Commit as RepoCommit, ObjectEnvelope, ObjectType};
+    use vaultx_types::IdentityRef;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["A=1".into()],
+        },
+    ))
+    .unwrap();
+    commit_ok(root, "legit commit", None);
+
+    // Forge a well-formed commit object signed by a DIFFERENT key and
+    // point a ref at it: object integrity holds, signature verification
+    // must fail.
+    let services = open_services(root);
+    let repo = services.context().repository();
+    let head = repo.current_head().unwrap().expect("head exists");
+    let manifest_id = RepoHistory::new(repo.objects())
+        .find_commit(&head)
+        .unwrap()
+        .manifest;
+    let stranger = SigningKeyPair::generate();
+    let forged = RepoCommit::new(
+        Vec::new(),
+        manifest_id,
+        IdentityRef::parse("user:stranger").unwrap(),
+        "forged by a stranger key",
+    )
+    .sign_with(&stranger)
+    .unwrap();
+    let envelope = ObjectEnvelope::new(ObjectType::Commit, serde_json::to_vec(&forged).unwrap());
+    repo.objects().put(&envelope).unwrap();
+    drop(services);
+
+    let forged_id = forged.commit_id().unwrap();
+    open_services(root)
+        .context()
+        .repository()
+        .refs()
+        .write_ref(RecoveryRefNamespace::Heads, "forged", &forged_id)
+        .unwrap();
+
+    let err = dispatch(&cli(
+        root,
+        Command::Recover {
+            fix: false,
+            yes_delete_unresolvable_refs: false,
+        },
+    ))
+    .unwrap_err();
+    match &err {
+        CliError::Diagnostics(report) => {
+            assert!(
+                report.contains("signature finding") && report.contains("signature invalid"),
+                "{report}"
+            );
+        }
+        other => panic!("expected Diagnostics, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn recover_detects_missing_secret_revision_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    // Store + commit a secret, then locate its revision record on disk.
+    store_secret(root, "DB_PASSWORD", "hunter2");
+    commit_ok(root, "adds secret", None);
+    let secrets_dir = root.join(".vaultx").join("secrets");
+    let mut record_path = None;
+    for entry in std::fs::read_dir(&secrets_dir).unwrap().flatten() {
+        for file in std::fs::read_dir(entry.path()).unwrap().flatten() {
+            record_path = Some(file.path());
+        }
+    }
+    let record_path = record_path.expect("one secret revision record exists");
+    std::fs::remove_file(&record_path).unwrap();
+
+    let err = dispatch(&cli(
+        root,
+        Command::Recover {
+            fix: false,
+            yes_delete_unresolvable_refs: false,
+        },
+    ))
+    .unwrap_err();
+    match &err {
+        CliError::Diagnostics(report) => {
+            assert!(
+                report.contains("missing secret revision: DB_PASSWORD"),
+                "{report}"
+            );
+            // Identifiers only — never values.
+            assert!(!report.contains("hunter2"), "value leaked: {report}");
+        }
+        other => panic!("expected Diagnostics, got {other:?}"),
+    }
 }

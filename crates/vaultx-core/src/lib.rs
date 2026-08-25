@@ -48,9 +48,11 @@ mod config;
 mod doctor;
 mod envs;
 mod error;
+mod export;
 mod history;
 mod policies;
 mod project;
+mod recover;
 mod secrets;
 mod services;
 mod staging;
@@ -58,15 +60,20 @@ mod staging;
 pub use agents::{AgentIdentityFile, AgentLifecycleService, AgentSummary};
 pub use broker_source::VaultCredentialSource;
 pub use config::{ConfigService, ImportReport};
-pub use doctor::{render_checks, CheckOutcome, CheckStatus, DoctorService};
+pub use doctor::{render_checks, BrokerProbe, CheckOutcome, CheckStatus, DoctorService};
 pub use envs::{EnvironmentService, EnvironmentSummary};
 pub use error::{CoreError, CoreResult};
+pub use export::{
+    render_export_entry, ExportEntry, ExportService, ExportValue, BROKERED_PLACEHOLDER,
+    DESTROYED_PLACEHOLDER, DYNAMIC_PLACEHOLDER, SECRET_PLACEHOLDER,
+};
 pub use history::{
     CommitDetail, CommitSummary, ConfigValueConflict, EntrySummary, HistoryService,
     MergeConflictSet, MergeOutcome, RollbackReport, SecretRevisionConflict,
 };
 pub use policies::PolicyOpsService;
 pub use project::ProjectContext;
+pub use recover::{RecoveryReport, RecoveryService, SignatureFinding, UnresolvableRef};
 pub use secrets::{
     BrokeredBinding, EncryptedSecretRevision, SecretListEntry, SecretMetadata, SecretRevisionAad,
     SecretRevisionInfo, SecretRevisionState, SecretService,
