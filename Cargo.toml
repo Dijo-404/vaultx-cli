@@ -24,6 +24,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+publish = false
 
 [workspace.dependencies]
 # Shared dependency versions are declared here; member crates reference

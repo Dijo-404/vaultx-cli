@@ -3,6 +3,8 @@ name = "vaultx-broker"
 version.workspace = true
 edition.workspace = true
 
+license.workspace = true
+publish.workspace = true
 [dependencies]
 base64 = { workspace = true }
 getrandom = { workspace = true }

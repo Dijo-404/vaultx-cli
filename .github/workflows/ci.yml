@@ -1,0 +1,204 @@
+# CI pipeline for vaultx-cli (plan §41).
+#
+# Required checks implemented here:
+#   - cargo fmt --check
+#   - cargo clippy --workspace --all-targets --all-features -- -D warnings
+#   - cargo test --workspace --all-features
+#   - cargo deny check / cargo audit
+#   - platform build checks (5-target release matrix)
+#   - npm installer tests
+#
+# Property tests and the fuzz smoke corpus are exercised by
+# `cargo test --workspace` once their targets land in the workspace; no
+# separate job is needed until then.
+#
+# Release binaries carry integrity metadata: every tag build produces a
+# SHA256SUMS file attached to the GitHub release alongside the artifacts
+# (see dist/README.md).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain input: dtolnay/rust-toolchain reads rust-toolchain.toml,
+      # keeping local and CI toolchains identical.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+
+      - name: cargo deny check
+        run: cargo deny check
+
+      - name: cargo audit
+        run: cargo audit
+
+  npm-installer:
+    name: npm installer tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: JS syntax checks
+        run: |
+          node --check npm/bin/vaultx.js
+          node --check npm/bin/install.js
+          node --check npm/lib/platform.js
+          node --check npm/scripts/embed-checksums.js
+          jq empty npm/package.json npm/checksums.json
+
+      # `node --test <dir>` is not supported across maintained Node versions;
+      # default discovery from the package directory is equivalent and works
+      # identically on Node 22 and newer.
+      - name: node:test suite
+        working-directory: npm
+        run: node --test
+
+  platform-builds:
+    name: build ${{ matrix.artifact }}
+    needs: [lint-and-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: vaultx-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: vaultx-linux-aarch64
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: vaultx-darwin-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: vaultx-darwin-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: vaultx-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      # Deterministic-ish release settings applied via profile overrides so
+      # Cargo.toml stays untouched; STRIP=symbols yields stripped binaries on
+      # every platform including MSVC.
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: install cross (linux aarch64)
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: build release binary (--locked)
+        run: >-
+          ${{ matrix.cross && 'cross' || 'cargo' }} build
+          --release --locked --target ${{ matrix.target }}
+
+      - name: stage artifact
+        shell: bash
+        run: |
+          mkdir -p stage
+          src="target/${{ matrix.target }}/release/vaultx"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            src="target/${{ matrix.target }}/release/vaultx.exe"
+          fi
+          cp "$src" "stage/${{ matrix.artifact }}"
+          ls -la stage/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.artifact }}
+          path: stage/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish-release:
+    name: publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint-and-test, supply-chain, npm-installer, platform-builds]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: dist
+
+      - name: generate SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum --binary * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "vaultx-cli $GITHUB_REF_NAME" \
+            dist/*

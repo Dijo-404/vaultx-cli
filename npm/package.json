@@ -1,0 +1,26 @@
+{
+  "name": "vaultx-cli",
+  "version": "0.1.0",
+  "description": "Installer for the vaultx native CLI: detects your platform, downloads the matching prebuilt vaultx binary from GitHub Releases, verifies its SHA-256 checksum, and exposes the `vaultx` executable. Contains no secret-management logic and no telemetry.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vaultx-cli/vaultx-cli.git"
+  },
+  "bin": {
+    "vaultx": "bin/vaultx.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "checksums.json",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node bin/install.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

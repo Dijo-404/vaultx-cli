@@ -1,0 +1,107 @@
+# cargo-deny configuration for vaultx-cli (plan §41).
+#
+# Local validation:
+#   cargo install cargo-deny
+#   cargo deny check
+#
+# CI runs `cargo deny check` on every PR/push; see .github/workflows/ci.yml.
+
+[graph]
+# Check the full dependency graph including optional features, matching the
+# clippy/test gates (`--all-features`) used elsewhere in CI.
+all-features = true
+
+# ---------------------------------------------------------------------------
+# Advisories: RUSTSEC database checks.
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+
+# Any detected vulnerability fails the check (v2 configuration denies all
+# RUSTSEC vulnerability advisories by default; there is no per-severity
+# threshold anymore).
+
+# Unmaintained dependencies are checked across the whole graph. In cargo-deny
+# v2 these findings are reported as warnings (they do not fail the check),
+# matching plan §41 ("vulnerabilities deny, unmaintained warn").
+unmaintained = "all"
+
+# Yanked releases must not enter new builds.
+yanked = "deny"
+
+# Known false positives / accepted risks go here, each with a comment and an
+# expiry rationale. Keep this list empty when possible.
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Licenses: every third-party dependency must carry a permissive license.
+# Workspace members are unpublished/private and are exempt via `private`.
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+confidence-threshold = 0.93
+
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+
+    # Required by the rustls crypto providers pulled in transitively
+    # (`ring` ships code under the OpenSSL license; see the clarify block).
+    "OpenSSL",
+
+    # webpki-roots ships Mozilla's CA root store under this permissive
+    # community data license; pulled in transitively by reqwest's rustls
+    # stack.
+    "CDLA-Permissive-2.0",
+]
+
+# Workspace members have no `license` key yet and are never published to a
+# registry; treat them as private so license checking applies to third-party
+# dependencies only.
+private = { ignore = true }
+
+# ring's LICENSE file bundles MIT/ISC/OpenSSL terms that SPDX cannot express;
+# cargo-deny's canonical clarification for ring 0.17.x.
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ---------------------------------------------------------------------------
+# Bans: duplicate versions and wildcard features.
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicate semver-incompatible versions of the same crate are common with
+# large graphs but each one is supply-chain surface; warn today so CI stays
+# green while making regressions visible.
+multiple-versions = "warn"
+
+# Deny wildcard (`*`) feature declarations anywhere in the graph.
+wildcards = "deny"
+
+# The workspace's internal crates reference each other via path-only
+# dependencies (no version requirement), which cargo-deny classifies as
+# wildcards. This flag permits exactly those intra-workspace path
+# references while registry/git wildcard declarations stay denied.
+allow-wildcard-paths = true
+
+highlight = "all"
+
+# Crates known to legitimately ship multiple semver-incompatible versions in
+# this tree go here; each entry needs a one-line justification.
+skip = []
+
+# ---------------------------------------------------------------------------
+# Sources: dependencies may only come from crates.io. Git sources and any
+# unknown registry are denied.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
