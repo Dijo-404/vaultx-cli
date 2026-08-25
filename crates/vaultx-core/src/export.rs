@@ -24,9 +24,9 @@ use vaultx_repository::ManifestEntry;
 use vaultx_types::{SecretRevisionId, VariableName};
 
 use crate::config::ConfigService;
-use crate::error::{CoreError, CoreResult};
+use crate::error::CoreResult;
 use crate::project::ProjectContext;
-use crate::secrets::{SecretRevisionState, SecretService};
+use crate::secrets::{ResolvedRevision, SecretService};
 
 /// Placeholder rendered for a plain secret in safe mode.
 pub const SECRET_PLACEHOLDER: &str = "<vaultx:secret>";
@@ -70,14 +70,24 @@ impl std::fmt::Debug for ExportValue {
     }
 }
 
-/// Renders one entry as a `NAME=value` line. Plaintext bytes are decoded
-/// lossily (secrets are stored from UTF-8 text).
+/// POSIX-single-quotes `value` (`'...'` with `'\''` escaping) so
+/// embedded newlines, quotes, and metacharacters can never forge extra
+/// shell statements when the export is sourced.
+fn posix_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Renders one entry as a source-safe `NAME='value'` line. Every value —
+/// literal, placeholder, and plaintext alike — is POSIX-single-quoted, so
+/// a multiline or hostile value stays bound to its own assignment.
+/// Plaintext bytes are decoded lossily (secrets are stored from UTF-8
+/// text).
 #[must_use]
 pub fn render_export_entry(entry: &ExportEntry) -> String {
     let value = match &entry.value {
-        ExportValue::Literal(value) => value.clone(),
-        ExportValue::Placeholder(tag) => (*tag).to_owned(),
-        ExportValue::Plaintext(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        ExportValue::Literal(value) => posix_single_quote(value),
+        ExportValue::Placeholder(tag) => posix_single_quote(tag),
+        ExportValue::Plaintext(bytes) => posix_single_quote(&String::from_utf8_lossy(bytes)),
     };
     format!("{}={}", entry.name.as_str(), value)
 }
@@ -105,7 +115,8 @@ impl<'a> ExportService<'a> {
     /// # Errors
     /// * Propagates manifest/config-object lookup failures.
     /// * A revealed revision whose record is missing fails with
-    ///   [`CoreError::MissingRevision`]; destroyed revisions are not
+    ///   [`crate::error::CoreError::MissingRevision`]; destroyed
+    ///   revisions are not
     ///   errors — they render [`DESTROYED_PLACEHOLDER`].
     pub fn export(&self, reveal_secrets: bool) -> CoreResult<Vec<ExportEntry>> {
         let manifest = self.ctx.repository().working_manifest()?;
@@ -142,17 +153,11 @@ impl<'a> ExportService<'a> {
         if !reveal_secrets {
             return Ok(ExportValue::Placeholder(SECRET_PLACEHOLDER));
         }
-        match secrets.revision_state(revision)? {
-            None => Err(CoreError::MissingRevision {
-                name: name.to_string(),
-                revision: revision.to_string(),
-            }),
-            Some(SecretRevisionState::Destroyed) => {
-                Ok(ExportValue::Placeholder(DESTROYED_PLACEHOLDER))
-            }
-            Some(_) => Ok(ExportValue::Plaintext(
-                secrets.reveal_revision(name, revision)?,
-            )),
+        // One record-store scan resolves both the lifecycle state and the
+        // plaintext, instead of a state probe followed by a reveal rescan.
+        match secrets.resolve_revision(name, revision)? {
+            ResolvedRevision::Destroyed => Ok(ExportValue::Placeholder(DESTROYED_PLACEHOLDER)),
+            ResolvedRevision::Plain(plaintext) => Ok(ExportValue::Plaintext(plaintext)),
         }
     }
 }
@@ -162,6 +167,7 @@ mod tests {
     use super::*;
 
     use crate::config::ConfigService;
+    use crate::error::CoreError;
     use crate::history::HistoryService;
     use crate::SecretString;
     use vaultx_types::model::VariableKind;
@@ -250,7 +256,7 @@ mod tests {
         let out = rendered(&fx, false);
         assert!(!out.contains(CANARY_PLAIN), "plaintext leaked: {out}");
         assert!(!out.contains(CANARY_BROKERED), "brokered leaked: {out}");
-        assert!(out.contains("PORT=8080"), "{out}");
+        assert!(out.contains("PORT='8080'"), "{out}");
     }
 
     #[test]
@@ -260,10 +266,16 @@ mod tests {
 
         let out = rendered(&fx, true);
         // The plain secret's real value appears only under reveal...
-        assert!(out.contains(&format!("API_TOKEN={CANARY_PLAIN}")), "{out}");
+        assert!(
+            out.contains(&format!("API_TOKEN='{CANARY_PLAIN}'")),
+            "{out}"
+        );
         // ...while the brokered credential stays a placeholder in every
         // mode (INV-002/INV-003).
-        assert!(out.contains("GITHUB_CRED=<vaultx:brokered>"), "{out}");
+        assert!(
+            out.contains(&format!("GITHUB_CRED='{BROKERED_PLACEHOLDER}'")),
+            "{out}"
+        );
         assert!(!out.contains(CANARY_BROKERED), "brokered leaked: {out}");
     }
 
@@ -276,10 +288,13 @@ mod tests {
             .unwrap();
 
         let safe = rendered(&fx, false);
-        assert!(safe.contains("API_TOKEN=<vaultx:secret>"), "{safe}");
+        assert!(
+            safe.contains(&format!("API_TOKEN='{SECRET_PLACEHOLDER}'")),
+            "{safe}"
+        );
         let revealed = rendered(&fx, true);
         assert!(
-            revealed.contains(&format!("API_TOKEN={DESTROYED_PLACEHOLDER}")),
+            revealed.contains(&format!("API_TOKEN='{DESTROYED_PLACEHOLDER}'")),
             "{revealed}"
         );
         assert!(!revealed.contains(CANARY_PLAIN), "shred leak: {revealed}");
@@ -313,7 +328,7 @@ mod tests {
             other => panic!("expected MissingRevision, got {other:?}"),
         }
         // Safe mode never touches revision records and still succeeds.
-        assert!(rendered(&fx, false).contains("API_TOKEN=<vaultx:secret>"));
+        assert!(rendered(&fx, false).contains(&format!("API_TOKEN='{SECRET_PLACEHOLDER}'")));
     }
 
     #[test]
@@ -331,20 +346,62 @@ mod tests {
             value: ExportValue::Plaintext(Zeroizing::new(b"hunter2-canary".to_vec())),
         };
 
-        assert_eq!(render_export_entry(&literal), "PORT=8080");
+        assert_eq!(render_export_entry(&literal), "PORT='8080'");
         assert_eq!(
             render_export_entry(&placeholder),
-            format!("TOKEN={SECRET_PLACEHOLDER}")
+            format!("TOKEN='{SECRET_PLACEHOLDER}'")
         );
         assert_eq!(
             render_export_entry(&plaintext_entry),
-            "SHOWN=hunter2-canary"
+            "SHOWN='hunter2-canary'"
         );
 
         // Debug/Display of the value enum itself must redact plaintext
         // (INV-012); the renderer is the only sanctioned disclosure path.
         let debugged = format!("{:?}", plaintext_entry.value);
         assert!(!debugged.contains("hunter2"), "{debugged}");
+    }
+
+    /// Minimal single-assignment parser mirroring what a POSIX shell
+    /// would extract from `NAME='...'` with `'\''` escapes.
+    fn parse_single_quoted_assignment(line: &str) -> Option<(String, String)> {
+        let (name, rest) = line.split_once('=')?;
+        let inner = rest.strip_prefix('\'')?.strip_suffix('\'')?;
+        Some((name.to_owned(), inner.replace("'\\''", "'")))
+    }
+
+    #[test]
+    fn multiline_and_injected_values_round_trip_as_one_quoted_assignment() {
+        let multiline = ExportEntry {
+            name: vaultx_types::VariableName::parse("EVIL").unwrap(),
+            value: ExportValue::Literal("bar\nEXFIL_CMD=1".to_owned()),
+        };
+        let apostrophe = ExportEntry {
+            name: vaultx_types::VariableName::parse("SHOWN").unwrap(),
+            value: ExportValue::Plaintext(Zeroizing::new(b"it's\nrm -rf /".to_vec())),
+        };
+
+        let line = render_export_entry(&multiline);
+        // The newline sits inside the closing quote, so the whole value
+        // stays one logical assignment; no bare `EXFIL_CMD=1` statement
+        // can exist when sourced.
+        assert_eq!(line, "EVIL='bar\nEXFIL_CMD=1'");
+        assert!(line.starts_with("EVIL='") && line.ends_with('\''));
+
+        let quoted = render_export_entry(&apostrophe);
+        assert_eq!(quoted, "SHOWN='it'\\''s\nrm -rf /'", "{quoted}");
+
+        for (entry, rendered) in [(&multiline, &line), (&apostrophe, &quoted)] {
+            let (name, value) = parse_single_quoted_assignment(rendered)
+                .unwrap_or_else(|| panic!("unparsable rendering: {rendered:?}"));
+            assert_eq!(name, entry.name.as_str());
+            let expected = match &entry.value {
+                ExportValue::Literal(value) => value.clone(),
+                ExportValue::Plaintext(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                ExportValue::Placeholder(tag) => (*tag).to_owned(),
+            };
+            assert_eq!(value, expected, "round-trip failed: {rendered:?}");
+        }
     }
 
     impl ExportEntry {

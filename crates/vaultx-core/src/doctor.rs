@@ -264,28 +264,42 @@ impl<'a> DoctorService<'a> {
     /// On unix a world-writable socket would let any local user speak to
     /// (or squat) the endpoint, so it downgrades the verdict to WARN.
     fn check_broker_socket(&self) -> CheckOutcome {
+        const SPLIT_NOTE: &str =
+            "; connectivity probes target the global XDG endpoint, not this project-local path";
         let path = self.ctx.vault_dir().join(BROKER_SOCKET_FILE);
         if !path.exists() {
             return outcome(
                 "broker socket permissions",
                 CheckStatus::Warn,
-                "broker not running (no socket at .vaultx/broker.sock)",
+                format!(
+                    "broker not running (no socket at .vaultx/{BROKER_SOCKET_FILE}){SPLIT_NOTE}"
+                ),
             );
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                let mode = metadata.permissions().mode();
-                if mode & 0o002 != 0 {
+            match std::fs::metadata(&path) {
+                Ok(metadata) => {
+                    let mode = metadata.permissions().mode();
+                    if mode & 0o002 != 0 {
+                        return outcome(
+                            "broker socket permissions",
+                            CheckStatus::Warn,
+                            format!(
+                                ".vaultx/{BROKER_SOCKET_FILE} is world-writable (mode {:o}); \
+                                 tighten it before trusting agent traffic\
+                                 {SPLIT_NOTE}",
+                                mode & 0o777
+                            ),
+                        );
+                    }
+                }
+                Err(err) => {
                     return outcome(
                         "broker socket permissions",
                         CheckStatus::Warn,
-                        format!(
-                            ".vaultx/{BROKER_SOCKET_FILE} is world-writable (mode {:o}); \
-                             tighten it before trusting agent traffic",
-                            mode & 0o777
-                        ),
+                        format!("cannot stat .vaultx/{BROKER_SOCKET_FILE}: {err}{SPLIT_NOTE}"),
                     );
                 }
             }
@@ -293,7 +307,7 @@ impl<'a> DoctorService<'a> {
         outcome(
             "broker socket permissions",
             CheckStatus::Pass,
-            "broker socket present; not world-writable",
+            format!("broker socket present; not world-writable{SPLIT_NOTE}"),
         )
     }
 
@@ -334,6 +348,8 @@ impl<'a> DoctorService<'a> {
     /// unresponsive endpoint means something claims to be running and is
     /// broken, which blocks.
     fn check_broker_connectivity(&self) -> CheckOutcome {
+        const SPLIT_NOTE: &str =
+            "; permission audit separately inspects project-local .vaultx/broker.sock";
         let name = "broker connectivity";
         let Some((endpoint, probe)) = self.broker_probe.as_ref() else {
             return outcome(name, CheckStatus::Warn, "not probed in this context");
@@ -343,20 +359,20 @@ impl<'a> DoctorService<'a> {
             BrokerProbe::Reachable { version } => outcome(
                 name,
                 CheckStatus::Pass,
-                format!("handshake ok at {endpoint} (version {version})"),
+                format!("handshake ok at {endpoint} (version {version}){SPLIT_NOTE}"),
             ),
             BrokerProbe::Unreachable { reason } => {
                 if socket_exists {
                     outcome(
                         name,
                         CheckStatus::Fail,
-                        format!("endpoint at {endpoint} unreachable: {reason}"),
+                        format!("endpoint at {endpoint} unreachable: {reason}{SPLIT_NOTE}"),
                     )
                 } else {
                     outcome(
                         name,
                         CheckStatus::Warn,
-                        format!("no socket at {endpoint}; broker not running"),
+                        format!("no socket at {endpoint}; broker not running{SPLIT_NOTE}"),
                     )
                 }
             }

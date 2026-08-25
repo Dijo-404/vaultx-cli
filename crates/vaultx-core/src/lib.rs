@@ -73,10 +73,12 @@ pub use history::{
 };
 pub use policies::PolicyOpsService;
 pub use project::ProjectContext;
-pub use recover::{RecoveryReport, RecoveryService, SignatureFinding, UnresolvableRef};
+pub use recover::{
+    RecoveryReport, RecoveryService, RepairOutcome, SignatureFinding, UnresolvableRef,
+};
 pub use secrets::{
-    BrokeredBinding, EncryptedSecretRevision, SecretListEntry, SecretMetadata, SecretRevisionAad,
-    SecretRevisionInfo, SecretRevisionState, SecretService,
+    BrokeredBinding, EncryptedSecretRevision, ResolvedRevision, SecretListEntry, SecretMetadata,
+    SecretRevisionAad, SecretRevisionInfo, SecretRevisionState, SecretService,
 };
 pub use services::{version, VaultxServices};
 pub use staging::{StagedChangeKind, StagingService, StatusReport};

@@ -2249,11 +2249,11 @@ fn safe_export_renders_placeholders_and_never_leaks_canary_values() {
     ))
     .unwrap();
 
-    // Literal config values pass through; protected values are inert
-    // placeholders.
-    assert!(out.contains("PORT=8080"), "{out}");
-    assert!(out.contains("API_TOKEN=<vaultx:secret>"), "{out}");
-    assert!(out.contains("GITHUB_CRED=<vaultx:brokered>"), "{out}");
+    // Literal config values pass through (quoted); protected values are
+    // inert placeholders.
+    assert!(out.contains("PORT='8080'"), "{out}");
+    assert!(out.contains("API_TOKEN='<vaultx:secret>'"), "{out}");
+    assert!(out.contains("GITHUB_CRED='<vaultx:brokered>'"), "{out}");
     // Canary leak scan across the entire rendered output.
     assert!(!out.contains("canary-plain"), "plaintext leaked: {out}");
     assert!(
@@ -2279,10 +2279,10 @@ fn reveal_export_emits_plain_secrets_but_brokered_stays_placeholder() {
     ))
     .unwrap();
 
-    // The plain secret's real value appears...
-    assert!(out.contains("API_TOKEN=canary-plain-hunter3"), "{out}");
+    // The plain secret's real value appears (quoted, source-safe)...
+    assert!(out.contains("API_TOKEN='canary-plain-hunter3'"), "{out}");
     // ...but the brokered credential NEVER does (INV-002/INV-003).
-    assert!(out.contains("GITHUB_CRED=<vaultx:brokered>"), "{out}");
+    assert!(out.contains("GITHUB_CRED='<vaultx:brokered>'"), "{out}");
     assert!(
         !out.contains("canary-brokered"),
         "brokered value leaked: {out}"

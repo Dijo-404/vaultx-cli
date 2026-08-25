@@ -1414,7 +1414,8 @@ pub(crate) const REVEAL_CONFIRMATION_PHRASE: &str = "REVEAL";
 /// Typed confirmation phrase required before deleting unresolvable refs.
 pub(crate) const DELETE_REFS_CONFIRMATION_PHRASE: &str = "DELETE";
 
-/// Case/whitespace-tolerant comparison of a typed confirmation line.
+/// Trimmed exact match (case-sensitive) comparison of a typed
+/// confirmation line.
 #[must_use]
 pub(crate) fn typed_confirmation_matches(typed: &str, phrase: &str) -> bool {
     typed.trim() == phrase
@@ -1502,11 +1503,12 @@ fn cmd_recover(
 ) -> Result<String, CliError> {
     let mut report = services.recovery().audit()?;
     let mut removed = 0usize;
+    let mut skipped = 0usize;
     if fix && !report.unresolvable_refs.is_empty() {
         let listing = report
             .unresolvable_refs
             .iter()
-            .map(|r| format!("{}/{} -> {}", r.namespace, r.name, r.commit))
+            .map(|r| format!("{}/{} -> {}", r.namespace.label(), r.name, r.commit))
             .collect::<Vec<_>>()
             .join(", ");
         authorize_high_friction_action(
@@ -1520,13 +1522,15 @@ fn cmd_recover(
             "--yes-delete-unresolvable-refs",
         )?;
         let targets = std::mem::take(&mut report.unresolvable_refs);
-        removed = services.recovery().fix_unresolvable_refs(&targets)?;
+        let outcome = services.recovery().fix_unresolvable_refs(&targets)?;
+        removed = outcome.removed;
+        skipped = outcome.skipped;
     }
     // Re-audit after repairs so the verdict reflects post-fix state.
     if removed > 0 {
         report = services.recovery().audit()?;
     }
-    let rendered = crate::output::render_recovery_report(&report, removed);
+    let rendered = crate::output::render_recovery_report(&report, removed, skipped);
     if report.is_clean() {
         Ok(rendered)
     } else {

@@ -100,6 +100,17 @@ impl std::fmt::Display for SecretRevisionState {
     }
 }
 
+/// Outcome of one-scan revision resolution (see
+/// [`SecretService::resolve_revision`]): the record's lifecycle state
+/// plus, only for a live plain revision, its decrypted plaintext.
+#[derive(Debug)]
+pub enum ResolvedRevision {
+    /// Live plain revision with decrypted plaintext.
+    Plain(Zeroizing<Vec<u8>>),
+    /// Record exists; its value is intentionally unrecoverable.
+    Destroyed,
+}
+
 /// Broker-side binding attached to brokered secret revisions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokeredBinding {
@@ -499,6 +510,28 @@ impl<'a> SecretService<'a> {
         name: &VariableName,
         revision: &SecretRevisionId,
     ) -> CoreResult<Zeroizing<Vec<u8>>> {
+        match self.resolve_revision(name, revision)? {
+            ResolvedRevision::Plain(plaintext) => Ok(plaintext),
+            // The name already matched the record at this point, so the
+            // error carries only the caller-supplied identifier.
+            ResolvedRevision::Destroyed => Err(CoreError::SecretDestroyed(name.to_string())),
+        }
+    }
+
+    /// State-returning variant of [`Self::reveal_revision`]: one
+    /// record-store scan resolves the lifecycle state and — for live
+    /// plain revisions — the decrypted plaintext together.
+    ///
+    /// # Errors
+    /// * [`CoreError::MissingRevision`] when no record carries `revision`.
+    /// * [`CoreError::SecretNotFound`] when the record's bound name
+    ///   differs from the given `name` (record/manifest divergence).
+    /// * [`CoreError::InconsistentBinding`] for brokered records.
+    pub fn resolve_revision(
+        &self,
+        name: &VariableName,
+        revision: &SecretRevisionId,
+    ) -> CoreResult<ResolvedRevision> {
         let record = self
             .scan_records(None)?
             .into_iter()
@@ -520,9 +553,9 @@ impl<'a> SecretService<'a> {
             )));
         }
         if record.state == SecretRevisionState::Destroyed {
-            return Err(CoreError::SecretDestroyed(record.name.to_string()));
+            return Ok(ResolvedRevision::Destroyed);
         }
-        self.decrypt_record(&record)
+        Ok(ResolvedRevision::Plain(self.decrypt_record(&record)?))
     }
 
     /// Lists secrets bound in one environment (names, kinds, states only),

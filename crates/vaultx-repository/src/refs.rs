@@ -30,11 +30,18 @@ pub enum RefNamespace {
 }
 
 impl RefNamespace {
-    fn dir_name(self) -> &'static str {
+    const fn dir_name(self) -> &'static str {
         match self {
             Self::Heads => "heads",
             Self::Environments => "environments",
         }
+    }
+
+    /// Human-readable label matching the on-disk layout
+    /// (`heads` / `environments`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        self.dir_name()
     }
 }
 

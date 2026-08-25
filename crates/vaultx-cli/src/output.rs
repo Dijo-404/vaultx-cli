@@ -635,16 +635,22 @@ fn indent(block: String) -> String {
 /// Renders the grouped `vaultx recover` report. Findings carry
 /// identifiers only — never secret material.
 #[must_use]
-pub fn render_recovery_report(report: &RecoveryReport, removed_refs: usize) -> String {
+pub fn render_recovery_report(
+    report: &RecoveryReport,
+    removed_refs: usize,
+    skipped_refs: usize,
+) -> String {
     let mut lines = Vec::new();
-    if report.is_clean() && removed_refs == 0 {
+    if report.is_clean() && removed_refs == 0 && skipped_refs == 0 {
         lines.push("recover: no findings; repository is consistent".to_owned());
         return lines.join("\n");
     }
     for r in &report.unresolvable_refs {
         lines.push(format!(
             "unresolvable ref: {}/{} -> {}",
-            r.namespace, r.name, r.commit
+            r.namespace.label(),
+            r.name,
+            r.commit
         ));
     }
     for f in &report.signature_failures {
@@ -656,18 +662,18 @@ pub fn render_recovery_report(report: &RecoveryReport, removed_refs: usize) -> S
     for (name, revision) in &report.missing_secret_revisions {
         lines.push(format!("missing secret revision: {name} {revision}"));
     }
+    if skipped_refs > 0 {
+        lines.push(format!(
+            "skipped {skipped_refs} ref(s); ref changed during recovery"
+        ));
+    }
     if removed_refs > 0 {
         lines.push(format!("removed {removed_refs} unresolvable ref(s)"));
     }
     lines.push(if report.is_clean() {
         "summary: repository consistent after repair".to_owned()
     } else {
-        format!(
-            "summary: {} finding(s)",
-            report.unresolvable_refs.len()
-                + report.signature_failures.len()
-                + report.missing_secret_revisions.len()
-        )
+        format!("summary: {} finding(s)", report.len())
     });
     lines.join("\n")
 }

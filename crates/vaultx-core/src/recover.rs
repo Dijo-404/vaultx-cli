@@ -30,8 +30,8 @@ use crate::secrets::SecretService;
 /// A ref whose target commit cannot be resolved from the object store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnresolvableRef {
-    /// Ref namespace label (`heads` / `environments`).
-    pub namespace: &'static str,
+    /// Ref namespace carrying the broken ref.
+    pub namespace: RefNamespace,
     /// Ref name within its namespace.
     pub name: String,
     /// Target that failed to resolve.
@@ -84,6 +84,17 @@ impl RecoveryReport {
     }
 }
 
+/// Counts from one conservative repair pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepairOutcome {
+    /// Refs deleted because their live target still matched the audited
+    /// unresolvable commit.
+    pub removed: usize,
+    /// Refs skipped because the ref changed between audit and repair;
+    /// nothing about either target is disclosed.
+    pub skipped: usize,
+}
+
 /// Recovery audit and conservative ref repair over one project.
 #[derive(Clone, Copy, Debug)]
 pub struct RecoveryService<'a> {
@@ -108,14 +119,11 @@ impl<'a> RecoveryService<'a> {
 
         // Category 1 + collection of walk roots.
         let mut tips: Vec<CommitId> = Vec::new();
-        for (namespace, label) in [
-            (RefNamespace::Heads, "heads"),
-            (RefNamespace::Environments, "environments"),
-        ] {
+        for namespace in [RefNamespace::Heads, RefNamespace::Environments] {
             for (name, commit) in repo.refs().list_refs(namespace)? {
                 if history.find_commit(&commit).is_err() {
                     report.unresolvable_refs.push(UnresolvableRef {
-                        namespace: label,
+                        namespace,
                         name,
                         commit,
                     });
@@ -236,25 +244,35 @@ impl<'a> RecoveryService<'a> {
     /// explicit operator consent that produced this list. Objects are
     /// never touched.
     ///
-    /// Returns the number of refs actually removed.
+    /// Each ref is re-read immediately before deletion: if it moved to a
+    /// different target between the audit and this repair (the interactive
+    /// confirmation window), it is skipped rather than deleted, and the
+    /// skip is reported without disclosing either target's value.
     ///
     /// # Errors
     /// * Propagates ref-store failures.
-    pub fn fix_unresolvable_refs(&self, targets: &[UnresolvableRef]) -> CoreResult<usize> {
+    pub fn fix_unresolvable_refs(&self, targets: &[UnresolvableRef]) -> CoreResult<RepairOutcome> {
         let refs = self.ctx.repository().refs();
-        let mut removed = 0;
+        let mut outcome = RepairOutcome::default();
         for target in targets {
+            // TOCTOU guard: the audited bad commit must still be the live
+            // target, otherwise the confirmation covered a different ref.
+            let current = refs.read_ref(target.namespace, &target.name)?;
+            if current.as_ref() != Some(&target.commit) {
+                outcome.skipped += 1;
+                continue;
+            }
             match target.namespace {
-                "heads" => {
+                RefNamespace::Heads => {
                     refs.delete_ref(RefNamespace::Heads, &target.name, true)?;
                 }
-                _ => {
+                RefNamespace::Environments => {
                     refs.delete_env_ref(&target.name, true)?;
                 }
             }
-            removed += 1;
+            outcome.removed += 1;
         }
-        Ok(removed)
+        Ok(outcome)
     }
 }
 
@@ -318,11 +336,15 @@ mod tests {
         assert!(report.is_clean(), "{report:?}");
         assert_eq!(report.len(), 0);
         // Repairing nothing is a no-op success.
+        let outcome = RecoveryService::new(&fx.ctx)
+            .fix_unresolvable_refs(&[])
+            .unwrap();
         assert_eq!(
-            RecoveryService::new(&fx.ctx)
-                .fix_unresolvable_refs(&[])
-                .unwrap(),
-            0
+            outcome,
+            RepairOutcome {
+                removed: 0,
+                skipped: 0
+            }
         );
     }
 
@@ -330,7 +352,6 @@ mod tests {
     fn unresolvable_refs_are_detected_and_fix_removes_only_them() {
         let fx = fixture();
         seed(&fx);
-        let head = HistoryService::new(&fx.ctx).log(1).unwrap()[0].id.clone();
 
         // One severed branch ref and one severed environment ref; main
         // stays healthy throughout.
@@ -348,12 +369,12 @@ mod tests {
         let report = RecoveryService::new(&fx.ctx).audit().unwrap();
         assert_eq!(report.unresolvable_refs.len(), 2, "{report:?}");
         assert!(report.unresolvable_refs.contains(&UnresolvableRef {
-            namespace: "heads",
+            namespace: RefNamespace::Heads,
             name: "broken".to_owned(),
             commit: broken_branch.clone(),
         }));
         assert!(report.unresolvable_refs.contains(&UnresolvableRef {
-            namespace: "environments",
+            namespace: RefNamespace::Environments,
             name: "ghostenv".to_owned(),
             commit: broken_env,
         }));
@@ -362,10 +383,16 @@ mod tests {
         // Fix deletes exactly the listed refs — including past HEAD/
         // protection guards — and never touches objects (INV-013).
         let targets = report.unresolvable_refs.clone();
-        let removed = RecoveryService::new(&fx.ctx)
+        let outcome = RecoveryService::new(&fx.ctx)
             .fix_unresolvable_refs(&targets)
             .unwrap();
-        assert_eq!(removed, 2);
+        assert_eq!(
+            outcome,
+            RepairOutcome {
+                removed: 2,
+                skipped: 0
+            }
+        );
         assert!(repo(&fx)
             .refs()
             .read_ref(RefNamespace::Heads, "broken")
@@ -385,7 +412,54 @@ mod tests {
 
         let after = RecoveryService::new(&fx.ctx).audit().unwrap();
         assert!(after.is_clean(), "{after:?}");
-        let _ = head;
+    }
+
+    #[test]
+    fn fix_skips_refs_that_change_between_audit_and_repair() {
+        let fx = fixture();
+        seed(&fx);
+
+        // Plant a ref pointing at an unresolvable commit, audit it...
+        let broken_branch = ghost_commit(0xAB);
+        repo(&fx)
+            .refs()
+            .write_ref(RefNamespace::Heads, "broken", &broken_branch)
+            .unwrap();
+        let report = RecoveryService::new(&fx.ctx).audit().unwrap();
+        assert_eq!(report.unresolvable_refs.len(), 1, "{report:?}");
+        let healthy = repo(&fx)
+            .refs()
+            .read_ref(RefNamespace::Heads, "main")
+            .unwrap()
+            .expect("seeded branch exists");
+
+        // ...then repair the ref behind the confirmation's back.
+        repo(&fx)
+            .refs()
+            .write_ref(RefNamespace::Heads, "broken", &healthy)
+            .unwrap();
+
+        let outcome = RecoveryService::new(&fx.ctx)
+            .fix_unresolvable_refs(&report.unresolvable_refs)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RepairOutcome {
+                removed: 0,
+                skipped: 1
+            }
+        );
+        // The repaired (now healthy) ref survives untouched.
+        assert_eq!(
+            repo(&fx)
+                .refs()
+                .read_ref(RefNamespace::Heads, "broken")
+                .unwrap(),
+            Some(healthy)
+        );
+
+        let after = RecoveryService::new(&fx.ctx).audit().unwrap();
+        assert!(after.is_clean(), "{after:?}");
     }
 
     #[test]
