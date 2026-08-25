@@ -2680,3 +2680,341 @@ fn recover_detects_missing_secret_revision_records() {
         other => panic!("expected Diagnostics, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Agent run (plan §17) — sanitized brokered workload execution
+// ---------------------------------------------------------------------------
+
+/// Serializes process-global env mutations across parallel tests; every
+/// test that touches env vars must hold this lock for its whole body.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sets one env var for a test body and restores the previous value on
+/// drop. Callers must hold [`ENV_LOCK`] so concurrent tests never race
+/// the process-global environment.
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Seeds an initialized project with committed config (`PORT`), plain
+/// secrets (`API_TOKEN`, `GITHUB_TOKEN`), a brokered credential
+/// (`GITHUB_CRED`), a pinned `development` environment, and an enabled
+/// agent named `runner-bot`. All secret values are canaries.
+fn seed_agent_run_fixture(root: &Path) {
+    use vaultx_types::model::{InjectionTemplateId, VariableKind};
+
+    init_in(root);
+    dispatch(&cli(
+        root,
+        Command::Set {
+            pairs: vec!["PORT=8080".into()],
+        },
+    ))
+    .unwrap();
+    store_secret(root, "API_TOKEN", "canary-plain-hunter3");
+    store_secret(root, "GITHUB_TOKEN", "canary-parent-hunter5");
+    open_services(root)
+        .secrets()
+        .set_secret(
+            "GITHUB_CRED",
+            &vaultx_core::SecretString::copy_from("canary-brokered-hunter4"),
+            VariableKind::Brokered,
+            "development",
+            Some(vaultx_core::BrokeredBinding {
+                credential_ref: vaultx_types::CredentialRef::parse("github-token").unwrap(),
+                injection: InjectionTemplateId::Bearer,
+                provider_hint: None,
+            }),
+        )
+        .unwrap();
+    commit_ok(root, "seed agent-run fixture", None);
+    dispatch(&cli(
+        root,
+        Command::Env {
+            command: EnvCommand::Create {
+                name: "development".into(),
+            },
+        },
+    ))
+    .unwrap();
+    dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Create {
+                name: "runner-bot".into(),
+            },
+        },
+    ))
+    .unwrap();
+}
+
+/// Builds an `agent run` invocation whose child is `sh -c <script>`.
+fn agent_run(name: &str, ttl_secs: Option<u64>, script: String) -> Command {
+    Command::Agent {
+        command: AgentCommand::Run {
+            name: name.into(),
+            env: None,
+            ttl_secs,
+            command: vec!["sh".into(), "-c".into(), script],
+        },
+    }
+}
+
+/// Sorted relative paths of every file under `root` (recursive).
+fn snapshot_tree(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                out.push(path.strip_prefix(base).unwrap().to_path_buf());
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, root, &mut files);
+    files.sort();
+    files
+}
+
+#[cfg(unix)]
+#[test]
+fn run_injects_config_and_broker_metadata_but_not_secret_values() {
+    let _runtime = isolated_xdg_runtime_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_agent_run_fixture(root);
+
+    // The dump file lives OUTSIDE the project so the no-new-files
+    // assertion below stays meaningful.
+    let dump_dir = tempfile::tempdir().unwrap();
+    let out_path = dump_dir.path().join("child-env.txt");
+    let script = format!(
+        "printf 'PORT=%s\\nAPI_TOKEN=%s\\nGITHUB_TOKEN=%s\\nGITHUB_CRED=%s\\nENDPOINT=%s\\nSESSION=%s\\nAGENT=%s\\nPROJECT=%s\\nENVIRONMENT=%s\\n' \
+         \"$PORT\" \"$API_TOKEN\" \"$GITHUB_TOKEN\" \"$GITHUB_CRED\" \"$VAULTX_BROKER_ENDPOINT\" \
+         \"$VAULTX_BROKER_SESSION\" \"$VAULTX_AGENT\" \"$VAULTX_PROJECT\" \"$VAULTX_ENVIRONMENT\" > {}",
+        out_path.display()
+    );
+
+    let before = snapshot_tree(root);
+    let out = dispatch(&cli(root, agent_run("runner-bot", Some(600), script)))
+        .unwrap_or_else(|err| panic!("agent run failed: {err}"));
+    assert_eq!(out, "", "success prints nothing extra");
+
+    let dumped = std::fs::read_to_string(&out_path).unwrap();
+    let get = |key: &str| {
+        dumped
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")).map(str::to_owned))
+            .unwrap_or_else(|| panic!("{key} line missing in child env:\n{dumped}"))
+    };
+
+    assert_eq!(get("PORT"), "8080", "committed config must be injected");
+    assert_eq!(get("API_TOKEN"), "", "plain secret value must be absent");
+    assert_eq!(get("GITHUB_TOKEN"), "", "managed name must stay unset");
+    assert_eq!(
+        get("GITHUB_CRED"),
+        "",
+        "brokered credential value must be absent"
+    );
+    assert_eq!(
+        get("ENDPOINT"),
+        vaultx_broker_client::default_endpoint(),
+        "broker endpoint metadata"
+    );
+    assert_eq!(get("AGENT"), "runner-bot");
+    assert_eq!(get("PROJECT"), "proj_local");
+    assert_eq!(get("ENVIRONMENT"), "development");
+
+    // The child saw a real capability token (64 hex chars, the minting
+    // grammar of FileSessionStore) even though it is unrecoverable from
+    // storage.
+    let token = get("SESSION");
+    assert_eq!(token.len(), 64, "token shape: {token}");
+    assert!(token.bytes().all(|b| b.is_ascii_hexdigit()), "{token}");
+
+    // INV-012 canary scan across everything vaultx itself rendered.
+    for canary in [
+        "canary-plain-hunter3",
+        "canary-parent-hunter5",
+        "canary-brokered-hunter4",
+        &token,
+    ] {
+        assert!(!out.contains(canary), "leak `{canary}` in output: {out}");
+    }
+
+    // No plaintext .env file was ever written; only .vaultx metadata
+    // (the session store) may have appeared.
+    for new_path in snapshot_tree(root).iter().filter(|p| !before.contains(p)) {
+        let shown = new_path.to_string_lossy();
+        assert!(
+            shown.starts_with(".vaultx/"),
+            "new file outside .vaultx: {shown}"
+        );
+        assert!(!shown.ends_with(".env"), "plaintext env written: {shown}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_strips_parent_managed_names_even_when_set_in_parent_env() {
+    let _runtime = isolated_xdg_runtime_dir();
+    let _serial = lock_env();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_agent_run_fixture(root);
+
+    // Pollute the parent process env with a value for a MANAGED name.
+    let _polluted = EnvVarGuard::set("GITHUB_TOKEN", "parent-attacker-value");
+
+    let dump_dir = tempfile::tempdir().unwrap();
+    let out_path = dump_dir.path().join("child-env.txt");
+    let script = format!(
+        "printf 'GITHUB_TOKEN=%s\\nPORT=%s\\n' \"$GITHUB_TOKEN\" \"$PORT\" > {}",
+        out_path.display()
+    );
+    let out = dispatch(&cli(root, agent_run("runner-bot", None, script)))
+        .unwrap_or_else(|err| panic!("agent run failed: {err}"));
+
+    let dumped = std::fs::read_to_string(&out_path).unwrap();
+    assert!(
+        !dumped.contains("parent-attacker-value"),
+        "parent value survived sanitization:\n{dumped}"
+    );
+    let token_line = dumped
+        .lines()
+        .find_map(|line| line.strip_prefix("GITHUB_TOKEN="))
+        .expect("GITHUB_TOKEN line present");
+    assert_eq!(token_line, "", "managed name must be unset in child");
+    assert_eq!(
+        dumped.lines().find_map(|l| l.strip_prefix("PORT=")),
+        Some("8080"),
+        "config injection unaffected by stripping"
+    );
+
+    // The attacker value and real secret never appear in CLI output.
+    assert!(
+        !out.contains("parent-attacker-value") && !out.contains("canary-parent-hunter5"),
+        "leak in output: {out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_propagates_child_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_agent_run_fixture(root);
+
+    let err = dispatch(&cli(
+        root,
+        agent_run("runner-bot", None, "exit 7".to_string()),
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CliError::ChildExit(7)), "{err:?}");
+    assert_eq!(err.exit_code(), 7);
+}
+
+#[test]
+fn run_unknown_agent_errors_cleanly() {
+    // Unknown agent fails before any session work, in an agentless repo.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+    let err = dispatch(&cli(
+        root,
+        agent_run("ghost-agent", None, "true".to_string()),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("unknown agent `ghost-agent`")),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 1);
+
+    // A disabled agent is refused too, before any session exists.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_agent_run_fixture(root);
+    dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Disable {
+                name: "runner-bot".into(),
+            },
+        },
+    ))
+    .unwrap();
+    let err = dispatch(&cli(
+        root,
+        agent_run("runner-bot", None, "true".to_string()),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("`runner-bot` is disabled")),
+        "{err:?}"
+    );
+
+    // Sessions were never minted along either refusal path.
+    let listed = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::SessionsList {
+                name: "runner-bot".into(),
+            },
+        },
+    ))
+    .unwrap();
+    assert!(listed.contains("no sessions"), "{listed}");
+}
+
+#[test]
+fn run_requires_command_after_double_dash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    let err = dispatch(&cli(
+        root,
+        Command::Agent {
+            command: AgentCommand::Run {
+                name: "runner-bot".into(),
+                env: None,
+                ttl_secs: None,
+                command: Vec::new(),
+            },
+        },
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&err, CliError::Usage(text) if text.contains("after `--`")),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 1);
+}

@@ -456,6 +456,34 @@ pub enum AgentCommand {
         /// Full session id to revoke.
         session_id: String,
     },
+    /// Run a command in a sanitized brokered environment for one agent
+    /// (plan §17).
+    ///
+    /// A scoped broker session is minted for the agent+environment and
+    /// handed to the child only through its environment: committed
+    /// config values plus `VAULTX_*` broker/identity metadata are
+    /// injected, while every managed variable name (secret, brokered,
+    /// dynamic) is stripped from the inherited parent environment. The
+    /// child's exit code becomes vaultx's own.
+    Run {
+        /// Agent bare name owning the broker session.
+        name: String,
+        /// Environment whose pinned commit supplies config values and
+        /// scopes the session (default: development).
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+        /// Optional time-to-live in seconds for the minted broker
+        /// session; expired sessions validate like revoked ones.
+        #[arg(long, value_name = "SECS")]
+        ttl_secs: Option<u64>,
+        /// Command to execute and its arguments, after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
 }
 
 /// `vaultx policy <subcommand>` (save/edit arrive later).
@@ -734,6 +762,14 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             AgentCommand::Revoke { session_id } => {
                 with_open(&cli.project, |s| cmd_agent_session_revoke(s, session_id))
             }
+            AgentCommand::Run {
+                name,
+                env,
+                ttl_secs,
+                command,
+            } => with_open(&cli.project, |s| {
+                cmd_agent_run(s, name, env.as_deref(), *ttl_secs, command)
+            }),
         },
 
         Command::Policy { command } => match command {
@@ -1653,6 +1689,126 @@ fn cmd_agent_session_revoke(
             other => CliError::Runtime(CoreError::Io(std::io::Error::other(other.to_string()))),
         })?;
     Ok(format!("revoked {id}"))
+}
+
+/// Project id every local service binds to; mirrors
+/// `broker_source::build_production_engine`.
+const LOCAL_PROJECT_ID: &str = "proj_local";
+
+/// Executes `COMMAND` for one agent inside a sanitized brokered
+/// environment (plan §17).
+///
+/// The child receives, through its environment only:
+///
+/// * committed plain config values of the environment's pinned commit
+///   (same resolution as [`cmd_run`]; secrets and brokered credentials
+///   are never materialized),
+/// * `VAULTX_BROKER_ENDPOINT`, `VAULTX_BROKER_SESSION` (the raw
+///   capability token), and agent/project/environment identity vars.
+///
+/// Every managed variable name in the pinned manifest is scrubbed from
+/// the inherited parent environment regardless of kind — by-construction
+/// via `env_clear`, so a polluted parent value can never survive. No
+/// plaintext `.env` file is written. The child's exit status maps onto
+/// dispatch exactly like [`cmd_run`] does.
+fn cmd_agent_run(
+    services: &VaultxServices,
+    name: &str,
+    env: Option<&str>,
+    ttl_secs: Option<u64>,
+    command: &[String],
+) -> Result<String, CliError> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| CliError::Usage("agent run requires a command after `--`".into()))?;
+
+    // Refuse unknown or disabled agents before minting any session
+    // material (same gate as `agent session create`).
+    let summary = services
+        .agents()
+        .list_agents()?
+        .into_iter()
+        .find(|agent| agent.name == name)
+        .ok_or_else(|| CliError::Usage(format!("unknown agent `{name}`")))?;
+    if !summary.enabled {
+        return Err(CliError::Usage(format!(
+            "agent `{name}` is disabled; enable it before creating sessions"
+        )));
+    }
+    let agent_id = services.agents().inspect(name)?;
+
+    let bare_env = env.unwrap_or(DEFAULT_SECRET_ENV);
+    let pinned = services
+        .environments()
+        .list_environments()?
+        .into_iter()
+        .find(|candidate| candidate.name == bare_env)
+        .ok_or_else(|| CliError::Runtime(CoreError::EnvironmentNotFound(bare_env.to_owned())))?;
+    let Some(commit) = pinned.commit else {
+        return Err(CliError::Usage(format!(
+            "environment `{bare_env}` has no pinned commit"
+        )));
+    };
+    let config_values = services.history().committed_config_values(&commit)?;
+    // Every managed name in the pinned manifest is scrubbed from the
+    // inherited environment, whatever kind it carries.
+    let managed_names: std::collections::HashSet<String> = services
+        .history()
+        .show(&commit)?
+        .entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+
+    // Scoped session through the same store as `agent session create`.
+    let (_, environment_id) = environment_id_for(env)?;
+    let (_session_id, raw_token) = open_session_store(services)?
+        .create_expiring(&agent_id.name, &environment_id, ttl_secs)
+        .map_err(map_session_error)?;
+
+    // Child environment assembled fully in memory; nothing touches disk.
+    let mut child_env: std::collections::HashMap<std::ffi::OsString, std::ffi::OsString> =
+        std::env::vars_os()
+            .filter(|(key, _)| !managed_names.contains(key.to_string_lossy().as_ref()))
+            .collect();
+    for (name, value) in config_values {
+        child_env.insert(name.into(), value.into());
+    }
+    child_env.insert(
+        "VAULTX_BROKER_ENDPOINT".into(),
+        vaultx_broker_client::default_endpoint().into(),
+    );
+    child_env.insert("VAULTX_BROKER_SESSION".into(), raw_token.into());
+    child_env.insert("VAULTX_AGENT".into(), name.into());
+    child_env.insert("VAULTX_PROJECT".into(), LOCAL_PROJECT_ID.into());
+    child_env.insert("VAULTX_ENVIRONMENT".into(), bare_env.into());
+
+    // Exact-by-construction inheritance: env_clear + insert so no
+    // managed name from the parent can leak through the OS default.
+    let mut child = std::process::Command::new(program);
+    child.args(args).env_clear();
+    for (key, value) in &child_env {
+        child.env(key, value);
+    }
+    let status = child.status().map_err(|err| {
+        CliError::Runtime(CoreError::Io(std::io::Error::other(format!(
+            "cannot execute {program}: {err}"
+        ))))
+    })?;
+    match status.code() {
+        Some(0) => Ok(String::new()),
+        Some(code) => Err(CliError::ChildExit(code)),
+        // Killed by a signal (unix): report the conventional 128+N code.
+        #[cfg(unix)]
+        None => {
+            use std::os::unix::process::ExitStatusExt as _;
+            let signal = status.signal().unwrap_or(0);
+            Err(CliError::ChildExit(128 + signal))
+        }
+        // No exit-code concept on this platform; fall back to failure.
+        #[cfg(not(unix))]
+        None => Err(CliError::ChildExit(1)),
+    }
 }
 
 /// Runs `future` to completion on a private multi-thread runtime. The
