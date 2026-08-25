@@ -100,6 +100,11 @@ pub trait ControlPlaneStore: Send + Sync {
     /// Devices registered under `owner`.
     fn list_devices_for_user(&self, owner: &str) -> StoreResult<Vec<DeviceRecord>>;
 
+    /// Devices registered by any member of `workspace`, sorted by public
+    /// key. Backs serving trusted signature-verification key material.
+    fn list_workspace_device_keys(&self, workspace: &WorkspaceId)
+        -> StoreResult<Vec<DeviceRecord>>;
+
     // ---- objects ----
 
     /// Stores an object entry after hash validation by the caller;
@@ -398,6 +403,25 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .filter(|d| d.owner == owner)
             .cloned()
             .collect())
+    }
+
+    fn list_workspace_device_keys(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> StoreResult<Vec<DeviceRecord>> {
+        let state = self.lock();
+        let mut devices: Vec<DeviceRecord> = state
+            .devices
+            .values()
+            .filter(|d| {
+                state
+                    .memberships
+                    .contains(&(workspace.as_str().to_owned(), d.owner.clone()))
+            })
+            .cloned()
+            .collect();
+        devices.sort_by(|a, b| a.public_key_hex.cmp(&b.public_key_hex));
+        Ok(devices)
     }
 
     fn put_object(&self, project: &ProjectId, entry: &ObjectEntryWire) -> StoreResult<bool> {

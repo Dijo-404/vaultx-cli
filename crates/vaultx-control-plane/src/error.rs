@@ -57,6 +57,22 @@ impl ControlPlaneError {
             Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    /// Stable machine-readable code for the error envelope; conflict
+    /// responses keep their own structured detail bodies.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::BadRequest(_) => "bad_request",
+            Self::SignatureInvalid => "signature_verification_failed",
+            Self::HashMismatch => "hash_mismatch",
+            Self::Conflict(_) => "ref_conflict",
+            Self::Storage(_) => "storage_failure",
+        }
+    }
 }
 
 impl IntoResponse for ControlPlaneError {
@@ -67,7 +83,9 @@ impl IntoResponse for ControlPlaneError {
             Self::Conflict(detail) => (status, Json(detail)).into_response(),
             other => (
                 status,
-                Json(serde_json::json!({ "error": other.to_string() })),
+                Json(serde_json::json!({
+                    "error": { "code": other.code(), "message": other.to_string() }
+                })),
             )
                 .into_response(),
         }

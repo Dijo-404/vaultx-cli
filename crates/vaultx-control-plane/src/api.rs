@@ -24,9 +24,9 @@ use crate::model::{
 };
 use crate::protocol::{
     device_attestation_message, AgentView, AuditEventView, BatchObjectsRequest,
-    BatchObjectsResponse, CreateAgentRequest, CreatedAgentResponse, ObjectEntryWire, PutRefRequest,
-    PutRefResponse, QueryMissingRequest, QueryMissingResponse, SessionRequest, SessionResponse,
-    WorkspaceView,
+    BatchObjectsResponse, CreateAgentRequest, CreatedAgentResponse, DeviceKeyFingerprint,
+    ObjectEntryWire, PutRefRequest, PutRefResponse, QueryMissingRequest, QueryMissingResponse,
+    SessionRequest, SessionResponse, WorkspaceView,
 };
 use crate::store::{AgentSessionContext, ControlPlaneStore};
 
@@ -266,7 +266,7 @@ async fn query_missing(
     if body.project != project_id {
         return Err(ControlPlaneError::BadRequest("project mismatch"));
     }
-    require_project(&*state.store, &principal, &project_id)?;
+    let project = require_project(&*state.store, &principal, &project_id)?;
 
     verify_device_identity(&body.device, &project_id)?;
     // First-seen device keys register under the presenting principal so
@@ -276,6 +276,17 @@ async fn query_missing(
         owner: principal.subject.clone(),
         label: None,
     })?;
+
+    let mut server_key_fingerprints = Vec::new();
+    for device in state.store.list_workspace_device_keys(&project.workspace)? {
+        let key_bytes = device.validate_key()?;
+        let mut hasher = Sha256::new();
+        hasher.update(key_bytes);
+        server_key_fingerprints.push(DeviceKeyFingerprint {
+            fingerprint: hex::encode(hasher.finalize()),
+            public_key_hex: device.public_key_hex,
+        });
+    }
 
     let known: std::collections::BTreeSet<&str> =
         body.known_object_ids.iter().map(ObjectId::as_str).collect();
@@ -323,7 +334,7 @@ async fn query_missing(
         remote_object_ids: remote_ids,
         policies: state.store.list_policies(&project_id)?,
         environments: state.store.list_environments(&project_id)?,
-        server_key_fingerprints: Vec::new(),
+        server_key_fingerprints,
     }))
 }
 
@@ -343,6 +354,15 @@ fn verify_device_identity(
     let message = device_attestation_message(project_id, &device.public_key_hex);
     verify_signature(&public, &message, &SignatureBytes(sig_bytes))
         .map_err(|_| ControlPlaneError::SignatureInvalid)
+}
+
+/// 409 body for a lost ref CAS race, carrying the server-side tip when
+/// one exists so the loser can reconcile against it.
+fn ref_conflict(current: Option<&RefState>) -> ControlPlaneError {
+    ControlPlaneError::Conflict(serde_json::json!({
+        "error": "ref_conflict",
+        "current_commit": current.map(|c| c.commit.clone()),
+    }))
 }
 
 async fn list_refs(
@@ -371,10 +391,12 @@ async fn put_ref(
         .store
         .get_ref_state(&project_id, body.namespace, &ref_name)?;
 
-    // Protected environment refs reject unauthorized updates outright.
+    // Protected environment refs reject unauthorized creation or update:
+    // the protection registry is consulted by name regardless of whether
+    // the ref exists yet, so a first write cannot bypass authorization.
     if body.namespace == crate::model::RefNamespace::Environments
         && state.store.environment_protection(&project_id, &ref_name)?
-        && current.as_ref().is_some_and(|c| c.commit != body.commit)
+        && current.as_ref().is_none_or(|c| c.commit != body.commit)
         && !body.authorized
     {
         return Err(ControlPlaneError::Conflict(serde_json::json!({
@@ -385,17 +407,18 @@ async fn put_ref(
 
     // Optimistic concurrency: base_commit mismatch means another writer
     // moved the ref first — surface the disagreement, never auto-pick.
-    if let Some(base) = &body.base_commit {
-        let matches_base = match &current {
-            None => false,
-            Some(existing) => &existing.commit == base,
-        };
-        if !matches_base {
-            return Err(ControlPlaneError::Conflict(serde_json::json!({
-                "error": "ref_conflict",
-                "current_commit": current.map(|c| c.commit),
-            })));
+    // A `None` base means "ref must not exist", so an existing tip is a
+    // lost create race and conflicts with the current value attached.
+    match (&body.base_commit, &current) {
+        (Some(base), Some(existing)) => {
+            if existing.commit != *base {
+                return Err(ref_conflict(current.as_ref()));
+            }
         }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(ref_conflict(current.as_ref()));
+        }
+        (None, None) => {}
     }
 
     let next = RefState {
@@ -664,6 +687,22 @@ mod tests {
         }
     }
 
+    /// Builds a valid signed query-missing request body for `pair`.
+    fn device_query(project: &ProjectId, pair: &SigningKeyPair) -> String {
+        let public_hex = hex::encode(pair.verifying_public_key().to_bytes());
+        let signature = pair.sign(&device_attestation_message(project, &public_hex));
+        serde_json::json!({
+            "known_object_ids": [],
+            "known_refs": [],
+            "project": project,
+            "device": {
+                "public_key_hex": public_hex,
+                "signature_hex": hex::encode(signature.0)
+            }
+        })
+        .to_string()
+    }
+
     #[tokio::test]
     async fn wrong_password_is_unauthorized() {
         let fx = fixture();
@@ -847,10 +886,9 @@ mod tests {
         let fx = fixture();
         let pair = SigningKeyPair::generate();
         let public_hex = hex::encode(pair.verifying_public_key().to_bytes());
-        let message = device_attestation_message(&fx.project, &public_hex);
         let forged = pair.sign(b"not the attestation message");
         let uri = format!("/projects/{}/objects/query-missing", fx.project);
-        let (status, _) = call(
+        let (status, value) = call(
             &fx.app,
             "POST",
             &uri,
@@ -870,7 +908,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let _ = message;
+        assert_eq!(
+            value["error"]["code"],
+            serde_json::json!("signature_verification_failed")
+        );
     }
 
     #[tokio::test]
@@ -930,8 +971,91 @@ mod tests {
             2
         );
         assert_eq!(value["remote_refs"].as_array().expect("refs").len(), 0);
-        assert!(value["server_key_fingerprints"].is_array());
+        let keys = value["server_key_fingerprints"]
+            .as_array()
+            .expect("device keys served");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0]["public_key_hex"],
+            serde_json::json!(hex::encode(pair.verifying_public_key().to_bytes()))
+        );
+        let mut key_hasher = Sha256::new();
+        let served_key = keys[0]["public_key_hex"].as_str().expect("key hex");
+        key_hasher.update(hex::decode(served_key).expect("hex"));
+        assert_eq!(
+            keys[0]["fingerprint"],
+            serde_json::json!(hex::encode(key_hasher.finalize()))
+        );
         assert_eq!(fx.store.list_devices_for_user("alice").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_missing_serves_all_workspace_member_device_keys() {
+        let fx = fixture();
+        let pair_a = SigningKeyPair::generate();
+        let pair_b = SigningKeyPair::generate();
+
+        // Alice registers her device through the sync flow.
+        let uri = format!("/projects/{}/objects/query-missing", fx.project);
+        let (status, _) = call(
+            &fx.app,
+            "POST",
+            &uri,
+            Some(ALICE_TOKEN),
+            Some(device_query(&fx.project, &pair_a)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A second workspace member registers theirs.
+        fx.store
+            .add_workspace_member(&WorkspaceMembership {
+                workspace: vaultx_types::WorkspaceId::parse("ws_api_test").expect("valid"),
+                user: "bob".to_owned(),
+                role: crate::model::ROLE_MEMBER.to_owned(),
+            })
+            .unwrap();
+        let bob_token = "vxs_bob_session";
+        fx.store
+            .issue_session(
+                bob_token,
+                &Principal {
+                    subject: "bob".to_owned(),
+                    class: crate::auth::TokenClass::ControlSession,
+                },
+            )
+            .unwrap();
+        let (status, _) = call(
+            &fx.app,
+            "POST",
+            &uri,
+            Some(bob_token),
+            Some(device_query(&fx.project, &pair_b)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Both members' keys are served, deterministically ordered.
+        let (status, value) = call(
+            &fx.app,
+            "POST",
+            &uri,
+            Some(ALICE_TOKEN),
+            Some(device_query(&fx.project, &pair_a)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let keys = value["server_key_fingerprints"].as_array().expect("keys");
+        let mut expected: Vec<String> = vec![&pair_a, &pair_b]
+            .into_iter()
+            .map(|p| hex::encode(p.verifying_public_key().to_bytes()))
+            .collect();
+        expected.sort();
+        let served: Vec<String> = keys
+            .iter()
+            .map(|k| k["public_key_hex"].as_str().expect("key").to_owned())
+            .collect();
+        assert_eq!(served, expected);
     }
 
     #[tokio::test]
@@ -1043,6 +1167,119 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn protected_environment_creation_requires_authorization() {
+        let fx = fixture();
+        // Protection is registered by name only; the ref does not exist yet.
+        fx.store
+            .set_environment_protection(&fx.project, "staging", true)
+            .unwrap();
+        let first = vaultx_types::CommitId::parse("cmt_stage_first").expect("valid");
+        let uri = format!("/projects/{}/refs/staging", fx.project);
+
+        // A first write creating a protected-named env ref still demands
+        // authorization — creation cannot bypass the registry.
+        let unauthorized = PutRefRequest {
+            namespace: RefNamespace::Environments,
+            commit: first.clone(),
+            base_commit: None,
+            authorized: false,
+        };
+        let (status, value) = call(
+            &fx.app,
+            "PUT",
+            &uri,
+            Some(ALICE_TOKEN),
+            Some(serde_json::to_string(&unauthorized).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "protected_environment_ref");
+        assert_eq!(
+            fx.store
+                .get_ref_state(&fx.project, RefNamespace::Environments, "staging")
+                .unwrap(),
+            None,
+            "unauthorized creation must not land"
+        );
+
+        let authorized = PutRefRequest {
+            namespace: RefNamespace::Environments,
+            commit: first,
+            base_commit: None,
+            authorized: true,
+        };
+        let (status, _) = call(
+            &fx.app,
+            "PUT",
+            &uri,
+            Some(ALICE_TOKEN),
+            Some(serde_json::to_string(&authorized).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(fx
+            .store
+            .get_ref_state(&fx.project, RefNamespace::Environments, "staging")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn absent_ref_base_conflicts_once_created() {
+        let fx = fixture();
+        let winner = vaultx_types::CommitId::parse("cmt_race_win").expect("valid");
+        let loser = vaultx_types::CommitId::parse("cmt_race_lose").expect("valid");
+        let uri = format!("/projects/{}/refs/main", fx.project);
+
+        // The first publisher claiming an absent ref wins.
+        let create = PutRefRequest {
+            namespace: RefNamespace::Heads,
+            commit: winner.clone(),
+            base_commit: None,
+            authorized: false,
+        };
+        let (status, _) = call(
+            &fx.app,
+            "PUT",
+            &uri,
+            Some(ALICE_TOKEN),
+            Some(serde_json::to_string(&create).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A concurrent publisher also claiming "absent" loses with the
+        // winning tip attached for reconciliation.
+        let racing = PutRefRequest {
+            namespace: RefNamespace::Heads,
+            commit: loser.clone(),
+            base_commit: None,
+            authorized: false,
+        };
+        let (status, value) = call(
+            &fx.app,
+            "PUT",
+            &uri,
+            Some(ALICE_TOKEN),
+            Some(serde_json::to_string(&racing).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["error"], "ref_conflict");
+        assert_eq!(
+            value["current_commit"],
+            serde_json::json!(winner.to_string())
+        );
+        assert_eq!(
+            fx.store
+                .get_ref_state(&fx.project, RefNamespace::Heads, "main")
+                .unwrap()
+                .map(|r| r.commit),
+            Some(winner)
+        );
     }
 
     #[tokio::test]

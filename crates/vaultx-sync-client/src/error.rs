@@ -35,6 +35,14 @@ pub enum SyncError {
         object: String,
     },
 
+    /// A downloaded commit carried a signature that verified against none
+    /// of the trusted device keys; nothing was applied locally.
+    #[error("commit signature verification failed for {object}")]
+    SignatureVerificationFailed {
+        /// Commit object id whose signature failed verification.
+        object: String,
+    },
+
     /// The control plane rejected the signed device identity.
     #[error("device signature rejected")]
     SignatureRejected,

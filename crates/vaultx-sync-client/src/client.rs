@@ -19,7 +19,9 @@ use vaultx_control_plane::protocol::{
     BatchObjectsRequest, BatchObjectsResponse, ObjectEntryWire, PutRefRequest, QueryMissingRequest,
     QueryMissingResponse,
 };
-use vaultx_repository::object::{hash_canonical, ObjectEnvelope};
+use vaultx_crypto::signature::{verify as verify_signature, VerifyingPublicKey};
+use vaultx_repository::object::{hash_canonical, ObjectEnvelope, ObjectType};
+use vaultx_repository::Commit;
 use vaultx_types::{CommitId, ObjectId, ProjectId};
 
 use crate::device::DeviceKeySource;
@@ -126,8 +128,13 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
     }
 
     /// Verifies every returned object independently (canonical re-encode +
-    /// SHA-256 + id agreement); applies all only after every check passed.
+    /// SHA-256 + id agreement), plus commit signatures against the device
+    /// keys served by the control plane; applies all only after every
+    /// check passed. Unsigned content is accepted for back-compat with
+    /// local-only repositories; any present signature that fails
+    /// verification is fatal and aborts before anything is applied.
     async fn download_and_apply(&self, response: &QueryMissingResponse) -> SyncResultOf<usize> {
+        let trusted_keys = trusted_device_keys(&response.server_key_fingerprints);
         let mut verified = Vec::with_capacity(response.missing_objects.len());
         for entry in &response.missing_objects {
             let envelope: ObjectEnvelope = serde_json::from_str(&entry.envelope_json)
@@ -138,6 +145,9 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
                 return Err(SyncError::HashMismatch {
                     object: entry.id.to_string(),
                 });
+            }
+            if envelope.object_type == ObjectType::Commit {
+                verify_commit_signature(entry.id.as_str(), &envelope, &trusted_keys)?;
             }
             verified.push(envelope);
         }
@@ -269,7 +279,11 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
 
     /// Publishes local refs that differ remotely, using optimistic
     /// concurrency on the observed base; disagreements surface as
-    /// conflicts rather than being forced or dropped.
+    /// conflicts rather than being forced or dropped. An absent remote is
+    /// published with `base_commit: None`, and the server treats that as
+    /// "ref must not exist" — so a concurrent first publisher loses the
+    /// race cleanly with a 409 carrying the winning tip instead of
+    /// clobbering it.
     async fn publish_local_refs(
         &self,
         project: &ProjectId,
@@ -381,14 +395,69 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> SyncService for ControlPlaneSy
     }
 }
 
-/// Maps a non-2xx control-plane response to a client error.
+/// Maps a non-2xx control-plane response to a client error. Only
+/// structured `{"error":{"code":…}}` bodies are interpreted; anything
+/// else falls back to the generic status-only variant so a hostile or
+/// malformed body can never inject semantics.
 fn map_rejection(response: &TransportResponse) -> SyncError {
-    if response.status == 401 && response.body.contains("signature verification failed") {
-        return SyncError::SignatureRejected;
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        #[serde(rename = "error")]
+        detail: ErrorDetail,
+    }
+    #[derive(serde::Deserialize)]
+    struct ErrorDetail {
+        code: String,
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<ErrorBody>(&response.body) {
+        if response.status == 401 && parsed.detail.code == "signature_verification_failed" {
+            return SyncError::SignatureRejected;
+        }
     }
     SyncError::Api {
         status: response.status,
     }
+}
+
+/// Decodes the trusted device public keys offered by the server, skipping
+/// entries that do not decode (the server validated them at registration).
+fn trusted_device_keys(
+    fingerprints: &[vaultx_control_plane::protocol::DeviceKeyFingerprint],
+) -> Vec<VerifyingPublicKey> {
+    fingerprints
+        .iter()
+        .filter_map(|entry| {
+            let bytes: [u8; 32] = hex::decode(&entry.public_key_hex).ok()?.try_into().ok()?;
+            VerifyingPublicKey::from_bytes(&bytes).ok()
+        })
+        .collect()
+}
+
+/// Verifies a commit envelope's embedded signature against the trusted
+/// device keys. An empty signature means unsigned and is accepted; any
+/// non-empty signature must verify against at least one trusted key.
+fn verify_commit_signature(
+    object_id: &str,
+    envelope: &ObjectEnvelope,
+    trusted_keys: &[VerifyingPublicKey],
+) -> SyncResultOf<()> {
+    let commit: Commit = envelope
+        .decode_payload()
+        .map_err(|_| SyncError::Protocol("commit decode"))?;
+    if commit.signature.0.is_empty() {
+        return Ok(());
+    }
+    let payload = commit.sign_payload()?;
+    let verified = trusted_keys
+        .iter()
+        .any(|key| verify_signature(key, &payload, &commit.signature).is_ok());
+    if !verified {
+        return Err(SyncError::SignatureVerificationFailed {
+            object: object_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 impl SyncError {
@@ -552,15 +621,133 @@ mod tests {
         }
     }
 
+    /// Corrupts one hex digit inside a downloaded commit's signature so
+    /// the envelope hash still matches but signature verification fails.
+    struct TamperCommitSignature<T: ControlPlaneTransport> {
+        inner: T,
+    }
+
+    impl<T: ControlPlaneTransport> ControlPlaneTransport for TamperCommitSignature<T> {
+        async fn send(&self, request: TransportRequest) -> SyncResultOf<TransportResponse> {
+            let is_query = request.path.ends_with("/objects/query-missing");
+            let response = self.inner.send(request).await?;
+            if !is_query {
+                return Ok(response);
+            }
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&response.body) else {
+                return Ok(response);
+            };
+            let Some(entries) = value
+                .get_mut("missing_objects")
+                .and_then(|e| e.as_array_mut())
+            else {
+                return Ok(response);
+            };
+            const NEEDLE: &str = "\"signature\":[";
+            for entry in entries {
+                let Some(raw) = entry.get("envelope_json").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Ok(envelope) = serde_json::from_str::<ObjectEnvelope>(raw) else {
+                    continue;
+                };
+                if envelope.object_type != ObjectType::Commit {
+                    continue;
+                }
+                let mut payload =
+                    String::from_utf8(envelope.payload).expect("commit payload is utf8 JSON");
+                let Some(start) = payload.find(NEEDLE).map(|p| p + NEEDLE.len()) else {
+                    continue;
+                };
+                // SignatureBytes renders as a JSON byte array; corrupting
+                // the last digit of its first element keeps both the JSON
+                // and the commit decodable while invalidating the
+                // signature.
+                let Some(rel) = payload[start..]
+                    .bytes()
+                    .position(|b| !b.is_ascii_digit())
+                    .filter(|&n| n > 0)
+                else {
+                    continue;
+                };
+                let pos = start + rel - 1;
+                let flipped = if payload.as_bytes()[pos] == b'0' {
+                    '9'
+                } else {
+                    '0'
+                };
+                payload.replace_range(pos..pos + 1, &flipped.to_string());
+                let tampered = ObjectEnvelope::new(ObjectType::Commit, payload.into_bytes());
+                let canonical = tampered.canonical_bytes().expect("canonical");
+                let digest = hex::encode(hash_canonical(&canonical));
+                entry["id"] = serde_json::Value::String(format!("obj_{digest}"));
+                entry["content_hash"] = serde_json::Value::String(digest);
+                entry["envelope_json"] =
+                    serde_json::Value::String(String::from_utf8(canonical).expect("utf8"));
+                break;
+            }
+            Ok(TransportResponse {
+                status: response.status,
+                body: value.to_string(),
+            })
+        }
+    }
+
+    /// Plants a rival head ref into the store when it observes the first
+    /// publish attempt, simulating another writer winning a create race.
+    struct RaceSeeder<T: ControlPlaneTransport> {
+        inner: T,
+        store: Arc<InMemoryControlPlaneStore>,
+        project: ProjectId,
+        rival_tip: CommitId,
+        seeded: std::sync::atomic::AtomicBool,
+    }
+
+    impl<T: ControlPlaneTransport> ControlPlaneTransport for RaceSeeder<T> {
+        async fn send(&self, request: TransportRequest) -> SyncResultOf<TransportResponse> {
+            let is_publish = request.method == "PUT"
+                && request.path == format!("/projects/{}/refs/main", self.project);
+            if is_publish && !self.seeded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.store
+                    .set_ref_state(
+                        &self.project,
+                        &vaultx_control_plane::model::RefState {
+                            namespace: RefNamespace::Heads,
+                            name: "main".to_owned(),
+                            commit: self.rival_tip.clone(),
+                            protected: false,
+                        },
+                    )
+                    .expect("seed rival tip");
+            }
+            self.inner.send(request).await
+        }
+    }
+
     /// Test fixture: seeded control plane plus two local repositories.
+    ///
+    /// Each side's commit-signing key is derived from the same keystore
+    /// backing its sync-client [`DeviceKeySource`], mirroring production
+    /// where one device identity both signs commits and attests sync.
     struct World {
         store: Arc<InMemoryControlPlaneStore>,
         app: axum::Router,
         project: ProjectId,
         alice_dir: tempfile::TempDir,
         bob_dir: tempfile::TempDir,
+        keys_a: Arc<dyn vaultx_keyring::WrappingKeyProvider>,
+        keys_b: Arc<dyn vaultx_keyring::WrappingKeyProvider>,
         pair_a: SigningKeyPair,
         pair_b: SigningKeyPair,
+    }
+
+    /// Derives a signing key from the device identity persisted in
+    /// `provider`, so commits and sync attestations share one identity.
+    fn device_pair(provider: &Arc<dyn vaultx_keyring::WrappingKeyProvider>) -> SigningKeyPair {
+        let root = provider.obtain().expect("root key");
+        let mut seed = [0u8; 32];
+        root.expose(|s| seed.copy_from_slice(s));
+        SigningKeyPair::from_seed(&seed).expect("seed valid")
     }
 
     impl World {
@@ -603,6 +790,10 @@ mod tests {
             let bob_dir = tempfile::tempdir().expect("tempdir");
             Repository::init(alice_dir.path()).expect("init A");
             Repository::init(bob_dir.path()).expect("init B");
+            let keys_a: Arc<dyn vaultx_keyring::WrappingKeyProvider> =
+                Arc::new(InMemoryKeyStore::new());
+            let keys_b: Arc<dyn vaultx_keyring::WrappingKeyProvider> =
+                Arc::new(InMemoryKeyStore::new());
             Self {
                 app: vaultx_control_plane::api::router(ControlPlaneState {
                     store: Arc::clone(&store) as Arc<dyn vaultx_control_plane::ControlPlaneStore>,
@@ -611,8 +802,10 @@ mod tests {
                 project,
                 alice_dir,
                 bob_dir,
-                pair_a: SigningKeyPair::generate(),
-                pair_b: SigningKeyPair::generate(),
+                pair_a: device_pair(&keys_a),
+                pair_b: device_pair(&keys_b),
+                keys_a,
+                keys_b,
             }
         }
 
@@ -625,7 +818,7 @@ mod tests {
             ControlPlaneSyncClient::new(
                 self.transport(),
                 FsWorkspace::open(repo.root()).expect("open"),
-                DeviceKeySource::new(Arc::new(InMemoryKeyStore::new())),
+                DeviceKeySource::new(Arc::clone(&self.keys_a)),
             )
         }
 
@@ -634,7 +827,7 @@ mod tests {
             ControlPlaneSyncClient::new(
                 self.transport(),
                 FsWorkspace::open(repo.root()).expect("open"),
-                DeviceKeySource::new(Arc::new(InMemoryKeyStore::new())),
+                DeviceKeySource::new(Arc::clone(&self.keys_b)),
             )
         }
 
@@ -1024,5 +1217,176 @@ mod tests {
         );
         let result = client.pull(project).await.expect("workload pull");
         assert!(result.is_converged());
+    }
+
+    #[tokio::test]
+    async fn tampered_commit_signature_aborts_pull_without_applying() {
+        let world = World::new();
+        let project = world.project.clone();
+        World::commit(&world.open_a(), &world.pair_a, "API_KEY", "v1");
+        world
+            .client_a()
+            .push(project.clone())
+            .await
+            .expect("seed push");
+
+        let repo_b = Repository::open(world.bob_dir.path()).expect("open B");
+        let client = ControlPlaneSyncClient::new(
+            TamperCommitSignature {
+                inner: world.transport(),
+            },
+            FsWorkspace::open(repo_b.root()).expect("open"),
+            DeviceKeySource::new(Arc::new(InMemoryKeyStore::new())),
+        );
+
+        let err = client.pull(project).await.expect_err("must abort");
+        assert!(
+            matches!(err, SyncError::SignatureVerificationFailed { .. }),
+            "expected SignatureVerificationFailed, got {err}"
+        );
+        assert!(
+            client
+                .workspace()
+                .known_object_ids()
+                .expect("ids")
+                .is_empty(),
+            "a failed signature must abort before anything is applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_signatures_verify_against_served_device_keys() {
+        let world = World::new();
+        let project = world.project.clone();
+        World::commit(&world.open_a(), &world.pair_a, "API_KEY", "v1");
+        world
+            .client_a()
+            .push(project.clone())
+            .await
+            .expect("seed push");
+
+        // The pulled commit is signed by A's device key; verification only
+        // passes because the server served that key as trusted material.
+        let pulled = world.client_b().pull(project).await.expect("pull");
+        assert!(pulled.is_converged());
+        assert_eq!(pulled.downloaded, 3);
+    }
+
+    #[tokio::test]
+    async fn unsigned_commit_objects_still_pull() {
+        let world = World::new();
+        let project = world.project.clone();
+        World::commit(&world.open_a(), &world.pair_a, "API_KEY", "v1");
+        world
+            .client_a()
+            .push(project.clone())
+            .await
+            .expect("seed push");
+
+        // Inject a legacy unsigned commit object directly into the remote.
+        let unsigned = Commit::new(
+            Vec::new(),
+            ObjectId::parse(&format!("obj_{}", "cd".repeat(32))).expect("valid shape"),
+            IdentityRef::parse("user:legacy").expect("valid"),
+            "unsigned legacy commit",
+        );
+        let envelope = ObjectEnvelope::new(
+            ObjectType::Commit,
+            serde_json::to_vec(&unsigned).expect("enc"),
+        );
+        let canonical = envelope.canonical_bytes().expect("canonical");
+        let digest = hex::encode(hash_canonical(&canonical));
+        let response = world
+            .transport()
+            .send(TransportRequest::post(
+                format!("/projects/{project}/objects/batch"),
+                serde_json::json!({"entries":[ObjectEntryWire {
+                    id: ObjectId::parse(&format!("obj_{digest}")).expect("hex digest"),
+                    content_hash: digest,
+                    envelope_json: String::from_utf8(canonical).expect("utf8"),
+                }]})
+                .to_string(),
+            ))
+            .await
+            .expect("upload");
+        assert_eq!(response.status, 200);
+
+        let pulled = world.client_b().pull(project).await.expect("pull");
+        assert!(pulled.is_converged(), "unsigned content is accepted");
+        assert_eq!(pulled.downloaded, 4);
+    }
+
+    #[tokio::test]
+    async fn lost_create_race_surfaces_conflict_with_server_tip() {
+        let world = World::new();
+        let project = world.project.clone();
+        let local_tip = World::commit(&world.open_a(), &world.pair_a, "A_VAR", "a");
+        let rival_tip = CommitId::parse("cmt_rival_winner").expect("valid");
+
+        let keys = DeviceKeySource::new(Arc::new(InMemoryKeyStore::new()));
+        let repo = Repository::open(world.alice_dir.path()).expect("open A");
+        let client = ControlPlaneSyncClient::new(
+            RaceSeeder {
+                inner: world.transport(),
+                store: Arc::clone(&world.store),
+                project: project.clone(),
+                rival_tip: rival_tip.clone(),
+                seeded: std::sync::atomic::AtomicBool::new(false),
+            },
+            FsWorkspace::open(repo.root()).expect("open"),
+            keys,
+        );
+
+        // Both sides claim the ref is absent; the server-side create CAS
+        // makes one side lose with the winning tip surfaced.
+        let result = client.push(project.clone()).await.expect("push");
+        assert!(!result.is_converged(), "the lost race must be surfaced");
+        let conflict = &result.conflicts[0];
+        assert_eq!(conflict.namespace, RefNamespace::Heads);
+        assert_eq!(conflict.name, "main");
+        assert_eq!(conflict.local_commit, Some(local_tip));
+        assert_eq!(conflict.remote_commit, Some(rival_tip.clone()));
+        assert_eq!(conflict.reason, ConflictReason::Diverged);
+
+        // The winner was never clobbered by the loser's write.
+        assert_eq!(
+            world
+                .store
+                .get_ref_state(&project, RefNamespace::Heads, "main")
+                .expect("state")
+                .map(|r| r.commit),
+            Some(rival_tip)
+        );
+    }
+
+    #[test]
+    fn rejection_maps_structured_signature_code_only() {
+        let structured = TransportResponse {
+            status: 401,
+            body: r#"{"error":{"code":"signature_verification_failed","message":"signature verification failed"}}"#.to_owned(),
+        };
+        assert!(matches!(
+            map_rejection(&structured),
+            SyncError::SignatureRejected
+        ));
+
+        let other_code = TransportResponse {
+            status: 422,
+            body: r#"{"error":{"code":"hash_mismatch","message":"content hash mismatch"}}"#
+                .to_owned(),
+        };
+        assert!(matches!(
+            map_rejection(&other_code),
+            SyncError::Api { status: 422 }
+        ));
+
+        let unstructured = TransportResponse {
+            status: 401,
+            body: "<html>gateway error</html>".to_owned(),
+        };
+        assert!(matches!(
+            map_rejection(&unstructured),
+            SyncError::Api { status: 401 }
+        ));
     }
 }

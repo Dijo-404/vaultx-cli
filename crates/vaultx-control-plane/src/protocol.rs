@@ -16,6 +16,17 @@ pub struct EnvironmentMetadata {
     pub protected: bool,
 }
 
+/// A registered device public key with its fingerprint, served so sync
+/// clients can independently verify commit signatures against trusted
+/// team device identities.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceKeyFingerprint {
+    /// Raw 32-byte Ed25519 public key, lowercase hex.
+    pub public_key_hex: String,
+    /// Lowercase-hex SHA-256 over the raw key bytes of `public_key_hex`.
+    pub fingerprint: String,
+}
+
 /// Session creation request (plan §29): either a direct login or a
 /// federated/OIDC identity exchange for CI/workload contexts.
 #[derive(Debug, Deserialize)]
@@ -137,9 +148,10 @@ pub struct QueryMissingResponse {
     pub policies: Vec<PolicyDocument>,
     /// Environment protection metadata.
     pub environments: Vec<EnvironmentMetadata>,
-    /// Server signing-key fingerprints (public key material for future
-    /// server-response verification).
-    pub server_key_fingerprints: Vec<String>,
+    /// Registered device public keys of the project's principals: raw
+    /// Ed25519 bytes plus fingerprint, letting clients verify commit
+    /// signatures independently.
+    pub server_key_fingerprints: Vec<DeviceKeyFingerprint>,
 }
 
 /// Request body of `PUT /projects/{id}/refs/{name}`.
