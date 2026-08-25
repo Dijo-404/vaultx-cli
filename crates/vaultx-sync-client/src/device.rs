@@ -7,6 +7,11 @@
 //! tests inject [`vaultx_keyring::InMemoryKeyStore`]. The signing pair
 //! itself is [`vaultx_crypto::signature::SigningKeyPair`]; nothing here
 //! reimplements cryptography.
+//!
+//! Trust note: the server's copy of this public key is trusted-by-server
+//! advisory pinning material. A compromised control plane can register and
+//! serve its own key; device signatures give tamper-evidence, not defense
+//! against a hostile control plane (see crate docs).
 
 use std::sync::Arc;
 

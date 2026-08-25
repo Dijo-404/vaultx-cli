@@ -16,6 +16,18 @@
 //! [`vaultx_keyring::WrappingKeyProvider`] seam so production backends swap
 //! in behind identical signatures while tests inject memory stores.
 //!
+//! # Trust model (read this before trusting verification)
+//!
+//! The device public keys served by the control plane are TRUSTED-BY-SERVER
+//! advisory pinning material: the server decides which keys to register and
+//! serve, so a compromised control plane can register and serve its own key
+//! and clients will accept commits signed with it. Signature checks here
+//! therefore provide tamper-evidence against network/man-in-the-middle
+//! tampering, not protection against a hostile control plane. Unsigned
+//! commit content is accepted for back-compat with local-only
+//! repositories; any signature that is present must still verify or the
+//! pull aborts.
+//!
 //! # Async traits
 //!
 //! The workspace has no existing `async_trait` usage; both traits here use

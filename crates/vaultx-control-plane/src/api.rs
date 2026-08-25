@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -19,8 +19,7 @@ use vaultx_types::{AgentId, ObjectId, ProjectId};
 use crate::auth;
 use crate::error::ControlPlaneError;
 use crate::model::{
-    DeviceRecord, PolicyDocument, Principal, RefState, UserRecord, WorkspaceMembership,
-    WorkspaceRecord,
+    DeviceRecord, PolicyDocument, Principal, RefState, WorkspaceMembership, WorkspaceRecord,
 };
 use crate::protocol::{
     device_attestation_message, AgentView, AuditEventView, BatchObjectsRequest,
@@ -28,13 +27,44 @@ use crate::protocol::{
     ObjectEntryWire, PutRefRequest, PutRefResponse, QueryMissingRequest, QueryMissingResponse,
     SessionRequest, SessionResponse, WorkspaceView,
 };
-use crate::store::{AgentSessionContext, ControlPlaneStore};
+use crate::store::{AgentSessionContext, ControlPlaneStore, RefCasOutcome};
+
+/// Maximum accepted request body size (1 MiB).
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Maximum cardinality of list-typed request payloads.
+const MAX_LIST_ITEMS: usize = 10_000;
+
+/// Default per-response cap on `missing_objects` entries; clients loop
+/// while responses report truncation.
+const DEFAULT_MAX_MISSING_OBJECTS: usize = 10_000;
 
 /// Shared handler state.
 #[derive(Clone)]
 pub struct AppState {
     /// Persistence backend backing every handler.
     pub store: Arc<dyn ControlPlaneStore>,
+    /// Per-response cap on `missing_objects` entries.
+    pub max_missing_objects: usize,
+}
+
+impl AppState {
+    /// Builds state with default response limits.
+    #[must_use]
+    pub fn new(store: Arc<dyn ControlPlaneStore>) -> Self {
+        Self {
+            store,
+            max_missing_objects: DEFAULT_MAX_MISSING_OBJECTS,
+        }
+    }
+
+    /// Overrides the per-response `missing_objects` cap (tests inject a
+    /// tiny value to exercise the client's convergence loop).
+    #[must_use]
+    pub fn with_max_missing_objects(mut self, max_missing_objects: usize) -> Self {
+        self.max_missing_objects = max_missing_objects;
+        self
+    }
 }
 
 /// Builds the control-plane router over `state`.
@@ -51,10 +81,21 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}/policies/{name}", put(put_policy))
         .route("/projects/{id}/agents", get(list_agents).post(create_agent))
         .route("/projects/{id}/audit", get(project_audit))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
 type HandlerResult<T> = Result<Json<T>, ControlPlaneError>;
+
+/// Generates a fresh prefixed entity id and reparses it into its typed
+/// form — the single home for the generate-then-reparse dance.
+fn fresh_typed_id<T>(
+    prefix: &str,
+    parse: impl FnOnce(&str) -> Result<T, vaultx_types::TypeError>,
+) -> Result<T, ControlPlaneError> {
+    let raw = crate::store::fresh_entity_id(prefix)?;
+    parse(&raw).map_err(|_| ControlPlaneError::Storage("entity id".to_owned()))
+}
 
 /// Loads `project` and enforces that `principal` belongs to its workspace.
 fn require_project(
@@ -81,22 +122,15 @@ async fn create_session(
             if login.is_empty() || password.is_empty() {
                 return Err(ControlPlaneError::BadRequest("credentials required"));
             }
-            let existing = state.store.find_user(login)?;
-            match existing {
-                Some(user) => {
-                    // Production backends compare a salted hash; the
-                    // in-memory test store holds the verifier directly.
-                    if user.verifier != password {
-                        return Err(ControlPlaneError::Unauthorized);
-                    }
-                }
-                None => {
-                    state.store.upsert_user(&UserRecord {
-                        login: login.to_owned(),
-                        display_name: None,
-                        verifier: password,
-                    })?;
-                }
+            // No provisioning flow exists in this milestone: unknown users
+            // are rejected outright. Users are created by direct store
+            // construction (tooling/tests).
+            let user = state
+                .store
+                .find_user(login)?
+                .ok_or(ControlPlaneError::Unauthorized)?;
+            if !auth::verify_verifier(&password, &user.verifier) {
+                return Err(ControlPlaneError::Unauthorized);
             }
             let token = auth::mint_token(auth::TokenClass::ControlSession)?;
             state.store.issue_session(
@@ -118,12 +152,14 @@ async fn create_session(
             if !is_provider_slug(&provider) || assertion.is_empty() {
                 return Err(ControlPlaneError::BadRequest("invalid oidc exchange grant"));
             }
-            // The workload subject is derived from a digest of the
-            // assertion so neither the assertion nor any derived secret is
-            // ever stored or logged verbatim.
-            let mut hasher = Sha256::new();
-            hasher.update(assertion.as_bytes());
-            let subject = format!("oidc:{provider}:{:.16}", hex::encode(hasher.finalize()));
+            let subject = auth::oidc_exchange_subject(&provider, &assertion);
+            // Default deny: exchanges only mint workload sessions for
+            // provider/subject pairs the store explicitly allowlisted.
+            // Real JWKS verification of provider assertions remains a
+            // documented production requirement.
+            if !state.store.allows_oidc_subject(&provider, &subject) {
+                return Err(ControlPlaneError::Unauthorized);
+            }
             let token = auth::mint_token(auth::TokenClass::WorkloadExchange)?;
             state.store.issue_session(
                 &token,
@@ -171,10 +207,10 @@ async fn create_workspace(
     Json(body): Json<WorkspaceView>,
 ) -> HandlerResult<WorkspaceView> {
     let principal = auth::authorize(&*state.store, &headers, auth::ADMIN_CLASSES)?;
-    let id = vaultx_types::WorkspaceId::parse(&crate::store::fresh_entity_id(
+    let id = fresh_typed_id(
         vaultx_types::WorkspaceId::PREFIX,
-    )?)
-    .map_err(|_| ControlPlaneError::Storage("workspace id".to_owned()))?;
+        vaultx_types::WorkspaceId::parse,
+    )?;
     let record = WorkspaceRecord {
         id: id.clone(),
         name: body.name,
@@ -234,6 +270,9 @@ async fn batch_objects(
 ) -> HandlerResult<BatchObjectsResponse> {
     let principal = auth::authorize(&*state.store, &headers, auth::ADMIN_CLASSES)?;
     require_project(&*state.store, &principal, &project_id)?;
+    if body.entries.len() > MAX_LIST_ITEMS {
+        return Err(ControlPlaneError::BadRequest("too many entries"));
+    }
 
     let mut stored = 0usize;
     let mut duplicates = 0usize;
@@ -266,6 +305,9 @@ async fn query_missing(
     if body.project != project_id {
         return Err(ControlPlaneError::BadRequest("project mismatch"));
     }
+    if body.known_object_ids.len() > MAX_LIST_ITEMS {
+        return Err(ControlPlaneError::BadRequest("too many known object ids"));
+    }
     let project = require_project(&*state.store, &principal, &project_id)?;
 
     verify_device_identity(&body.device, &project_id)?;
@@ -296,7 +338,13 @@ async fn query_missing(
         .filter(|id| !known.contains(id.as_str()))
         .cloned()
         .collect();
-    let missing_objects = state.store.get_objects(&project_id, &missing_ids)?;
+    let mut missing_objects = state.store.get_objects(&project_id, &missing_ids)?;
+    // Cap per-response cardinality and say so; clients re-query (their
+    // known set has advanced) until the flag clears.
+    let missing_objects_truncated = missing_objects.len() > state.max_missing_objects;
+    if missing_objects_truncated {
+        missing_objects.truncate(state.max_missing_objects);
+    }
 
     let mut remote_refs = state.store.list_ref_states(&project_id)?;
     for reference in &mut remote_refs {
@@ -323,13 +371,15 @@ async fn query_missing(
         "objects.query_missing",
         &serde_json::json!({
             "known_objects": body.known_object_ids.len(),
-            "missing_returned": missing_objects.len()
+            "missing_returned": missing_objects.len(),
+            "missing_truncated": missing_objects_truncated
         })
         .to_string(),
     )?;
 
     Ok(Json(QueryMissingResponse {
         missing_objects,
+        missing_objects_truncated,
         remote_refs,
         remote_object_ids: remote_ids,
         policies: state.store.list_policies(&project_id)?,
@@ -405,29 +455,20 @@ async fn put_ref(
         })));
     }
 
-    // Optimistic concurrency: base_commit mismatch means another writer
-    // moved the ref first — surface the disagreement, never auto-pick.
-    // A `None` base means "ref must not exist", so an existing tip is a
-    // lost create race and conflicts with the current value attached.
-    match (&body.base_commit, &current) {
-        (Some(base), Some(existing)) => {
-            if existing.commit != *base {
-                return Err(ref_conflict(current.as_ref()));
-            }
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(ref_conflict(current.as_ref()));
-        }
-        (None, None) => {}
-    }
-
-    let next = RefState {
-        namespace: body.namespace,
-        name: ref_name,
-        commit: body.commit.clone(),
-        protected: current.as_ref().is_some_and(|c| c.protected),
+    // Atomic compare-and-swap: `base_commit: None` means "ref must not
+    // exist", so concurrent create/update races are decided inside one
+    // store step; losers surface a conflict carrying the winning tip.
+    let next = match state.store.compare_and_swap_ref(
+        &project_id,
+        body.namespace,
+        &ref_name,
+        body.base_commit.as_ref(),
+        &body.commit,
+    )? {
+        RefCasOutcome::Applied { next } => next,
+        RefCasOutcome::Rejected { current } => return Err(ref_conflict(current.as_ref())),
     };
-    state.store.set_ref_state(&project_id, &next)?;
+
     state.store.append_audit_event(
         Some(&project_id),
         &principal.subject,
@@ -499,8 +540,7 @@ async fn create_agent(
     let principal = auth::authorize(&*state.store, &headers, auth::ADMIN_CLASSES)?;
     require_project(&*state.store, &principal, &project_id)?;
 
-    let agent_id = AgentId::parse(&crate::store::fresh_entity_id(AgentId::PREFIX)?)
-        .map_err(|_| ControlPlaneError::Storage("agent id".to_owned()))?;
+    let agent_id = fresh_typed_id(AgentId::PREFIX, AgentId::parse)?;
     state.store.create_agent_identity(
         &project_id,
         &agent_id,
@@ -558,7 +598,7 @@ mod tests {
     use vaultx_types::ProjectId;
 
     use super::*;
-    use crate::model::{RefNamespace, WorkspaceRecord};
+    use crate::model::{RefNamespace, UserRecord, WorkspaceRecord};
     use crate::protocol::{
         device_attestation_message, ObjectEntryWire, PutRefRequest, SessionResponse,
     };
@@ -581,7 +621,7 @@ mod tests {
             .upsert_user(&UserRecord {
                 login: "alice".to_owned(),
                 display_name: None,
-                verifier: "hunter2".to_owned(),
+                verifier: crate::auth::hash_verifier("hunter2").expect("seed verifier"),
             })
             .expect("seed user");
         store
@@ -617,9 +657,7 @@ mod tests {
             .expect("seed outsider workspace");
 
         Fixture {
-            app: router(AppState {
-                store: store.clone(),
-            }),
+            app: router(AppState::new(store.clone())),
             store,
             project: project_id,
         }
@@ -718,6 +756,33 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            fx.store.find_user("alice").unwrap().is_some(),
+            "wrong password must not disturb the existing record"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_user_is_unauthorized_without_provisioning() {
+        let fx = fixture();
+        let (status, value) = call(
+            &fx.app,
+            "POST",
+            "/auth/session",
+            None,
+            Some(
+                serde_json::json!({"kind":"password","username":"stranger","password":"pw"})
+                    .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            fx.store.find_user("stranger").unwrap(),
+            None,
+            "unknown usernames must never be auto-created"
+        );
+        assert_eq!(value["error"]["code"], serde_json::json!("unauthorized"));
     }
 
     #[tokio::test]
@@ -737,7 +802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oidc_exchange_issues_workload_token_rejected_on_admin_routes() {
+    async fn unconfigured_oidc_exchange_is_unauthorized() {
         let fx = fixture();
         let (status, value) = call(
             &fx.app,
@@ -749,6 +814,34 @@ mod tests {
                     "kind": "oidc_exchange",
                     "provider": "github-actions",
                     "assertion": "eyJhbGciOiJSUzI1NiJ9.payload.sig"
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(value["error"]["code"], serde_json::json!("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn oidc_exchange_issues_workload_token_rejected_on_admin_routes() {
+        let fx = fixture();
+        // Default deny: only explicitly allowlisted provider/subject pairs
+        // mint workload sessions.
+        let assertion = "eyJhbGciOiJSUzI1NiJ9.payload.sig";
+        let subject = auth::oidc_exchange_subject("github-actions", assertion);
+        fx.store.trust_oidc_subject("github-actions", &subject);
+
+        let (status, value) = call(
+            &fx.app,
+            "POST",
+            "/auth/session",
+            None,
+            Some(
+                serde_json::json!({
+                    "kind": "oidc_exchange",
+                    "provider": "github-actions",
+                    "assertion": assertion
                 })
                 .to_string(),
             ),
@@ -824,18 +917,9 @@ mod tests {
     #[tokio::test]
     async fn project_routes_require_workspace_membership() {
         let fx = fixture();
-        let (status, _) = call(
-            &fx.app,
-            "POST",
-            "/auth/session",
-            None,
-            Some(
-                serde_json::json!({"kind":"password","username":"mallory","password":"pw"})
-                    .to_string(),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
+        // Mallory holds a valid session but no membership in the project's
+        // workspace; sessions are minted by direct store seeding here
+        // because no provisioning flow exists.
         let mallory_token = "vxs_mallory_session";
         fx.store
             .issue_session(
@@ -1318,6 +1402,243 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| e["action"] == "objects.query_missing"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_race_admits_exactly_one_writer() {
+        let fx = fixture();
+        let uri = format!("/projects/{}/refs/main", fx.project);
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let app = fx.app.clone();
+            let uri = uri.clone();
+            handles.push(tokio::spawn(async move {
+                let commit =
+                    vaultx_types::CommitId::parse(&format!("cmt_create_{i:02}")).expect("valid");
+                let body = PutRefRequest {
+                    namespace: RefNamespace::Heads,
+                    commit: commit.clone(),
+                    base_commit: None,
+                    authorized: false,
+                };
+                let (status, value) = call(
+                    &app,
+                    "PUT",
+                    &uri,
+                    Some(ALICE_TOKEN),
+                    Some(serde_json::to_string(&body).expect("body")),
+                )
+                .await;
+                (commit, status, value)
+            }));
+        }
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            results.push(handle.await.expect("task"));
+        }
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, s, _)| *s == StatusCode::OK)
+            .collect();
+        let losers: Vec<_> = results
+            .iter()
+            .filter(|(_, s, _)| *s == StatusCode::CONFLICT)
+            .collect();
+        assert_eq!(winners.len(), 1, "exactly one create may win");
+        assert_eq!(losers.len(), 7);
+        let winning_commit = &winners[0].0;
+        for (_, _, value) in &losers {
+            assert_eq!(value["error"], "ref_conflict");
+            assert_eq!(
+                value["current_commit"],
+                serde_json::json!(winning_commit.to_string()),
+                "losers must carry the winner's tip"
+            );
+        }
+        assert_eq!(
+            fx.store
+                .get_ref_state(&fx.project, RefNamespace::Heads, "main")
+                .unwrap()
+                .map(|r| r.commit),
+            Some(winning_commit.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_update_race_admits_exactly_one_writer() {
+        let fx = fixture();
+        let base = vaultx_types::CommitId::parse("cmt_update_base").expect("valid");
+        fx.store
+            .set_ref_state(
+                &fx.project,
+                &crate::model::RefState {
+                    namespace: RefNamespace::Heads,
+                    name: "main".to_owned(),
+                    commit: base.clone(),
+                    protected: false,
+                },
+            )
+            .unwrap();
+        let uri = format!("/projects/{}/refs/main", fx.project);
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let app = fx.app.clone();
+            let uri = uri.clone();
+            let base = base.clone();
+            handles.push(tokio::spawn(async move {
+                let commit =
+                    vaultx_types::CommitId::parse(&format!("cmt_update_{i:02}")).expect("valid");
+                let body = PutRefRequest {
+                    namespace: RefNamespace::Heads,
+                    commit: commit.clone(),
+                    base_commit: Some(base),
+                    authorized: false,
+                };
+                let (status, value) = call(
+                    &app,
+                    "PUT",
+                    &uri,
+                    Some(ALICE_TOKEN),
+                    Some(serde_json::to_string(&body).expect("body")),
+                )
+                .await;
+                (commit, status, value)
+            }));
+        }
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            results.push(handle.await.expect("task"));
+        }
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, s, _)| *s == StatusCode::OK)
+            .collect();
+        assert_eq!(winners.len(), 1, "exactly one update may win the CAS");
+        let losing_tips_ok = results
+            .iter()
+            .filter(|(c, s, _)| c != &winners[0].0 && *s == StatusCode::CONFLICT)
+            .all(|(_, _, value)| value["error"] == "ref_conflict");
+        assert!(losing_tips_ok);
+        assert_eq!(
+            fx.store
+                .get_ref_state(&fx.project, RefNamespace::Heads, "main")
+                .unwrap()
+                .map(|r| r.commit),
+            Some(winners[0].0.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_known_object_id_list_is_rejected() {
+        let fx = fixture();
+        // Compact ids keep the raw body under the 1 MiB transport limit so
+        // the request reaches the cardinality check itself.
+        let known: Vec<String> = (0..=MAX_LIST_ITEMS)
+            .map(|i| format!("obj_{i:064x}"))
+            .collect();
+        let body = serde_json::json!({
+            "known_object_ids": known,
+            "known_refs": [],
+            "project": fx.project,
+            "device": {
+                "public_key_hex": "00",
+                "signature_hex": "00"
+            }
+        })
+        .to_string();
+        assert!(
+            body.len() < MAX_BODY_BYTES,
+            "test payload must stay under the body limit to reach the cardinality check"
+        );
+        let uri = format!("/projects/{}/objects/query-missing", fx.project);
+        let (status, _) = call(&fx.app, "POST", &uri, Some(ALICE_TOKEN), Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn query_missing_flags_truncation_when_cap_hit() {
+        let store = Arc::new(InMemoryControlPlaneStore::new());
+        let ws_id = vaultx_types::WorkspaceId::parse("ws_api_test").expect("valid");
+        let project_id = ProjectId::parse("proj_api_test").expect("valid");
+        store
+            .upsert_user(&UserRecord {
+                login: "alice".to_owned(),
+                display_name: None,
+                verifier: crate::auth::hash_verifier("hunter2").expect("seed verifier"),
+            })
+            .unwrap();
+        store
+            .create_workspace(&WorkspaceRecord {
+                id: ws_id.clone(),
+                name: "acme".to_owned(),
+                owner: "alice".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_project(&crate::model::ProjectRecord {
+                id: project_id.clone(),
+                workspace: ws_id,
+                name: "core".to_owned(),
+            })
+            .unwrap();
+        store
+            .issue_session(
+                ALICE_TOKEN,
+                &Principal {
+                    subject: "alice".to_owned(),
+                    class: crate::auth::TokenClass::ControlSession,
+                },
+            )
+            .unwrap();
+
+        // Tiny injected cap forces a truncated first response.
+        let app = router(AppState::new(store).with_max_missing_objects(1));
+        let stored = vec![
+            object_entry("{\"payload\":\"00\"}"),
+            object_entry("{\"payload\":\"01\"}"),
+        ];
+        let batch_uri = format!("/projects/{}/objects/batch", project_id);
+        let (status, _) = call(
+            &app,
+            "POST",
+            &batch_uri,
+            Some(ALICE_TOKEN),
+            Some(serde_json::json!({"entries": stored}).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let pair = SigningKeyPair::generate();
+        let public_hex = hex::encode(pair.verifying_public_key().to_bytes());
+        let message = device_attestation_message(&project_id, &public_hex);
+        let signature = pair.sign(&message);
+        let uri = format!("/projects/{}/objects/query-missing", project_id);
+        let (status, value) = call(
+            &app,
+            "POST",
+            &uri,
+            Some(ALICE_TOKEN),
+            Some(
+                serde_json::json!({
+                    "known_object_ids": [],
+                    "known_refs": [],
+                    "project": project_id,
+                    "device": {
+                        "public_key_hex": public_hex,
+                        "signature_hex": hex::encode(signature.0)
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            value["missing_objects"].as_array().expect("array").len(),
+            1,
+            "response must respect the cap"
+        );
+        assert_eq!(value["missing_objects_truncated"], true);
     }
 
     #[test]

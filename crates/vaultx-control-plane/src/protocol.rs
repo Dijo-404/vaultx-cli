@@ -17,8 +17,16 @@ pub struct EnvironmentMetadata {
 }
 
 /// A registered device public key with its fingerprint, served so sync
-/// clients can independently verify commit signatures against trusted
-/// team device identities.
+/// clients can check commit signatures against team device identities.
+///
+/// # Trust model
+///
+/// These keys are trusted-by-server advisory pinning material: the control
+/// plane decides which keys to register and serve, so a compromised
+/// control plane can register and serve its own key. Verification against
+/// this material gives clients tamper-evidence in transit, not protection
+/// against a fully hostile server; unsigned commit content remains
+/// accepted for back-compat.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceKeyFingerprint {
     /// Raw 32-byte Ed25519 public key, lowercase hex.
@@ -138,8 +146,13 @@ pub struct QueryMissingRequest {
 /// metadata, signature/public-key material).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueryMissingResponse {
-    /// Encrypted objects the client is missing.
+    /// Encrypted objects the client is missing, capped per response at the
+    /// server's limit.
     pub missing_objects: Vec<ObjectEntryWire>,
+    /// True when more missing objects exist than fit in one response;
+    /// clients must re-query (their known set has advanced) until false.
+    #[serde(default)]
+    pub missing_objects_truncated: bool,
     /// Every ref currently recorded server-side.
     pub remote_refs: Vec<RefState>,
     /// All object ids the server holds (lets push compute its upload set).
@@ -149,8 +162,10 @@ pub struct QueryMissingResponse {
     /// Environment protection metadata.
     pub environments: Vec<EnvironmentMetadata>,
     /// Registered device public keys of the project's principals: raw
-    /// Ed25519 bytes plus fingerprint, letting clients verify commit
-    /// signatures independently.
+    /// Ed25519 bytes plus fingerprint. Trusted-by-server advisory pinning
+    /// material — a compromised control plane can register and serve its
+    /// own key; unsigned commit content is still accepted (see
+    /// [`DeviceKeyFingerprint`]).
     pub server_key_fingerprints: Vec<DeviceKeyFingerprint>,
 }
 

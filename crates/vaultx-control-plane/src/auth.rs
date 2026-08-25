@@ -6,8 +6,71 @@
 //! mechanism behind the plan §39 note that administrative APIs must not
 //! share a reachable surface with agent session tokens.
 
+use sha2::{Digest, Sha256};
+
 use crate::error::ControlPlaneError;
 use crate::model::Principal;
+
+/// Salt length (bytes) for in-memory credential verifiers.
+const VERIFIER_SALT_LEN: usize = 16;
+
+/// Computes the hex digest of `password` under a binary salt.
+fn password_digest(salt: &[u8], password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(password.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Derives the stored credential verifier for `password`: a per-user
+/// random salt plus salted SHA-256 digest (`sha256$<salt-hex>$<digest-hex>`).
+///
+/// This is the milestone's in-memory stopgap only. Production PostgreSQL
+/// backends MUST store argon2/bcrypt verifiers instead (see
+/// [`crate::store::InMemoryControlPlaneStore`]).
+///
+/// # Errors
+/// [`ControlPlaneError::Storage`] when the OS randomness source fails.
+pub fn hash_verifier(password: &str) -> Result<String, ControlPlaneError> {
+    let mut salt = [0u8; VERIFIER_SALT_LEN];
+    getrandom::getrandom(&mut salt)
+        .map_err(|_| ControlPlaneError::Storage("verifier entropy unavailable".to_owned()))?;
+    Ok(format!(
+        "sha256${}${}",
+        hex::encode(salt),
+        password_digest(&salt, password)
+    ))
+}
+
+/// Checks `password` against a verifier produced by [`hash_verifier`].
+/// Verifiers in any other format never match.
+#[must_use]
+pub fn verify_verifier(password: &str, stored: &str) -> bool {
+    let Some(("sha256", rest)) = stored.split_once('$') else {
+        return false;
+    };
+    let Some((salt_hex, expected_hex)) = rest.split_once('$') else {
+        return false;
+    };
+    let Ok(salt) = hex::decode(salt_hex) else {
+        return false;
+    };
+    if salt.len() != VERIFIER_SALT_LEN {
+        return false;
+    }
+    password_digest(&salt, password) == expected_hex
+}
+
+/// Stable workload principal id derived from an OIDC exchange assertion:
+/// neither the assertion nor any derived secret is ever stored or logged
+/// verbatim. Shared by the session handler and tests so allowlist entries
+/// and minted subjects cannot drift apart.
+#[must_use]
+pub fn oidc_exchange_subject(provider: &str, assertion: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(assertion.as_bytes());
+    format!("oidc:{provider}:{:.16}", hex::encode(hasher.finalize()))
+}
 
 /// Disjoint bearer-token families.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,5 +220,26 @@ mod tests {
             axum::http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
         );
         assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn verifiers_are_salted_per_user_and_never_reversible() {
+        let a = hash_verifier("hunter2").expect("hash");
+        let b = hash_verifier("hunter2").expect("hash");
+        assert_ne!(a, b, "each derivation uses a fresh random salt");
+        assert!(verify_verifier("hunter2", &a));
+        assert!(!verify_verifier("wrong", &a));
+        // Legacy plaintext or malformed verifiers must never match.
+        assert!(!verify_verifier("hunter2", "hunter2"));
+        assert!(!verify_verifier("", "$"));
+        // Subjects are deterministic per (provider, assertion) pair.
+        assert_eq!(
+            oidc_exchange_subject("github-actions", "tok"),
+            oidc_exchange_subject("github-actions", "tok")
+        );
+        assert_ne!(
+            oidc_exchange_subject("github-actions", "tok"),
+            oidc_exchange_subject("gitlab-ci", "tok")
+        );
     }
 }

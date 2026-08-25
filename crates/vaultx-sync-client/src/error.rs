@@ -74,16 +74,6 @@ impl From<std::io::Error> for SyncError {
 /// Convenience alias for client results.
 pub type SyncResultOf<T> = Result<T, SyncError>;
 
-/// Helper used by callers distinguishing conflicts from hard failures.
-#[must_use]
-pub fn conflict_summary(conflicts: &[RefConflict]) -> String {
-    conflicts
-        .iter()
-        .map(|c| format!("{}/{} ({})", c.namespace_name(), c.name, c.reason))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 impl RefConflict {
     /// Namespace rendered as its wire name (`heads`/`environments`).
     #[must_use]

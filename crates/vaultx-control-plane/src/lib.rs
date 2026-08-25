@@ -14,6 +14,15 @@
 //! (federated/OIDC exchange) are accepted only on the data-plane sync
 //! route. [`crate::auth::TokenClass::Agent`] session tokens are subordinate broker-style
 //! credentials and are rejected on every control-plane route.
+//!
+//! # Session issuance
+//!
+//! Password sessions require an existing user record — unknown usernames
+//! are rejected with no provisioning flow. OIDC exchange is default-deny:
+//! workload sessions are minted only for provider/subject pairs the store
+//! explicitly allowlists ([`store::ControlPlaneStore::allows_oidc_subject`]);
+//! real JWKS verification of provider assertions is a documented
+//! production requirement, not implemented in this milestone.
 
 pub mod api;
 pub mod auth;
@@ -32,5 +41,5 @@ pub use store::{ControlPlaneStore, InMemoryControlPlaneStore};
 /// Builds the control-plane REST router (plan §39 route surface) over
 /// `store`.
 pub fn router(store: Arc<dyn ControlPlaneStore>) -> axum::Router {
-    api::router(api::AppState { store })
+    api::router(api::AppState::new(store))
 }

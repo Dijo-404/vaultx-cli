@@ -10,16 +10,18 @@ pub enum RefNamespace {
     Environments,
 }
 
-/// A control-plane user record. `verifier` holds a credential verifier
-/// (a salted hash in production; the in-memory test store compares it
-/// directly and never logs it).
+/// A control-plane user record. `verifier` holds a credential verifier in
+/// the salted format produced by [`crate::auth::hash_verifier`]
+/// (`sha256$<salt-hex>$<digest-hex>`); production PostgreSQL stores must
+/// persist argon2/bcrypt verifiers instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UserRecord {
     /// Unique login name.
     pub login: String,
     /// Optional display name.
     pub display_name: Option<String>,
-    /// Credential verifier compared at session creation.
+    /// Salted credential verifier compared at session creation; never
+    /// logged or echoed.
     pub verifier: String,
 }
 

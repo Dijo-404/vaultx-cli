@@ -188,26 +188,30 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
     }
 
     /// Applies remote refs strictly by ancestry: fast-forward or explicit
-    /// conflict; never an automatic pick between diverged revisions.
+    /// conflict; never an automatic pick between diverged revisions. A
+    /// remote tip whose commit cannot be resolved locally — even after
+    /// downloading everything offered — is refused for BOTH fresh and
+    /// existing refs (`UnverifiableHistory`), so a crafted response can
+    /// never plant a dangling head.
     async fn reconcile_remote_refs(
         &self,
         response: &QueryMissingResponse,
     ) -> SyncResultOf<Vec<RefConflict>> {
         let mut conflicts = Vec::new();
         for remote in &response.remote_refs {
+            if self.workspace.commit_parents(&remote.commit)?.is_none() {
+                conflicts.push(RefConflict {
+                    namespace: remote.namespace,
+                    name: remote.name.clone(),
+                    local_commit: self.workspace.read_ref(remote.namespace, &remote.name)?,
+                    remote_commit: Some(remote.commit.clone()),
+                    reason: ConflictReason::UnverifiableHistory,
+                });
+                continue;
+            }
             match self.workspace.read_ref(remote.namespace, &remote.name)? {
                 Some(current) if current == remote.commit => {}
                 Some(current) => {
-                    if self.workspace.commit_parents(&remote.commit)?.is_none() {
-                        conflicts.push(RefConflict {
-                            namespace: remote.namespace,
-                            name: remote.name.clone(),
-                            local_commit: Some(current),
-                            remote_commit: Some(remote.commit.clone()),
-                            reason: ConflictReason::UnverifiableHistory,
-                        });
-                        continue;
-                    }
                     let remote_ahead =
                         is_ancestor_or_equal(self.workspace(), &current, &remote.commit)?;
                     let local_ahead =
@@ -365,7 +369,7 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
                                 reason,
                             });
                         }
-                        status => return Err(map_rejection(&response).with_status(status)),
+                        _ => return Err(map_rejection(&response)),
                     }
                 }
             }
@@ -377,8 +381,20 @@ impl<T: ControlPlaneTransport, W: LocalWorkspace> ControlPlaneSyncClient<T, W> {
 impl<T: ControlPlaneTransport, W: LocalWorkspace> SyncService for ControlPlaneSyncClient<T, W> {
     async fn pull(&self, project: ProjectId) -> Result<SyncResult, SyncError> {
         let mut result = SyncResult::clean();
-        let response = self.probe(&project).await?;
-        result.downloaded = self.download_and_apply(&response).await?;
+        // Loop while the server truncates its answer: each round applies
+        // the offered objects, so the next probe's known set advances and
+        // pagination converges. A zero-download round breaks out to keep
+        // a misbehaving server from spinning us forever.
+        let mut downloaded_total = 0usize;
+        let response = loop {
+            let response = self.probe(&project).await?;
+            let downloaded = self.download_and_apply(&response).await?;
+            downloaded_total += downloaded;
+            if !response.missing_objects_truncated || downloaded == 0 {
+                break response;
+            }
+        };
+        result.downloaded = downloaded_total;
         result.conflicts = self.reconcile_remote_refs(&response).await?;
         Ok(result)
     }
@@ -458,15 +474,6 @@ fn verify_commit_signature(
         });
     }
     Ok(())
-}
-
-impl SyncError {
-    fn with_status(self, status: u16) -> Self {
-        match self {
-            Self::Api { .. } => Self::Api { status },
-            other => other,
-        }
-    }
 }
 
 /// Hex digest portion of a content-derived id (`obj_<64 hex>`).
@@ -759,7 +766,7 @@ mod tests {
                 .upsert_user(&UserRecord {
                     login: "alice".to_owned(),
                     display_name: None,
-                    verifier: "pw".to_owned(),
+                    verifier: vaultx_control_plane::auth::hash_verifier("pw").expect("seed"),
                 })
                 .expect("seed user");
             store
@@ -795,9 +802,9 @@ mod tests {
             let keys_b: Arc<dyn vaultx_keyring::WrappingKeyProvider> =
                 Arc::new(InMemoryKeyStore::new());
             Self {
-                app: vaultx_control_plane::api::router(ControlPlaneState {
-                    store: Arc::clone(&store) as Arc<dyn vaultx_control_plane::ControlPlaneStore>,
-                }),
+                app: vaultx_control_plane::api::router(ControlPlaneState::new(
+                    Arc::clone(&store) as Arc<dyn vaultx_control_plane::ControlPlaneStore>
+                )),
                 store,
                 project,
                 alice_dir,
@@ -1165,11 +1172,16 @@ mod tests {
         let world = World::new();
         let project = world.project.clone();
 
-        // Exchange a federated assertion for a workload session.
+        // Exchange a federated assertion for a workload session. OIDC is
+        // default-deny, so the store must allowlist the derived subject.
+        let assertion = "federated-assertion-for-ci";
+        let subject =
+            vaultx_control_plane::auth::oidc_exchange_subject("github-actions", assertion);
+        world.store.trust_oidc_subject("github-actions", &subject);
         let exchange = serde_json::json!({
             "kind": "oidc_exchange",
             "provider": "github-actions",
-            "assertion": "federated-assertion-for-ci"
+            "assertion": assertion
         });
         let anonymous = InProcess::new(world.app.clone(), "");
         let response = anonymous
@@ -1186,10 +1198,6 @@ mod tests {
         assert!(session.token.starts_with("vxw_"));
 
         // The workload principal needs workspace membership for the project.
-        use sha2::Digest as _;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(b"federated-assertion-for-ci");
-        let subject = format!("oidc:github-actions:{:.16}", hex::encode(hasher.finalize()));
         world
             .store
             .add_workspace_member(&WorkspaceMembership {
@@ -1357,6 +1365,83 @@ mod tests {
                 .map(|r| r.commit),
             Some(rival_tip)
         );
+    }
+
+    #[tokio::test]
+    async fn pull_refuses_remote_tip_with_unresolvable_history() {
+        let world = World::new();
+        let project = world.project.clone();
+
+        // Legitimate history first so main converges normally.
+        let c1 = World::commit(&world.open_a(), &world.pair_a, "API_KEY", "v1");
+        world
+            .client_a()
+            .push(project.clone())
+            .await
+            .expect("seed push");
+
+        // A crafted (or corrupted) remote ref pointing at a commit id no
+        // object covers must never be applied as a dangling head.
+        let ghost = CommitId::parse("cmt_ghost_unknown").expect("valid");
+        world
+            .store
+            .set_ref_state(
+                &project,
+                &vaultx_control_plane::model::RefState {
+                    namespace: RefNamespace::Heads,
+                    name: "ghost".to_owned(),
+                    commit: ghost.clone(),
+                    protected: false,
+                },
+            )
+            .expect("plant ghost ref");
+
+        let pulled = world.client_b().pull(project).await.expect("pull");
+        let conflict = pulled
+            .conflicts
+            .iter()
+            .find(|c| c.reason == ConflictReason::UnverifiableHistory)
+            .expect("unverifiable-history conflict surfaced");
+        assert_eq!(conflict.name, "ghost");
+        assert_eq!(conflict.local_commit, None);
+        assert_eq!(conflict.remote_commit, Some(ghost));
+
+        // Nothing was applied for the unverifiable tip...
+        assert_eq!(head_of(&world.open_b(), "ghost"), None);
+        // ...while resolvable refs still converge.
+        assert_eq!(head_of(&world.open_b(), "main"), Some(c1));
+    }
+
+    #[tokio::test]
+    async fn pull_loops_through_truncated_responses_until_convergence() {
+        let world = World::new();
+        let project = world.project.clone();
+
+        // Three objects land remotely through an uncapped transport.
+        World::commit(&world.open_a(), &world.pair_a, "API_KEY", "v1");
+        world
+            .client_a()
+            .push(project.clone())
+            .await
+            .expect("seed push");
+
+        // B pulls against a server answering at most one object per
+        // response; the client must loop until it reports convergence.
+        let capped_app = vaultx_control_plane::api::router(
+            ControlPlaneState::new(
+                Arc::clone(&world.store) as Arc<dyn vaultx_control_plane::ControlPlaneStore>
+            )
+            .with_max_missing_objects(1),
+        );
+        let repo_b = Repository::open(world.bob_dir.path()).expect("open B");
+        let client = ControlPlaneSyncClient::new(
+            InProcess::new(capped_app, SESSION_TOKEN),
+            FsWorkspace::open(repo_b.root()).expect("open"),
+            DeviceKeySource::new(Arc::new(InMemoryKeyStore::new())),
+        );
+        let pulled = client.pull(project).await.expect("pull");
+        assert!(pulled.is_converged());
+        assert_eq!(pulled.downloaded, 3, "all objects arrive across rounds");
     }
 
     #[test]

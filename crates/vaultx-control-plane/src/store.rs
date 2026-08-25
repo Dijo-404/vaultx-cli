@@ -18,6 +18,22 @@ use crate::model::{
 };
 use crate::protocol::{AgentView, AuditEventView, EnvironmentMetadata, ObjectEntryWire};
 
+/// Outcome of an atomic ref compare-and-swap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefCasOutcome {
+    /// Expectation held; the ref was written.
+    Applied {
+        /// The freshly recorded ref state.
+        next: RefState,
+    },
+    /// Expectation failed; nothing was written. Carries the current tip
+    /// when one exists so losers can reconcile against it.
+    Rejected {
+        /// Current server-side ref state, when present.
+        current: Option<RefState>,
+    },
+}
+
 /// Result alias for store operations.
 pub type StoreResult<T> = Result<T, ControlPlaneError>;
 
@@ -47,6 +63,15 @@ pub trait ControlPlaneStore: Send + Sync {
     /// # Errors
     /// Propagates storage failures.
     fn upsert_user(&self, user: &UserRecord) -> StoreResult<()>;
+
+    /// Whether OIDC exchange may mint a workload session for the given
+    /// `(provider, subject)` pair. Default deny: implementations must opt
+    /// every provider/subject in explicitly. Real JWKS/signature
+    /// verification of provider assertions is out of scope for this
+    /// milestone and remains documented as a production requirement.
+    fn allows_oidc_subject(&self, _provider: &str, _subject: &str) -> bool {
+        false
+    }
 
     /// Records `token -> principal` for later resolution. Production
     /// backends persist only a verifier of `token`.
@@ -145,6 +170,37 @@ pub trait ControlPlaneStore: Send + Sync {
     /// Propagates storage failures.
     fn set_ref_state(&self, project: &ProjectId, state: &RefState) -> StoreResult<()>;
 
+    /// Atomic compare-and-swap for one ref: writes `next_commit` only when
+    /// the current commit of `(project, namespace, name)` equals
+    /// `expected`, where `None` requires the ref to be absent. Read,
+    /// check, and write happen in ONE indivisible step — concurrent
+    /// writers cannot both pass the check.
+    ///
+    /// The returned [`RefCasOutcome::Applied`] carries the freshly written
+    /// state (inheriting the replaced row's protection flag; `false` for
+    /// newly created refs).
+    ///
+    /// # DDL contract
+    /// A PostgreSQL implementation must perform this as a single
+    /// conditional statement, e.g.
+    ///
+    /// ```sql
+    /// UPDATE refs SET commit_id = $next
+    /// WHERE project = $p AND namespace = $ns AND name = $n
+    ///   AND commit_id IS NOT DISTINCT FROM $expected
+    /// ```
+    ///
+    /// plus a guarded insert for the absent-ref case — never two separate
+    /// SELECT-then-UPDATE statements, which reintroduce the TOCTOU race.
+    fn compare_and_swap_ref(
+        &self,
+        project: &ProjectId,
+        namespace: RefNamespace,
+        name: &str,
+        expected: Option<&CommitId>,
+        next_commit: &CommitId,
+    ) -> StoreResult<RefCasOutcome>;
+
     /// Records environment protection metadata.
     ///
     /// # Errors
@@ -198,9 +254,6 @@ pub trait ControlPlaneStore: Send + Sync {
     /// Propagates storage failures.
     fn issue_agent_session(&self, token: &str, context: &AgentSessionContext) -> StoreResult<()>;
 
-    /// Resolves an agent session token to its context.
-    fn resolve_agent_session(&self, token: &str) -> StoreResult<Option<AgentSessionContext>>;
-
     // ---- audit ----
 
     /// Appends an immutable audit event.
@@ -235,6 +288,14 @@ pub trait ControlPlaneStore: Send + Sync {
 /// Process-lifetime hermetic store intended for tests and ephemeral
 /// tooling: sessions hold raw tokens in memory and everything evaporates
 /// on drop. Share it by wrapping in `Arc` (as [`crate::router`] expects).
+///
+/// # Credential verifiers
+///
+/// User records seeded here use the milestone's salted-SHA-256 verifier
+/// format ([`crate::auth::hash_verifier`]) compared at the API boundary.
+/// This is NOT production-grade password hashing: any PostgreSQL
+/// implementation of this store MUST persist argon2/bcrypt verifiers and
+/// verify them inside the database-backed implementation instead.
 #[derive(Debug, Default)]
 pub struct InMemoryControlPlaneStore {
     state: Mutex<StoreState>,
@@ -256,6 +317,7 @@ struct StoreState {
     agent_sessions: BTreeMap<String, AgentSessionContext>,
     audit: Vec<(Option<String>, AuditEventView)>,
     sync_state: BTreeMap<(String, String), Option<String>>,
+    oidc_allowlist: BTreeSet<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -267,10 +329,18 @@ struct AgentRow {
 }
 
 impl InMemoryControlPlaneStore {
-    /// Creates an empty store.
+    /// Creates an empty store. OIDC exchange is default-deny until
+    /// subjects are allowlisted via [`Self::trust_oidc_subject`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Allowlists one `(provider, subject)` pair for OIDC exchange.
+    pub fn trust_oidc_subject(&self, provider: &str, subject: &str) {
+        self.lock()
+            .oidc_allowlist
+            .insert((provider.to_owned(), subject.to_owned()));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, StoreState> {
@@ -315,6 +385,12 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
     fn upsert_user(&self, user: &UserRecord) -> StoreResult<()> {
         self.lock().users.insert(user.login.clone(), user.clone());
         Ok(())
+    }
+
+    fn allows_oidc_subject(&self, provider: &str, subject: &str) -> bool {
+        self.lock()
+            .oidc_allowlist
+            .contains(&(provider.to_owned(), subject.to_owned()))
     }
 
     fn issue_session(&self, token: &str, principal: &Principal) -> StoreResult<()> {
@@ -512,6 +588,50 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         Ok(())
     }
 
+    fn compare_and_swap_ref(
+        &self,
+        project: &ProjectId,
+        namespace: RefNamespace,
+        name: &str,
+        expected: Option<&CommitId>,
+        next_commit: &CommitId,
+    ) -> StoreResult<RefCasOutcome> {
+        // Read-check-write under ONE lock guard so concurrent writers
+        // cannot both observe the same pre-state.
+        let mut state = self.lock();
+        let key = (
+            project.as_str().to_owned(),
+            Self::namespace_rank(namespace),
+            name.to_owned(),
+        );
+        match state.refs.get_mut(&key) {
+            Some(existing) => {
+                if expected.is_some_and(|e| *e == existing.commit) {
+                    existing.commit = next_commit.clone();
+                    return Ok(RefCasOutcome::Applied {
+                        next: existing.clone(),
+                    });
+                }
+                Ok(RefCasOutcome::Rejected {
+                    current: Some(existing.clone()),
+                })
+            }
+            None => match expected {
+                Some(_) => Ok(RefCasOutcome::Rejected { current: None }),
+                None => {
+                    let created = RefState {
+                        namespace,
+                        name: name.to_owned(),
+                        commit: next_commit.clone(),
+                        protected: false,
+                    };
+                    state.refs.insert(key, created.clone());
+                    Ok(RefCasOutcome::Applied { next: created })
+                }
+            },
+        }
+    }
+
     fn set_environment_protection(
         &self,
         project: &ProjectId,
@@ -619,10 +739,6 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .agent_sessions
             .insert(token.to_owned(), context.clone());
         Ok(())
-    }
-
-    fn resolve_agent_session(&self, token: &str) -> StoreResult<Option<AgentSessionContext>> {
-        Ok(self.lock().agent_sessions.get(token).cloned())
     }
 
     fn append_audit_event(
@@ -809,7 +925,6 @@ mod tests {
             project: project.clone(),
         };
         store.issue_agent_session("vxa_tok", &ctx).unwrap();
-        assert_eq!(store.resolve_agent_session("vxa_tok").unwrap(), Some(ctx));
 
         let event = store
             .append_audit_event(Some(&project), "alice", "ref.update", "{}")
