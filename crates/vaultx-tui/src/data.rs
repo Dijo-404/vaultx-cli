@@ -20,7 +20,7 @@ use vaultx_types::{AgentId, CommitId, ObjectId};
 use crate::mask::{self, RedactedLine};
 use crate::state::{
     AgentDetail, AgentRow, AgentsData, AuditRow, BrokerStatus, EnvRow, HistoryRow, LoadedState,
-    OutcomeFilter, SessionRow, SessionStatus, Snapshot, VariableRow,
+    OutcomeFilter, RemoteRow, SessionRow, SessionStatus, Snapshot, SyncData, VariableRow,
 };
 
 /// Default environment when `--env` is omitted (mirrors the CLI).
@@ -86,6 +86,8 @@ impl<'a> SnapshotSource<'a> {
                 notes.push(format!("audit unavailable: {reason}"));
                 Vec::new()
             });
+        let branches = self.load_branches(&mut notes);
+        let sync = self.load_sync_data(&mut notes);
 
         LoadedState {
             snapshot: Snapshot { notes, ..snapshot },
@@ -95,6 +97,8 @@ impl<'a> SnapshotSource<'a> {
             broker,
             policy_names: agents_snapshot.policy_names,
             editor_seed: agents_snapshot.editor_seed,
+            branches,
+            sync,
         }
     }
 
@@ -283,6 +287,44 @@ impl<'a> SnapshotSource<'a> {
             agents: AgentsData { list, details },
             policy_names,
             editor_seed,
+        }
+    }
+
+    /// Branch names usable as promotion sources; a broken history store
+    /// degrades to an empty list plus a note.
+    fn load_branches(&self, notes: &mut Vec<String>) -> Vec<String> {
+        match self.services.history().branches() {
+            Ok(branches) => branches.into_iter().map(|(name, _)| name).collect(),
+            Err(err) => {
+                notes.push(format!("branches unavailable: {err}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Control-plane remotes and login presence for the sync view.
+    /// Reads only token-free coordinates (`remote.json`); the session
+    /// file's existence is checked without ever reading its contents.
+    fn load_sync_data(&self, notes: &mut Vec<String>) -> SyncData {
+        let remotes =
+            match vaultx_sync_client::load_remote_config(self.services.context().vault_dir()) {
+                Ok(config) => config
+                    .remotes
+                    .into_iter()
+                    .map(|(name, entry)| RemoteRow {
+                        name,
+                        server: entry.server,
+                        project_id: entry.project_id,
+                    })
+                    .collect(),
+                Err(err) => {
+                    notes.push(format!("remotes unavailable: {err}"));
+                    Vec::new()
+                }
+            };
+        SyncData {
+            remotes,
+            logged_in: vaultx_sync_client::session_path().is_file(),
         }
     }
 
@@ -559,6 +601,12 @@ fn probe_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Blocks on one async operation (sync push/pull/sync) using the shared
+/// runtime so refresh paths and actions never spawn extra runtimes.
+pub(crate) fn run_blocking<F: std::future::Future>(future: F) -> F::Output {
+    probe_runtime().block_on(future)
+}
+
 fn probe_endpoint(endpoint: PathBuf) -> Result<String, String> {
     probe_runtime().block_on(async move {
         let attempt = async {
@@ -666,5 +714,64 @@ mod tests {
         let denies = query_audit_rows(&path, OutcomeFilter::Deny, AUDIT_LIMIT).expect("query");
         assert_eq!(denies.len(), 2);
         assert!(denies.iter().all(|row| !row.allowed));
+    }
+
+    #[test]
+    fn loader_fills_branches_environments_and_sync_view_data() {
+        use vaultx_sync_client::files::write_atomic;
+
+        let dir = TempDir::new().expect("temp dir");
+        let services = vaultx_core::VaultxServices::init(dir.path()).expect("init project");
+
+        // Seed a commit so a branch and an environment ref exist.
+        services.config().set_config("A", "1").unwrap();
+        services.history().commit("baseline", "user:e").unwrap();
+        services
+            .environments()
+            .create_environment("development")
+            .unwrap();
+        services
+            .environments()
+            .protect_environment("development", true)
+            .unwrap();
+
+        // Token-free remote coordinates only; no session file exists.
+        let mut config = vaultx_sync_client::RemoteConfig::default();
+        config.remotes.insert(
+            "origin".to_owned(),
+            vaultx_sync_client::RemoteEntry {
+                server: "https://cp.example.com".to_owned(),
+                project_id: "proj_team".to_owned(),
+            },
+        );
+        write_atomic(
+            &services.context().vault_dir().join("remote.json"),
+            &serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = SnapshotSource::new(&services, None).load(BrokerStatus::default());
+
+        assert_eq!(loaded.branches, vec!["main".to_owned()]);
+        assert_eq!(loaded.snapshot.envs.len(), 1);
+        assert!(loaded.snapshot.envs[0].protected);
+        assert!(!loaded.sync.remotes.is_empty());
+        assert_eq!(loaded.sync.remotes[0].name, "origin");
+        assert_eq!(loaded.sync.remotes[0].server, "https://cp.example.com");
+        assert_eq!(
+            loaded.sync.logged_in,
+            vaultx_sync_client::session_path().is_file()
+        );
+
+        // A corrupt remote.json degrades to an empty list plus a note,
+        // never a failed load.
+        std::fs::write(services.context().vault_dir().join("remote.json"), "{bad").unwrap();
+        let degraded = SnapshotSource::new(&services, None).load(BrokerStatus::default());
+        assert!(degraded.sync.remotes.is_empty());
+        assert!(degraded
+            .snapshot
+            .notes
+            .iter()
+            .any(|note| note.contains("remotes unavailable")));
     }
 }

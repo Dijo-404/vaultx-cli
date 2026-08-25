@@ -582,7 +582,7 @@ fn login_stores_credentials_and_rejects_bad_tokens() {
     assert!(out.contains("credentials stored"), "got: {out}");
 
     // Stored outside any repository, owner-only on unix.
-    let path = crate::remoting::session_path();
+    let path = vaultx_sync_client::session_path();
     assert!(path.is_file());
     #[cfg(unix)]
     {
@@ -1070,7 +1070,7 @@ fn session_file_exists() -> bool {
 
 fn remove_session_file() {
     if session_file_exists() {
-        std::fs::remove_file(crate::remoting::session_path()).expect("remove session file");
+        std::fs::remove_file(vaultx_sync_client::session_path()).expect("remove session file");
     }
 }
 

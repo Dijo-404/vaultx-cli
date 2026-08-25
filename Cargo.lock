@@ -2834,8 +2834,6 @@ dependencies = [
  "axum",
  "base64",
  "clap",
- "getrandom 0.2.17",
- "hex",
  "http",
  "http-body-util",
  "reqwest",
@@ -2853,7 +2851,6 @@ dependencies = [
  "vaultx-core",
  "vaultx-crypto",
  "vaultx-http",
- "vaultx-keyring",
  "vaultx-mcp",
  "vaultx-policy",
  "vaultx-policy-packs",
@@ -3001,9 +2998,11 @@ name = "vaultx-sync-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "getrandom 0.2.17",
  "hex",
  "http",
  "http-body-util",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -3039,6 +3038,7 @@ dependencies = [
  "vaultx-core",
  "vaultx-policy",
  "vaultx-policy-packs",
+ "vaultx-sync-client",
  "vaultx-types",
 ]
 

@@ -4,109 +4,47 @@
 //!
 //! Credential handling (INV-012): the session token never enters any
 //! repository file or rendered output. It lives in
-//! `$XDG_RUNTIME_DIR/vaultx/session.json` (mode 0600), a tmpfs-backed
-//! location on conforming systems that is wiped at reboot — hence
-//! re-login after every boot. Only non-secret coordinates (server URL,
-//! project id) are stored under `.vaultx/remote.json`. No OS-keyring
-//! helper exists in `vaultx-keyring` (only dev/test stores), so the
-//! runtime-directory choice is deliberate.
+//! `$XDG_RUNTIME_DIR/vaultx/session.json` (mode 0600) — see
+//! [`vaultx_sync_client::session`], which owns that file along with
+//! `.vaultx/remote.json`, the hardened reqwest transport, and the device
+//! identity so the CLI and the TUI share ONE hardened implementation.
 //!
+//! What remains here is purely the command surface: argument handling,
+//! output rendering, audit-upload watermarking, and CLI error mapping.
 //! The device signing identity for sync attestations reuses
 //! `.vaultx/device.key` — the same seed commit signing uses — so pushed
 //! commits verify against the attesting device's registered key.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use vaultx_audit::{AppendStore as _, AuditEvent, JsonlAppendStore};
 use vaultx_control_plane::protocol::WorkspaceView;
 use vaultx_core::CoreError;
-use vaultx_crypto::envelope::RootKey;
-use vaultx_crypto::error::CryptoError;
-use vaultx_crypto::signature::SigningKeyPair;
 use vaultx_http::{classify_ip, Classification};
-use vaultx_keyring::WrappingKeyProvider;
-use vaultx_sync_client::transport::{ControlPlaneTransport, TransportRequest, TransportResponse};
-use vaultx_sync_client::{
-    ControlPlaneSyncClient, DeviceKeySource, FsWorkspace, IngestEvent, SyncError, SyncOptions,
-    SyncResult, SyncService,
-};
+use vaultx_sync_client::client::ControlPlaneSyncClient;
+use vaultx_sync_client::context::open_sync_context as open_shared_sync_context;
+use vaultx_sync_client::error::SyncError;
+use vaultx_sync_client::files::write_atomic;
+use vaultx_sync_client::http::HttpTransport;
+use vaultx_sync_client::local::FsWorkspace;
+use vaultx_sync_client::remotes::{load_remote_config, save_remote_config, RemoteEntry};
+use vaultx_sync_client::session::{load_session, store_session, StoredSession};
+use vaultx_sync_client::setup_error::SyncSetupError;
+use vaultx_sync_client::transport::{ControlPlaneTransport as _, TransportRequest};
+use vaultx_sync_client::{IngestEvent, SyncResult, SyncService};
 
 use crate::cli::{CliError, PullStrategy};
 
-/// Name assumed by `push`/`pull`/`sync` when `--remote` is omitted and
-/// more than one remote exists.
-pub(crate) const DEFAULT_REMOTE_NAME: &str = "origin";
-
-/// Conventional remote configuration file inside `.vaultx`.
-const REMOTE_FILE: &str = "remote.json";
 /// Tracks how much of the local audit log has been uploaded remotely.
 const SYNC_STATE_FILE: &str = "sync-state.json";
-/// Directory (under `$XDG_RUNTIME_DIR`) holding the live session token.
-const RUNTIME_SUBDIR: &str = "vaultx";
-
-/// Outbound connect timeout (mirrors the broker transport).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Per-read timeout (mirrors the broker transport).
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Whole-request ceiling (mirrors the broker transport).
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
-/// Hard ceiling on any single control-plane response body.
-const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum events per audit-ingest POST so large backlogs converge
 /// within the control plane's list/body limits.
 const AUDIT_UPLOAD_CHUNK: usize = 1_000;
 
-/// One named remote: where the control plane is and which project this
-/// repository synchronizes with. Deliberately token-free.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RemoteEntry {
-    /// Base URL of the control plane.
-    pub server: String,
-    /// Typed project id on the control plane.
-    pub project_id: String,
-}
-
-/// Contents of `.vaultx/remote.json`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct RemoteConfig {
-    #[serde(default)]
-    remotes: BTreeMap<String, RemoteEntry>,
-}
-
-/// Live login credentials. The token is secret: `Debug` redacts it and
-/// no rendering path ever receives it. Serialized only to the 0600
-/// runtime session file, never into any repository.
-#[derive(Clone, Serialize, Deserialize)]
-struct StoredSession {
-    server: String,
-    token: String,
-}
-
-impl std::fmt::Debug for StoredSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StoredSession")
-            .field("server", &self.server)
-            .field("token", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Watermark for client-side audit upload (`--with-audit`). Audit
-/// sequences start at 0, so "nothing uploaded yet" must be distinct
-/// from "everything through 0 uploaded": `None`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct SyncState {
-    #[serde(default)]
-    last_uploaded_sequence: Option<u64>,
-}
-
 // ---------------------------------------------------------------------------
-// Storage helpers
+// Error mapping
 // ---------------------------------------------------------------------------
 
 fn map_io(err: std::io::Error) -> CliError {
@@ -121,157 +59,32 @@ fn runtime_message(message: impl Into<String>) -> CliError {
     CliError::Runtime(CoreError::Io(std::io::Error::other(message.into())))
 }
 
-/// Fresh unpredictable temp-file candidate next to `path` (never a
-/// symlink target: creation uses `create_new`, which refuses existing
-/// entries including symlinks).
-fn tmp_candidate(path: &Path) -> PathBuf {
-    let mut entropy = [0u8; 8];
-    getrandom::getrandom(&mut entropy).expect("OS randomness unavailable");
-    let name = path
-        .file_name()
-        .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned());
-    path.with_file_name(format!(
-        ".{name}.tmp-{}-{}",
-        std::process::id(),
-        hex::encode(entropy)
-    ))
-}
-
-/// Writes `contents` to `path` atomically: creates an exclusive
-/// (`create_new`) owner-only temp file via `candidate` and renames it
-/// over the destination. Name collisions are retried with fresh
-/// candidates; any other error aborts.
-pub(crate) fn write_atomic_via<F>(
-    path: &Path,
-    contents: &str,
-    mut candidate: F,
-) -> Result<(), std::io::Error>
-where
-    F: FnMut() -> PathBuf,
-{
-    for _ in 0..16 {
-        let tmp = candidate();
-        #[cfg(unix)]
-        let opened = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)
-        };
-        #[cfg(not(unix))]
-        let opened = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp);
-        match opened {
-            Ok(mut file) => {
-                use std::io::Write as _;
-                file.write_all(contents.as_bytes())?;
-                drop(file);
-                return match std::fs::rename(&tmp, path) {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        Err(err)
-                    }
-                };
-            }
-            // Predicted name lost a race (or was planted): try a new one.
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
-        }
+/// Maps the shared sync-setup error family onto the CLI's, preserving
+/// the usage/runtime split that drives exit codes.
+fn map_setup_error(err: SyncSetupError) -> CliError {
+    match err {
+        SyncSetupError::Usage(message) => CliError::Usage(message),
+        SyncSetupError::Io(io) => CliError::Runtime(CoreError::Io(io)),
     }
-    Err(std::io::Error::other(
-        "could not create a unique temporary file after 16 attempts",
-    ))
 }
 
-/// Writes `contents` atomically (exclusive temp file + rename) so
-/// concurrent readers never observe torn JSON.
-fn write_atomic(path: &Path, contents: &str) -> Result<(), CliError> {
-    let parent = path.parent().ok_or_else(|| {
-        map_io(std::io::Error::other(
-            "configuration path has no parent directory",
-        ))
-    })?;
-    std::fs::create_dir_all(parent).map_err(map_io)?;
-    write_atomic_via(path, contents, || tmp_candidate(path)).map_err(map_io)
+/// Wraps a [`SyncError`] into the CLI error family without echoing any
+/// wire material (SyncError displays are already secret-free).
+fn map_sync_error(err: SyncError) -> CliError {
+    runtime_message(err.to_string())
 }
 
-/// Ensures `dir` exists with owner-only permissions (0700 on unix) —
-/// applied to the runtime session directory before any token lands
-/// there.
-fn ensure_private_dir(dir: &Path) -> Result<(), CliError> {
-    std::fs::create_dir_all(dir).map_err(map_io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(dir).map_err(map_io)?;
-        if metadata.permissions().mode() & 0o777 != 0o700 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(map_io)?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// Audit-upload watermark (CLI-only concern)
+// ---------------------------------------------------------------------------
 
-/// Writes secret material (`path`, `contents`) atomically into an
-/// owner-only private directory.
-fn write_private(path: &Path, contents: &str) -> Result<(), CliError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| map_io(std::io::Error::other("secret path has no parent directory")))?;
-    ensure_private_dir(parent)?;
-    write_atomic(path, contents)
-}
-
-/// `$XDG_RUNTIME_DIR/vaultx/session.json`; falls back to the system temp
-/// directory when `XDG_RUNTIME_DIR` is unset.
-pub(crate) fn session_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
-    base.join(RUNTIME_SUBDIR).join("session.json")
-}
-
-fn load_session() -> Result<StoredSession, CliError> {
-    let text = std::fs::read_to_string(session_path())
-        .map_err(|_| usage("not logged in; run `vaultx login --server <URL>` first"))?;
-    serde_json::from_str::<StoredSession>(&text)
-        .map_err(|_| runtime_message("stored session is corrupt; run `vaultx login` again"))
-}
-
-fn store_session(session: &StoredSession) -> Result<(), CliError> {
-    let json = serde_json::to_string(session)
-        .map_err(|_| runtime_message("session serialization failed"))?;
-    write_private(&session_path(), &json)
-}
-
-fn load_remote_config(vault_dir: &Path) -> Result<RemoteConfig, CliError> {
-    let path = vault_dir.join(REMOTE_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RemoteConfig::default());
-        }
-        Err(err) => return Err(map_io(err)),
-    };
-    serde_json::from_str(&text).map_err(|err| {
-        runtime_message(format!(
-            "remote config `{}` is corrupt ({err}); delete it and re-run `vaultx remote add`",
-            path.display()
-        ))
-    })
-}
-
-fn save_remote_config(vault_dir: &Path, config: &RemoteConfig) -> Result<(), CliError> {
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|_| runtime_message("remote config serialization failed"))?;
-    write_atomic(&vault_dir.join(REMOTE_FILE), &json)
+/// Watermark for client-side audit upload (`--with-audit`). Audit
+/// sequences start at 0, so "nothing uploaded yet" must be distinct
+/// from "everything through 0 uploaded": `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SyncState {
+    #[serde(default)]
+    last_uploaded_sequence: Option<u64>,
 }
 
 /// Loads the audit-upload watermark. A missing file starts fresh; a
@@ -297,192 +110,16 @@ fn load_sync_state(vault_dir: &Path) -> Result<SyncState, CliError> {
 fn save_sync_state(vault_dir: &Path, state: &SyncState) -> Result<(), CliError> {
     let json = serde_json::to_string(state)
         .map_err(|_| runtime_message("sync state serialization failed"))?;
-    write_atomic(&vault_dir.join(SYNC_STATE_FILE), &json)
-}
-
-/// Resolves the remote entry to use: the explicit name must exist; an
-/// omitted name resolves `origin` first, then falls back to the sole
-/// configured remote.
-fn resolve_remote(
-    vault_dir: &Path,
-    requested: Option<&str>,
-) -> Result<(String, RemoteEntry), CliError> {
-    let config = load_remote_config(vault_dir)?;
-    match requested {
-        Some(name) => config.remotes.get(name).map_or_else(
-            || {
-                Err(usage(format!(
-                    "no remote named `{name}`; run `vaultx remote list`"
-                )))
-            },
-            |entry| Ok((name.to_owned(), entry.clone())),
-        ),
-        None => {
-            if let Some(entry) = config.remotes.get(DEFAULT_REMOTE_NAME) {
-                return Ok((DEFAULT_REMOTE_NAME.to_owned(), entry.clone()));
-            }
-            if config.remotes.len() == 1 {
-                let (name, entry) = config
-                    .remotes
-                    .iter()
-                    .next()
-                    .expect("exactly one remote checked");
-                return Ok((name.clone(), entry.clone()));
-            }
-            Err(usage(
-                "no remote configured; run `vaultx remote add <NAME> --project <PROJECT_ID>`",
-            ))
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
-
-/// [`ControlPlaneTransport`] backed by reqwest (rustls only, mirroring
-/// the broker transport's hardened client). The bearer token rides only
-/// in the Authorization header and never appears in error strings or
-/// [`Debug`] output.
-#[derive(Clone)]
-struct HttpTransport {
-    client: reqwest::Client,
-    server: String,
-    bearer: Arc<String>,
-}
-
-impl std::fmt::Debug for HttpTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpTransport")
-            .field("server", &self.server)
-            .field("bearer", &"<redacted>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl HttpTransport {
-    fn new(server: &str, token: &str) -> Result<Self, CliError> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .timeout(TOTAL_TIMEOUT)
-            .build()
-            .map_err(|err| runtime_message(format!("cannot build HTTP client: {err}")))?;
-        Ok(Self {
-            client,
-            server: server.trim_end_matches('/').to_owned(),
-            bearer: Arc::new(token.to_owned()),
-        })
-    }
-
-    fn url(&self, request: &TransportRequest) -> String {
-        format!("{}{}", self.server, request.path)
-    }
-}
-
-impl ControlPlaneTransport for HttpTransport {
-    async fn send(&self, request: TransportRequest) -> Result<TransportResponse, SyncError> {
-        let url = self.url(&request);
-        let builder = match request.method {
-            "GET" => self.client.get(&url),
-            "POST" => self.client.post(&url),
-            "PUT" => self.client.put(&url),
-            _ => return Err(SyncError::Protocol("unsupported method")),
-        };
-        let mut outgoing = builder.bearer_auth(self.bearer.as_str());
-        if let Some(body) = request.json_body {
-            outgoing = outgoing
-                .header("content-type", "application/json")
-                .body(body);
-        }
-        let response = outgoing.send().await.map_err(|err| {
-            // err Display carries method+URL only — headers (and therefore
-            // the bearer token) are never embedded.
-            SyncError::Transport(err.to_string())
-        })?;
-        let status = response.status().as_u16();
-        // Cap the read so a hostile/misbehaving proxy cannot exhaust
-        // memory with an unbounded body.
-        let body = read_capped(response, MAX_RESPONSE_BYTES).await?;
-        Ok(TransportResponse { status, body })
-    }
-}
-
-/// Reads a response body up to `cap` bytes; anything larger is a
-/// protocol error rather than an OOM.
-async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<String, SyncError> {
-    let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|err| SyncError::Transport(err.to_string()))?
-    {
-        if bytes.len() + chunk.len() > cap {
-            return Err(SyncError::Protocol("response body exceeds size limit"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    String::from_utf8(bytes).map_err(|_| SyncError::Protocol("response body is not valid UTF-8"))
-}
-
-/// Wraps a [`SyncError`] into the CLI error family without echoing any
-/// wire material (SyncError displays are already secret-free).
-fn map_sync_error(err: SyncError) -> CliError {
-    runtime_message(err.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Device identity
-// ---------------------------------------------------------------------------
-
-/// [`WrappingKeyProvider`] reading/writing `.vaultx/device.key` — the
-/// exact file and hex-seed format `vaultx-core`'s history service uses
-/// for commit signatures, so one identity signs commits and attests sync.
-struct ProjectDeviceKey(PathBuf);
-
-impl ProjectDeviceKey {
-    fn parse_seed(text: &str) -> Result<RootKey, CryptoError> {
-        let bytes = hex::decode(text.trim()).map_err(|err| {
-            CryptoError::ProviderError(format!("device key is not valid hex ({err})"))
-        })?;
-        let seed: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
-            CryptoError::ProviderError(format!("expected 32 seed bytes, found {}", bytes.len()))
-        })?;
-        Ok(RootKey::from_bytes(&seed))
-    }
-}
-
-impl WrappingKeyProvider for ProjectDeviceKey {
-    fn obtain(&self) -> Result<RootKey, CryptoError> {
-        match std::fs::read_to_string(&self.0) {
-            Ok(text) => Self::parse_seed(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let pair = SigningKeyPair::generate();
-                let mut seed_hex = String::new();
-                pair.expose_seed(|seed| seed_hex = hex::encode(seed));
-                write_private(&self.0, &format!("{seed_hex}\n")).map_err(|err| {
-                    CryptoError::ProviderError(format!("cannot persist device key: {err}"))
-                })?;
-                Self::parse_seed(&seed_hex)
-            }
-            Err(err) => Err(CryptoError::ProviderError(format!(
-                "cannot read device key: {err}"
-            ))),
-        }
-    }
-
-    fn load(&self) -> Result<RootKey, CryptoError> {
-        let text = std::fs::read_to_string(&self.0)
-            .map_err(|err| CryptoError::ProviderError(format!("cannot read device key: {err}")))?;
-        Self::parse_seed(&text)
-    }
+    write_atomic(&vault_dir.join(SYNC_STATE_FILE), &json).map_err(map_io)
 }
 
 // ---------------------------------------------------------------------------
 // Sync plumbing shared by push / pull / sync / audit upload
 // ---------------------------------------------------------------------------
 
+/// CLI-side view over the shared [`vaultx_sync_client::context`]
+/// assembly, extended with the audit path the `--with-audit` uploader
+/// streams from.
 struct SyncContext {
     client: ControlPlaneSyncClient<HttpTransport, FsWorkspace>,
     project_id: vaultx_types::ProjectId,
@@ -496,34 +133,17 @@ fn open_sync_context(
     authorize_protected: bool,
 ) -> Result<SyncContext, CliError> {
     let ctx = services.context();
-    // Login is the more fundamental prerequisite: report it first so a
-    // completely unconfigured project gets the actionable message.
-    let session = load_session()?;
-    let (_, entry) = resolve_remote(ctx.vault_dir(), requested_remote)?;
-    // A stale remote/server pairing must never receive another plane's
-    // token: after re-login to a different control plane, old remotes
-    // have to be re-added explicitly.
-    if entry.server != session.server {
-        return Err(usage(format!(
-            "remote is bound to {} but the stored login is for {}; \
-             re-run `vaultx remote add` or `vaultx login`",
-            entry.server, session.server
-        )));
-    }
-    let project_id = vaultx_types::ProjectId::parse(&entry.project_id)
-        .map_err(|_| runtime_message("configured remote holds a malformed project id"))?;
-    let transport = HttpTransport::new(&entry.server, &session.token)?;
-    let workspace = FsWorkspace::open(ctx.root()).map_err(map_sync_error)?;
-    let keys = DeviceKeySource::new(Arc::new(ProjectDeviceKey(
-        ctx.vault_dir().join("device.key"),
-    )));
-    let options = SyncOptions {
-        authorize_protected_environments: authorize_protected,
-    };
+    let shared = open_shared_sync_context(
+        ctx.root(),
+        ctx.vault_dir(),
+        requested_remote,
+        authorize_protected,
+    )
+    .map_err(map_setup_error)?;
     Ok(SyncContext {
-        client: ControlPlaneSyncClient::with_options(transport, workspace, keys, options),
-        project_id,
-        vault_dir: ctx.vault_dir().to_path_buf(),
+        client: shared.client,
+        project_id: shared.project_id,
+        vault_dir: shared.vault_dir,
         audit_path: ctx.audit_path(),
     })
 }
@@ -567,7 +187,7 @@ fn upload_pending_audit(ctx: &SyncContext) -> Result<String, CliError> {
                 .upload_audit_events(ctx.project_id.clone(), batch),
         )
         .map_err(map_sync_error)?;
-        let rejected: std::collections::HashMap<usize, &str> = result
+        let rejected: HashMap<usize, &str> = result
             .rejected
             .iter()
             .map(|r| (r.index, r.reason.as_str()))
@@ -615,7 +235,7 @@ fn chunk_sequences(chunk: &[&AuditEvent]) -> Vec<u64> {
 /// `(sequence, reason)` pairs were rejected by position.
 pub(crate) fn reconcile_chunk(
     sequences: &[u64],
-    rejected: &std::collections::HashMap<usize, &str>,
+    rejected: &HashMap<usize, &str>,
 ) -> (usize, Vec<(u64, String)>) {
     let mut skipped = Vec::new();
     for (index, sequence) in sequences.iter().enumerate() {
@@ -686,7 +306,7 @@ pub(crate) fn cmd_login(server: &str, token_arg: Option<&str>) -> Result<String,
         return Err(usage("a non-empty session token is required"));
     }
 
-    let transport = HttpTransport::new(&normalized, &token)?;
+    let transport = HttpTransport::new(&normalized, &token).map_err(map_setup_error)?;
     let response = crate::cli::run_async(transport.send(TransportRequest::get("/workspaces")))
         .map_err(map_sync_error)?;
     if !response.is_success() {
@@ -700,7 +320,8 @@ pub(crate) fn cmd_login(server: &str, token_arg: Option<&str>) -> Result<String,
     store_session(&StoredSession {
         server: normalized.clone(),
         token,
-    })?;
+    })
+    .map_err(map_setup_error)?;
     Ok(format!(
         "authenticated against {normalized}; {} workspace(s) visible; credentials stored \
          (re-login required after reboot)",
@@ -760,11 +381,11 @@ pub(crate) fn cmd_remote_add(
     let name = validate_remote_name(name)?;
     let parsed_project = vaultx_types::ProjectId::parse(project_id)
         .map_err(|_| usage(format!("invalid project id `{project_id}`")))?;
-    let session = load_session()?;
+    let session = load_session().map_err(map_setup_error)?;
 
     // Early verification: the stored session must actually see this
     // project, so typos fail here instead of at the next push.
-    let transport = HttpTransport::new(&session.server, &session.token)?;
+    let transport = HttpTransport::new(&session.server, &session.token).map_err(map_setup_error)?;
     let response = crate::cli::run_async(
         transport.send(TransportRequest::get(format!("/projects/{parsed_project}"))),
     )
@@ -778,7 +399,7 @@ pub(crate) fn cmd_remote_add(
     }
 
     let vault_dir = services.context().vault_dir().to_path_buf();
-    let mut config = load_remote_config(&vault_dir)?;
+    let mut config = load_remote_config(&vault_dir).map_err(map_setup_error)?;
     if config.remotes.contains_key(&name) {
         return Err(usage(format!(
             "remote `{name}` already exists; remove it first"
@@ -791,7 +412,7 @@ pub(crate) fn cmd_remote_add(
             project_id: parsed_project.to_string(),
         },
     );
-    save_remote_config(&vault_dir, &config)?;
+    save_remote_config(&vault_dir, &config).map_err(map_setup_error)?;
     Ok(format!("remote `{name}` -> {parsed_project}"))
 }
 
@@ -812,7 +433,7 @@ fn validate_remote_name(name: &str) -> Result<String, CliError> {
 
 /// `vaultx remote list`.
 pub(crate) fn cmd_remote_list(services: &vaultx_core::VaultxServices) -> Result<String, CliError> {
-    let config = load_remote_config(services.context().vault_dir())?;
+    let config = load_remote_config(services.context().vault_dir()).map_err(map_setup_error)?;
     if config.remotes.is_empty() {
         return Ok("no remotes configured".to_owned());
     }
@@ -861,18 +482,18 @@ pub(crate) fn cmd_remote_remove(
     name: &str,
 ) -> Result<String, CliError> {
     let vault_dir = services.context().vault_dir().to_path_buf();
-    let mut config = load_remote_config(&vault_dir)?;
+    let mut config = load_remote_config(&vault_dir).map_err(map_setup_error)?;
     if config.remotes.remove(name).is_none() {
         return Err(usage(format!("no remote named `{name}`")));
     }
-    save_remote_config(&vault_dir, &config)?;
+    save_remote_config(&vault_dir, &config).map_err(map_setup_error)?;
     Ok(format!("removed remote `{name}`"))
 }
 
 /// `vaultx workspace list` — thin GET /workspaces through the transport.
 pub(crate) fn cmd_workspace_list() -> Result<String, CliError> {
-    let session = load_session()?;
-    let transport = HttpTransport::new(&session.server, &session.token)?;
+    let session = load_session().map_err(map_setup_error)?;
+    let transport = HttpTransport::new(&session.server, &session.token).map_err(map_setup_error)?;
     let response = crate::cli::run_async(transport.send(TransportRequest::get("/workspaces")))
         .map_err(map_sync_error)?;
     if !response.is_success() {
@@ -895,8 +516,8 @@ pub(crate) fn cmd_workspace_list() -> Result<String, CliError> {
 
 /// `vaultx workspace create <NAME>` — thin POST /workspaces.
 pub(crate) fn cmd_workspace_create(name: &str) -> Result<String, CliError> {
-    let session = load_session()?;
-    let transport = HttpTransport::new(&session.server, &session.token)?;
+    let session = load_session().map_err(map_setup_error)?;
+    let transport = HttpTransport::new(&session.server, &session.token).map_err(map_setup_error)?;
     // The server mints its own typed id; the body id is a required-but-
     // ignored placeholder shaped to pass deserialization.
     let body = serde_json::json!({ "id": "ws_placeholder", "name": name });
@@ -1043,6 +664,7 @@ pub(crate) fn cmd_audit_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vaultx_sync_client::DeviceKeySource;
 
     #[test]
     fn remote_names_are_validated() {
@@ -1065,34 +687,57 @@ mod tests {
         assert!(normalize_server("vaultx.example.com").is_err());
     }
 
-    #[test]
-    fn device_key_provider_round_trips_the_history_format() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("device.key");
-        let provider = ProjectDeviceKey(path.clone());
-
-        let created = provider.obtain().expect("first obtain creates");
-        // Same file, second source: identical identity.
-        let reloaded = ProjectDeviceKey(path).load().expect("reload");
-        let mut a = [0u8; 32];
-        let mut b = [0u8; 32];
-        created.expose(|s| a.copy_from_slice(s));
-        reloaded.expose(|s| b.copy_from_slice(s));
-        assert_eq!(a, b);
-
-        // Corrupt seeds are refused, never silently replaced.
-        std::fs::write(dir.path().join("bad"), "zzz").unwrap();
-        assert!(ProjectDeviceKey(dir.path().join("bad")).load().is_err());
-    }
-
     #[cfg(unix)]
     #[test]
     fn session_files_get_owner_only_permissions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("session.json");
-        write_atomic(&path, "{\"server\":\"https://x\",\"token\":\"vxs_t\"}").unwrap();
+        vaultx_sync_client::files::write_atomic(
+            &path,
+            "{\"server\":\"https://x\",\"token\":\"vxs_t\"}",
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn device_key_source_round_trips_the_history_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = || vaultx_sync_client::FileDeviceKeySource::new(dir.path().join("device.key"));
+
+        let created = DeviceKeySource::new(std::sync::Arc::new(source()))
+            .signing_key()
+            .expect("first obtain creates");
+
+        // Same file, second source: identical identity.
+        let reloaded = DeviceKeySource::new(std::sync::Arc::new(source()))
+            .signing_key()
+            .expect("reload");
+        assert_eq!(
+            created.verifying_public_key().to_bytes(),
+            reloaded.verifying_public_key().to_bytes()
+        );
+
+        // Corrupt seeds are refused, never silently replaced.
+        std::fs::write(dir.path().join("bad"), "zzz").unwrap();
+        assert!(DeviceKeySource::new(std::sync::Arc::new(
+            vaultx_sync_client::FileDeviceKeySource::new(dir.path().join("bad"))
+        ))
+        .signing_key()
+        .is_err());
+    }
+
+    #[test]
+    fn setup_errors_keep_the_usage_runtime_split() {
+        assert!(matches!(
+            map_setup_error(SyncSetupError::Usage("hint".to_owned())),
+            CliError::Usage(_)
+        ));
+        assert!(matches!(
+            map_setup_error(SyncSetupError::Io(std::io::Error::other("boom"))),
+            CliError::Runtime(_)
+        ));
     }
 }

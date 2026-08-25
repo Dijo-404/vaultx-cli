@@ -12,7 +12,13 @@
 //! - **policy** — form/tree editing for common rules plus a raw YAML view
 //!   with continuous validation; invalid documents are visibly flagged
 //!   and can never be applied without explicit confirmation,
-//! - **audit** — the local hash-chained trail filtered by allow/deny.
+//! - **audit** — the local hash-chained trail filtered by allow/deny,
+//! - **promote** — environment promotion: pick a source branch and a
+//!   target environment (NAME / PROTECTED / PINNED COMMIT); protected
+//!   targets require explicit confirmation and promote with force,
+//! - **sync** — configured control-plane remotes with login presence
+//!   plus push/pull/sync driven through the same hardened sync client
+//!   the CLI uses (plan §38).
 //!
 //! # Architecture
 //!

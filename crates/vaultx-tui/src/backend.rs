@@ -18,10 +18,11 @@ use ratatui::Terminal;
 
 use vaultx_broker::SessionStore as _;
 use vaultx_core::VaultxServices;
+use vaultx_sync_client::SyncService as _;
 
 use crate::data::{self, SnapshotSource};
 use crate::error::TuiError;
-use crate::state::{App, Effect, KeyCode, KeyInput};
+use crate::state::{sync_result_lines, App, Effect, KeyCode, KeyInput};
 use crate::view;
 
 /// Launch configuration for [`run`], mirroring sibling CLI commands.
@@ -141,8 +142,98 @@ fn apply_effect(
                 app.status = format!("revoke failed: {err}");
             }
         },
+        Effect::Promote {
+            from_ref,
+            to_env,
+            force,
+        } => match services.environments().promote(&from_ref, &to_env, force) {
+            Ok(()) => {
+                // Refresh first so the status line can name the commit
+                // the target environment now pins.
+                reload(app, source);
+                let commit = app
+                    .loaded
+                    .snapshot
+                    .envs
+                    .iter()
+                    .find(|env| env.name == to_env)
+                    .and_then(|env| env.commit_short.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                app.status = format!("promoted {from_ref} -> {to_env} ({commit})");
+            }
+            Err(err) => {
+                app.status = format!("promote failed: {err}");
+            }
+        },
+        Effect::Push => run_sync_action(app, source, services, "push", SyncAction::Push),
+        Effect::Pull => run_sync_action(app, source, services, "pull", SyncAction::Pull),
+        Effect::SyncAll => run_sync_action(app, source, services, "sync", SyncAction::SyncAll),
     }
     Ok(())
+}
+
+/// Which shared sync operation one action runs.
+enum SyncAction {
+    Push,
+    Pull,
+    SyncAll,
+}
+
+/// Opens the shared sync context and runs one push/pull/sync through
+/// [`vaultx_sync_client`] — the exact same hardened client the CLI uses.
+/// Results land as lines in `app.sync_lines`; failures surface on the
+/// status line (error text is secret-free by construction).
+fn run_sync_action(
+    app: &mut App,
+    source: &SnapshotSource<'_>,
+    services: &VaultxServices,
+    label: &str,
+    action: SyncAction,
+) {
+    let ctx = services.context();
+    let opened = vaultx_sync_client::open_sync_context(ctx.root(), ctx.vault_dir(), None, false);
+    let opened = match opened {
+        Ok(opened) => opened,
+        Err(err) => {
+            app.sync_lines.clear();
+            app.status = format!("{label} failed: {err}");
+            return;
+        }
+    };
+    let project = opened.project_id.clone();
+    let outcome = data::run_blocking(async {
+        match action {
+            SyncAction::Push => opened.client.push(project).await,
+            SyncAction::Pull => opened.client.pull(project).await,
+            SyncAction::SyncAll => {
+                let pushed = opened.client.push(project.clone()).await?;
+                let pulled = opened.client.pull(project).await?;
+                Ok(vaultx_sync_client::SyncResult {
+                    uploaded: pushed.uploaded,
+                    downloaded: pulled.downloaded,
+                    conflicts: {
+                        let mut all = pushed.conflicts;
+                        all.extend(pulled.conflicts);
+                        all
+                    },
+                    policies_applied: pulled.policies_applied,
+                })
+            }
+        }
+    });
+    match outcome {
+        Ok(result) => {
+            app.sync_lines = sync_result_lines(label, &result);
+            app.status = app.sync_lines.first().cloned().unwrap_or_default();
+            if matches!(action, SyncAction::Pull | SyncAction::SyncAll) && result.is_converged() {
+                reload(app, source);
+            }
+        }
+        Err(err) => {
+            app.sync_lines.clear();
+            app.status = format!("{label} failed: {err}");
+        }
+    }
 }
 
 fn reload(app: &mut App, source: &SnapshotSource<'_>) {

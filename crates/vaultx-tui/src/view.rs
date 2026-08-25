@@ -8,11 +8,11 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
 use crate::mask::{MASK, NON_REVEALABLE};
-use crate::state::{AgentFocus, App, Modal, Pane, Route, ValidationState};
+use crate::state::{AgentFocus, App, Modal, Pane, PromoteFocus, Route, ValidationState};
 
 const HIGHLIGHT: Style = Style::new().fg(Color::Yellow);
 const FOCUSED_BORDER: Style = Style::new().fg(Color::Yellow);
@@ -45,6 +45,8 @@ pub fn render(f: &mut Frame, app: &App) {
         Route::Agents => render_agents(f, app, rows[1]),
         Route::PolicyEditor => render_policy_editor(f, app, rows[1]),
         Route::Audit => render_audit(f, app, rows[1]),
+        Route::Promote => render_promote(f, app, rows[1]),
+        Route::Sync => render_sync(f, app, rows[1]),
     }
 
     let bottom = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(rows[2]);
@@ -116,7 +118,7 @@ pub fn binding_pairs(app: &App) -> Vec<(String, String)> {
         ];
     }
     let mut base = vec![
-        ("1-5".to_owned(), "views".to_owned()),
+        ("1-7".to_owned(), "views".to_owned()),
         ("r".to_owned(), "refresh".to_owned()),
         ("q".to_owned(), "quit".to_owned()),
     ];
@@ -139,6 +141,16 @@ pub fn binding_pairs(app: &App) -> Vec<(String, String)> {
             base.insert(0, ("t".to_owned(), "form/raw".to_owned()));
             base.insert(1, ("enter".to_owned(), "edit field".to_owned()));
             base.insert(2, ("ctrl+s".to_owned(), "apply".to_owned()));
+        }
+        Route::Promote => {
+            base.insert(0, ("tab".to_owned(), "ref/env".to_owned()));
+            base.insert(1, ("↑↓".to_owned(), "select".to_owned()));
+            base.insert(2, ("enter".to_owned(), "promote".to_owned()));
+        }
+        Route::Sync => {
+            base.insert(0, ("u".to_owned(), "push".to_owned()));
+            base.insert(1, ("d".to_owned(), "pull".to_owned()));
+            base.insert(2, ("s".to_owned(), "sync".to_owned()));
         }
     }
     base
@@ -829,6 +841,166 @@ fn truncate(text: &str, max_chars: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Promotion view (plan §38 "environment promotion view")
+// ---------------------------------------------------------------------------
+
+fn render_promote(f: &mut Frame, app: &App, area: Rect) {
+    let refs_focused = app.promote_focus == PromoteFocus::Refs;
+    let envs_focused = !refs_focused;
+    let stacked = app.stacked_layout();
+
+    // Wide terminals show the two lists side by side; small ones stack
+    // them above the target summary so no section is clipped away.
+    let areas: [Rect; 3] = if !stacked {
+        let rows = Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).split(area);
+        let cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(rows[0]);
+        [cols[0], cols[1], rows[1]]
+    } else {
+        let chunks = Layout::vertical([
+            Constraint::Min(4),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
+        .split(area);
+        [chunks[0], chunks[1], chunks[2]]
+    };
+
+    let ref_items: Vec<ListItem> = app
+        .loaded
+        .branches
+        .iter()
+        .map(|name| ListItem::new(Line::from(name.clone())))
+        .collect();
+    list_block(
+        f,
+        ref_items,
+        areas[0],
+        "source refs",
+        refs_focused,
+        Some(app.promote_ref_selected),
+    );
+
+    render_env_table(
+        f,
+        app,
+        areas[1],
+        envs_focused,
+        Some(app.promote_env_selected),
+    );
+
+    f.render_widget(
+        Paragraph::new(promotion_target_line(app))
+            .block(block_for("promotion target", false))
+            .wrap(Wrap { trim: true }),
+        areas[2],
+    );
+}
+
+/// NAME / PROTECTED / PINNED COMMIT table over the environment rows.
+fn render_env_table(f: &mut Frame, app: &App, area: Rect, focused: bool, selected: Option<usize>) {
+    let header = Row::new(["NAME", "PROTECTED", "PINNED COMMIT"])
+        .style(Style::new().add_modifier(Modifier::BOLD));
+    let rows = app.loaded.snapshot.envs.iter().map(|env| {
+        Row::new(vec![
+            Cell::from(env.name.clone()),
+            Cell::from(if env.protected { "yes" } else { "no" }),
+            Cell::from(env.commit_short.clone().unwrap_or_else(|| "—".to_owned())),
+        ])
+    });
+    let widths = [
+        Constraint::Percentage(40),
+        Constraint::Percentage(25),
+        Constraint::Percentage(35),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block_for("environments", focused))
+        .row_highlight_style(HIGHLIGHT.add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    let mut state = ratatui::widgets::TableState::default();
+    state.select(selected);
+    f.render_stateful_widget(table, area, &mut state);
+}
+
+/// One-line description of what Enter would promote right now.
+fn promotion_target_line(app: &App) -> String {
+    match (app.selected_promote_ref(), app.selected_promote_env()) {
+        (Some(from_ref), Some(env)) => {
+            let guard = if env.protected {
+                " (protected: needs confirm)"
+            } else {
+                ""
+            };
+            format!("enter promotes {from_ref} -> {}{guard}", env.name)
+        }
+        _ => "(nothing selected)".to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sync view (plan §38)
+// ---------------------------------------------------------------------------
+
+fn render_sync(f: &mut Frame, app: &App, area: Rect) {
+    let stacked = app.stacked_layout();
+
+    // Both layouts keep the remote/login section pinned above the
+    // results log so the control-plane context never scrolls away.
+    let (top, results) = if !stacked {
+        let rows =
+            Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
+        (rows[0], rows[1])
+    } else {
+        let rows = Layout::vertical([Constraint::Min(5), Constraint::Min(4)]).split(area);
+        (rows[0], rows[1])
+    };
+
+    let login = app.loaded.sync.login_label().to_owned();
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        login.clone(),
+        if app.loaded.sync.logged_in {
+            ALLOW_STYLE
+        } else {
+            DENY_STYLE.add_modifier(Modifier::BOLD)
+        },
+    ))];
+    if app.loaded.sync.remotes.is_empty() {
+        lines.push(Line::from("(no remotes configured)"));
+    }
+    for (index, remote) in app.loaded.sync.remotes.iter().enumerate() {
+        let marker = if index == app.sync_selected {
+            "> "
+        } else {
+            "  "
+        };
+        lines.push(Line::from(format!(
+            "{marker}{}  {}  {}",
+            remote.name, remote.project_id, remote.server
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(block_for("control plane", true)),
+        top,
+    );
+
+    let result_lines: Vec<Line> = if app.sync_lines.is_empty() {
+        vec![Line::from("(no sync run yet — u push · d pull · s sync)")]
+    } else {
+        app.sync_lines
+            .iter()
+            .map(|l| Line::from(l.clone()))
+            .collect()
+    };
+    f.render_widget(
+        Paragraph::new(result_lines)
+            .block(block_for("last sync", false))
+            .wrap(Wrap { trim: false }),
+        results,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Modal
 // ---------------------------------------------------------------------------
 
@@ -1232,18 +1404,141 @@ mod tests {
         // removed rows) and render every route: nothing may panic.
         app.loaded.audit.truncate(1);
         app.loaded.diff.clear();
+        app.sync_lines = vec!["stale result line".to_owned()];
 
-        for route in [
-            Route::Dashboard,
-            Route::Diff,
-            Route::Agents,
-            Route::PolicyEditor,
-            Route::Audit,
-        ] {
+        for route in Route::ALL {
             app.route = route;
             let screen = render_app(&app, 110, 30);
             assert!(!screen.is_empty());
         }
+
+        // Same sweep in stacked mode.
+        app.handle_resize(80, 24);
+        for route in Route::ALL {
+            app.route = route;
+            let screen = render_app(&app, 80, 24);
+            assert!(!screen.is_empty());
+        }
+    }
+
+    #[test]
+    fn promote_view_renders_columns_selection_and_stacks_when_small() {
+        let mut app = sample_app();
+        app.route = Route::Promote;
+
+        let large = render_app(&app, 130, 40);
+        for token in [
+            "source refs",
+            "environments",
+            "NAME",
+            "PROTECTED",
+            "PINNED COMMIT",
+            "feature/login",
+            "main",
+            "development",
+            "production",
+            "promotion target",
+        ] {
+            assert!(
+                large.contains(token),
+                "missing `{token}` in large promote view"
+            );
+        }
+        assert!(large.contains("yes"), "protected flag must render");
+        assert!(large.contains("enter promotes feature/login -> development"));
+
+        // Small terminal: both sections plus the summary stay visible,
+        // stacked vertically.
+        app.handle_resize(80, 24);
+        let small = render_app(&app, 80, 24);
+        for token in [
+            "source refs",
+            "environments",
+            "PINNED COMMIT",
+            "promotion target",
+            "development",
+        ] {
+            assert!(
+                small.contains(token),
+                "missing `{token}` in stacked promote view"
+            );
+        }
+
+        // Selecting the protected env updates the summary guard text.
+        send(&mut app, press(KeyCode::Tab));
+        send(&mut app, press(KeyCode::Down));
+        app.handle_resize(100, 30);
+        let guarded = render_app(&app, 100, 30);
+        assert!(guarded.contains("protected: needs confirm"));
+    }
+
+    #[test]
+    fn sync_view_renders_login_remotes_and_last_run_lines() {
+        let mut app = sample_app();
+        app.route = Route::Sync;
+        app.sync_lines = crate::state::sync_result_lines(
+            "sync",
+            &vaultx_sync_client::SyncResult {
+                uploaded: 2,
+                downloaded: 1,
+                conflicts: Vec::new(),
+                policies_applied: 3,
+            },
+        );
+
+        let large = render_app(&app, 130, 40);
+        for token in [
+            "control plane",
+            "login: present",
+            "origin",
+            "proj_team",
+            "https://cp.example.com",
+            "last sync",
+            "sync: uploaded 2 object(s), downloaded 1 object(s)",
+            "policies applied: 3",
+            "refs: converged (no conflicts)",
+        ] {
+            assert!(
+                large.contains(token),
+                "missing `{token}` in large sync view"
+            );
+        }
+
+        // Small terminal keeps every section.
+        app.handle_resize(80, 24);
+        let small = render_app(&app, 80, 24);
+        for token in [
+            "control plane",
+            "login: present",
+            "last sync",
+            "policies applied: 3",
+        ] {
+            assert!(
+                small.contains(token),
+                "missing `{token}` in stacked sync view"
+            );
+        }
+
+        // Missing login renders the actionable hint, never any token
+        // material (there is deliberately none in state).
+        let mut offline = sample_app();
+        offline.route = Route::Sync;
+        offline.loaded.sync.logged_in = false;
+        assert!(render_app(&offline, 110, 30).contains("login: missing"));
+    }
+
+    #[test]
+    fn binding_bar_lists_actions_for_the_new_views() {
+        let mut app = sample_app();
+        send(&mut app, key('6'));
+        assert!(binding_pairs(&app).contains(&("tab".to_owned(), "ref/env".to_owned())));
+        assert!(binding_pairs(&app).contains(&("enter".to_owned(), "promote".to_owned())));
+
+        send(&mut app, key('7'));
+        let pairs = binding_pairs(&app);
+        assert!(pairs.contains(&("u".to_owned(), "push".to_owned())));
+        assert!(pairs.contains(&("d".to_owned(), "pull".to_owned())));
+        assert!(pairs.contains(&("s".to_owned(), "sync".to_owned())));
     }
 
     #[test]

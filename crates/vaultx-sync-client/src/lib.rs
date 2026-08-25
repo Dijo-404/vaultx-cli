@@ -34,18 +34,36 @@
 //! native `async fn` (stable since 1.75) to keep dependencies minimal.
 
 pub mod client;
+#[cfg(feature = "reqwest")]
+pub mod context;
 pub mod device;
+pub mod device_file;
 pub mod error;
+pub mod files;
+#[cfg(feature = "reqwest")]
+pub mod http;
 pub mod local;
+pub mod remotes;
+pub mod session;
+pub mod setup_error;
 pub mod transport;
 
 use vaultx_types::CommitId;
 use vaultx_types::ProjectId;
 
 pub use client::{ControlPlaneSyncClient, SyncOptions};
+#[cfg(feature = "reqwest")]
+pub use context::{open_sync_context, HttpSyncContext, OpenSyncContext};
 pub use device::DeviceKeySource;
+pub use device_file::FileDeviceKeySource;
 pub use error::SyncError;
 pub use local::{FsWorkspace, LocalWorkspace, RefApplyOutcome};
+pub use remotes::{
+    load_remote_config, resolve_remote, save_remote_config, RemoteConfig, RemoteEntry,
+    DEFAULT_REMOTE_NAME,
+};
+pub use session::{load_session, session_path, store_session, StoredSession};
+pub use setup_error::{SyncSetupError, SyncSetupResult};
 pub use transport::{ControlPlaneTransport, TransportRequest, TransportResponse};
 
 /// Which ref namespace a synchronized ref belongs to. Re-exported from the

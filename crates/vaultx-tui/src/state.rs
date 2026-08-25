@@ -66,7 +66,7 @@ pub struct KeyInput {
 // Views, panes, filters
 // ---------------------------------------------------------------------------
 
-/// Top-level switchable views (plan §15); digits 1–5 select them.
+/// Top-level switchable views (plan §15); digits 1–7 select them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Route {
     /// LazyGit-style dashboard (env/branch · variables · history ·
@@ -81,16 +81,23 @@ pub enum Route {
     PolicyEditor,
     /// Local audit trail with outcome filters.
     Audit,
+    /// Environment promotion: pick a source ref and a target env
+    /// (plan §38 "environment promotion view").
+    Promote,
+    /// Control-plane remotes plus push/pull/sync actions (plan §38).
+    Sync,
 }
 
 impl Route {
     /// All routes in tab order.
-    pub const ALL: [Route; 5] = [
+    pub const ALL: [Route; 7] = [
         Route::Dashboard,
         Route::Diff,
         Route::Agents,
         Route::PolicyEditor,
         Route::Audit,
+        Route::Promote,
+        Route::Sync,
     ];
 
     /// Tab label including its selecting digit.
@@ -102,6 +109,8 @@ impl Route {
             Self::Agents => "3 agents",
             Self::PolicyEditor => "4 policy",
             Self::Audit => "5 audit",
+            Self::Promote => "6 promote",
+            Self::Sync => "7 sync",
         }
     }
 
@@ -120,6 +129,8 @@ impl Route {
             '3' => 2,
             '4' => 3,
             '5' => 4,
+            '6' => 5,
+            '7' => 6,
             _ => return None,
         };
         Self::ALL.get(index).copied()
@@ -435,6 +446,52 @@ pub struct AgentsData {
     pub details: BTreeMap<String, AgentDetail>,
 }
 
+/// Sub-focus inside the promotion view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromoteFocus {
+    /// The source-ref (branch) list.
+    #[default]
+    Refs,
+    /// The target-environment list.
+    Envs,
+}
+
+/// One configured control-plane remote row. Non-secret coordinates only
+/// (server URL + project id); the session token never reaches this
+/// struct or the screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRow {
+    /// Remote name as configured in `remote.json`.
+    pub name: String,
+    /// Base URL of the control plane.
+    pub server: String,
+    /// Project id mirrored by this remote.
+    pub project_id: String,
+}
+
+/// Everything the sync view renders from a refresh: configured remotes
+/// plus whether a login session file exists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncData {
+    /// Configured remotes (name-sorted).
+    pub remotes: Vec<RemoteRow>,
+    /// Whether the runtime session file exists (login presence only;
+    /// its contents are never read into the UI).
+    pub logged_in: bool,
+}
+
+impl SyncData {
+    /// One-line login indicator for the view header.
+    #[must_use]
+    pub fn login_label(&self) -> &'static str {
+        if self.logged_in {
+            "login: present"
+        } else {
+            "login: missing — run vaultx login"
+        }
+    }
+}
+
 /// Everything one refresh produces; [`crate::run`] feeds it to
 /// [`App::with_size`]
 /// and re-feeds after [`Effect::Refresh`].
@@ -454,6 +511,10 @@ pub struct LoadedState {
     pub policy_names: Vec<String>,
     /// Initial YAML for the editor (existing document or template).
     pub editor_seed: String,
+    /// Branch names available as promotion sources (sorted).
+    pub branches: Vec<String>,
+    /// Control-plane remotes and login presence for the sync view.
+    pub sync: SyncData,
 }
 
 impl LoadedState {
@@ -480,6 +541,14 @@ pub enum PendingAction {
     RevokeSession {
         /// Exact session id.
         session_id: String,
+    },
+    /// Promote a source ref onto a protected environment; runs with
+    /// `force = true` once confirmed.
+    Promote {
+        /// Source branch (or env) name.
+        from_ref: String,
+        /// Target protected environment.
+        to_env: String,
     },
 }
 
@@ -525,6 +594,22 @@ pub enum Effect {
         /// Exact session id.
         session_id: String,
     },
+    /// Move the target environment ref onto the source ref's commit.
+    /// `force` is set only after the protected-env confirmation modal.
+    Promote {
+        /// Source ref name (branch or environment).
+        from_ref: String,
+        /// Target bare environment name.
+        to_env: String,
+        /// Whether a protected target may be moved.
+        force: bool,
+    },
+    /// Upload local objects/refs to the configured remote.
+    Push,
+    /// Download and apply remote objects/refs locally.
+    Pull,
+    /// Push then pull in one pass.
+    SyncAll,
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,6 +1129,16 @@ pub struct App {
     /// Audit filter and row selection.
     pub audit_filter: OutcomeFilter,
     pub audit_selected: usize,
+    /// Promotion-view sub-focus (refs vs environments).
+    pub promote_focus: PromoteFocus,
+    /// Selected source-ref row.
+    pub promote_ref_selected: usize,
+    /// Selected target-environment row.
+    pub promote_env_selected: usize,
+    /// Selected remote row in the sync view.
+    pub sync_selected: usize,
+    /// Rendered lines from the most recent push/pull/sync run.
+    pub sync_lines: Vec<String>,
     selection: DashboardSelection,
 }
 
@@ -1075,6 +1170,11 @@ impl App {
             editor,
             audit_filter: OutcomeFilter::default(),
             audit_selected: 0,
+            promote_focus: PromoteFocus::default(),
+            promote_ref_selected: 0,
+            promote_env_selected: 0,
+            sync_selected: 0,
+            sync_lines: Vec::new(),
         }
     }
 
@@ -1090,9 +1190,9 @@ impl App {
         self.size = (width.max(1), height.max(1));
     }
 
-    /// Replaces loaded data and clamps the agent/audit selections against
-    /// the new lengths so a shrinking snapshot never strands an index
-    /// outside its list.
+    /// Replaces loaded data and clamps the agent/audit/promote/sync
+    /// selections against the new lengths so a shrinking snapshot never
+    /// strands an index outside its list.
     pub fn swap_loaded(&mut self, loaded: LoadedState) {
         self.loaded = loaded;
         self.agent_selected = self
@@ -1101,6 +1201,30 @@ impl App {
         self.audit_selected = self
             .audit_selected
             .min(self.loaded.audit.len().saturating_sub(1));
+        self.promote_ref_selected = self
+            .promote_ref_selected
+            .min(self.loaded.branches.len().saturating_sub(1));
+        self.promote_env_selected = self
+            .promote_env_selected
+            .min(self.loaded.snapshot.envs.len().saturating_sub(1));
+        self.sync_selected = self
+            .sync_selected
+            .min(self.loaded.sync.remotes.len().saturating_sub(1));
+    }
+
+    /// Source ref highlighted in the promotion view.
+    #[must_use]
+    pub fn selected_promote_ref(&self) -> Option<&str> {
+        self.loaded
+            .branches
+            .get(self.promote_ref_selected)
+            .map(String::as_str)
+    }
+
+    /// Target environment row highlighted in the promotion view.
+    #[must_use]
+    pub fn selected_promote_env(&self) -> Option<&EnvRow> {
+        self.loaded.snapshot.envs.get(self.promote_env_selected)
     }
 
     /// Focused dashboard pane (defaults to the first pane).
@@ -1206,6 +1330,8 @@ impl App {
             Route::Agents => self.agents_key(k),
             Route::Audit => self.audit_key(k),
             Route::PolicyEditor => self.policy_editor_key(k),
+            Route::Promote => self.promote_key(k),
+            Route::Sync => self.sync_key(k),
         }
     }
 
@@ -1331,6 +1457,108 @@ impl App {
         self.editor.editing_field = false;
     }
 
+    /// Promotion-view keys: Tab swaps focus between the source-ref and
+    /// target-env lists, arrows move the selection, Enter starts the
+    /// promotion (gated behind a confirmation modal for protected
+    /// targets), Esc returns to the dashboard.
+    fn promote_key(&mut self, k: KeyInput) -> Effect {
+        if k.code == KeyCode::Esc {
+            self.switch_route(Route::Dashboard);
+            return Effect::None;
+        }
+        match k.code {
+            KeyCode::Tab => {
+                self.promote_focus = match self.promote_focus {
+                    PromoteFocus::Refs => PromoteFocus::Envs,
+                    PromoteFocus::Envs => PromoteFocus::Refs,
+                };
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let delta = vertical_delta(k);
+                match self.promote_focus {
+                    PromoteFocus::Refs => scroll(
+                        &mut self.promote_ref_selected,
+                        self.loaded.branches.len(),
+                        delta,
+                    ),
+                    PromoteFocus::Envs => scroll(
+                        &mut self.promote_env_selected,
+                        self.loaded.snapshot.envs.len(),
+                        delta,
+                    ),
+                }
+            }
+            KeyCode::Enter => return self.begin_promotion(),
+            _ => {}
+        }
+        Effect::None
+    }
+
+    /// Starts a promotion from the current selections. Protected targets
+    /// open the blocking confirmation modal first; unprotected ones emit
+    /// the effect immediately.
+    fn begin_promotion(&mut self) -> Effect {
+        // Clone the selections up front so the modal assignment below
+        // cannot alias into the loaded snapshot.
+        let Some(env) = self.selected_promote_env().cloned() else {
+            self.status = "no environment selected".to_owned();
+            return Effect::None;
+        };
+        let Some(from_ref) = self.selected_promote_ref().map(str::to_owned) else {
+            self.status = "no source ref selected".to_owned();
+            return Effect::None;
+        };
+        let to_env = env.name;
+        if env.protected {
+            self.modal = Some(Modal {
+                title: "promote onto protected env".to_owned(),
+                body: vec![
+                    format!("move `{to_env}` onto `{from_ref}`?"),
+                    "the target is protected; confirming promotes with force.".to_owned(),
+                ],
+                action: PendingAction::Promote {
+                    from_ref: from_ref.clone(),
+                    to_env: to_env.clone(),
+                },
+            });
+            self.status = format!("awaiting confirmation: promote {from_ref} -> {to_env}");
+            return Effect::None;
+        }
+        Effect::Promote {
+            from_ref,
+            to_env,
+            force: false,
+        }
+    }
+
+    /// Sync-view keys: u/d/s run push/pull/sync through the shared sync
+    /// client, arrows move the remote-row highlight (display only — the
+    /// actions resolve their remote exactly like the CLI does), Esc
+    /// returns to the dashboard.
+    fn sync_key(&mut self, k: KeyInput) -> Effect {
+        if k.ctrl {
+            return Effect::None;
+        }
+        match k.code {
+            KeyCode::Char('u') => Effect::Push,
+            KeyCode::Char('d') => Effect::Pull,
+            KeyCode::Char('s') => Effect::SyncAll,
+            KeyCode::Up | KeyCode::Down => {
+                scroll(
+                    &mut self.sync_selected,
+                    self.loaded.sync.remotes.len(),
+                    vertical_delta(k),
+                );
+                Effect::None
+            }
+            KeyCode::Esc => {
+                self.switch_route(Route::Dashboard);
+                Effect::None
+            }
+            _ => Effect::None,
+        }
+    }
+
     fn request_apply_policy(&mut self) -> Effect {
         if !self.editor.can_apply() {
             self.status = "apply blocked: policy is invalid".to_owned();
@@ -1403,8 +1631,51 @@ impl App {
                 self.status = format!("revoking {session_id}…");
                 Effect::RevokeSession { session_id }
             }
+            PendingAction::Promote { from_ref, to_env } => {
+                self.status = format!("promoting {from_ref} -> {to_env}…");
+                Effect::Promote {
+                    from_ref,
+                    to_env,
+                    force: true,
+                }
+            }
         }
     }
+}
+
+/// Renders one push/pull/sync outcome as the plain lines stored in
+/// [`App::sync_lines`]. Mirrors the CLI's sync vocabulary; conflict rows
+/// carry ref names and commit ids only — never token or payload
+/// material.
+#[must_use]
+pub fn sync_result_lines(label: &str, result: &vaultx_sync_client::SyncResult) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{label}: uploaded {} object(s), downloaded {} object(s)",
+        result.uploaded, result.downloaded
+    )];
+    lines.push(format!("policies applied: {}", result.policies_applied));
+    if result.conflicts.is_empty() {
+        lines.push("refs: converged (no conflicts)".to_owned());
+    } else {
+        lines.push(format!("refs: {} conflict(s)", result.conflicts.len()));
+        for conflict in &result.conflicts {
+            let local = conflict
+                .local_commit
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string);
+            let remote = conflict
+                .remote_commit
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string);
+            lines.push(format!(
+                "  {}/{}: local={local} remote={remote} ({})",
+                conflict.namespace_name(),
+                conflict.name,
+                conflict.reason
+            ));
+        }
+    }
+    lines
 }
 
 fn vertical_delta(k: KeyInput) -> i32 {
@@ -1513,6 +1784,15 @@ pub(crate) mod testing {
             broker: BrokerStatus::default(),
             policy_names: Vec::new(),
             editor_seed: TEMPLATE_YAML.to_owned(),
+            branches: vec!["feature/login".to_owned(), "main".to_owned()],
+            sync: SyncData {
+                remotes: vec![RemoteRow {
+                    name: "origin".to_owned(),
+                    server: "https://cp.example.com".to_owned(),
+                    project_id: "proj_team".to_owned(),
+                }],
+                logged_in: true,
+            },
         }
     }
 
@@ -1752,6 +2032,224 @@ mod tests {
             }
         );
         assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn digits_six_and_seven_open_promotion_and_sync_views() {
+        assert_eq!(Route::from_digit('6'), Some(Route::Promote));
+        assert_eq!(Route::from_digit('7'), Some(Route::Sync));
+        assert_eq!(Route::ALL.len(), 7);
+        assert_eq!(Route::Promote.index(), 5);
+        assert_eq!(Route::Sync.index(), 6);
+        assert_eq!(Route::Sync.label(), "7 sync");
+
+        let mut app = sample_app();
+        send(&mut app, key('6'));
+        assert_eq!(app.route, Route::Promote);
+        send(&mut app, key('7'));
+        assert_eq!(app.route, Route::Sync);
+    }
+
+    #[test]
+    fn esc_returns_to_the_dashboard_from_the_new_views() {
+        let mut app = sample_app();
+        app.status = "transient".to_owned();
+
+        send(&mut app, key('6'));
+        send(&mut app, press(KeyCode::Esc));
+        assert_eq!(app.route, Route::Dashboard);
+
+        send(&mut app, key('7'));
+        send(&mut app, press(KeyCode::Esc));
+        assert_eq!(app.route, Route::Dashboard);
+    }
+
+    #[test]
+    fn promote_tab_toggles_focus_and_arrows_move_each_list() {
+        let mut app = sample_app();
+        send(&mut app, key('6'));
+
+        assert_eq!(app.promote_focus, PromoteFocus::Refs);
+        send(&mut app, press(KeyCode::Down));
+        assert_eq!(app.promote_ref_selected, 1);
+
+        send(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.promote_focus, PromoteFocus::Envs);
+        send(&mut app, press(KeyCode::Down));
+        // Clamped at the last of the two environment rows.
+        assert_eq!(app.promote_env_selected, 1);
+        send(&mut app, press(KeyCode::Down));
+        assert_eq!(app.promote_env_selected, 1);
+
+        send(&mut app, press(KeyCode::Up));
+        assert_eq!(app.promote_env_selected, 0);
+        send(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.promote_focus, PromoteFocus::Refs);
+    }
+
+    #[test]
+    fn promote_enter_on_unprotected_env_emits_the_effect_without_a_modal() {
+        let mut app = sample_app();
+        // development (row 0) is unprotected in the fixture.
+        send(&mut app, key('6'));
+        assert_eq!(app.selected_promote_ref(), Some("feature/login"));
+        assert_eq!(
+            app.selected_promote_env().map(|e| e.name.as_str()),
+            Some("development")
+        );
+
+        // Move to `main`, then Enter: no modal, immediate effect.
+        send(&mut app, press(KeyCode::Down));
+        let effect = app.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            effect,
+            Effect::Promote {
+                from_ref: "main".to_owned(),
+                to_env: "development".to_owned(),
+                force: false,
+            }
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn protected_env_gates_promotion_behind_confirmation() {
+        let mut app = sample_app();
+        send(&mut app, key('6'));
+        // Focus the env list and select production (protected).
+        send(&mut app, press(KeyCode::Tab));
+        send(&mut app, press(KeyCode::Down));
+
+        // Enter opens the confirmation modal and performs NO promotion.
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), Effect::None);
+        let modal = app.modal.as_ref().expect("confirm modal open");
+        assert_eq!(
+            modal.action,
+            PendingAction::Promote {
+                from_ref: "feature/login".to_owned(),
+                to_env: "production".to_owned(),
+            }
+        );
+
+        // While the modal is open every other key stays inert.
+        assert_eq!(app.handle_key(key('q')), Effect::None);
+        assert!(!app.quit_requested);
+        assert_eq!(app.handle_key(key('6')), Effect::None);
+        assert_eq!(app.route, Route::Promote);
+        assert_eq!(app.handle_key(press(KeyCode::Tab)), Effect::None);
+
+        // Confirming emits the forced promotion exactly once.
+        assert_eq!(
+            app.handle_key(key('y')),
+            Effect::Promote {
+                from_ref: "feature/login".to_owned(),
+                to_env: "production".to_owned(),
+                force: true,
+            }
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn protected_env_promotion_can_be_declined_without_any_effect() {
+        let mut app = sample_app();
+        send(&mut app, key('6'));
+        send(&mut app, press(KeyCode::Tab));
+        send(&mut app, press(KeyCode::Down));
+        let _ = app.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(app.handle_key(key('n')), Effect::None);
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("cancelled"));
+    }
+
+    #[test]
+    fn promote_enter_with_no_selections_reports_instead_of_panicking() {
+        let mut loaded = sample_loaded();
+        loaded.branches.clear();
+        loaded.snapshot.envs.clear();
+        let mut app = App::with_size(loaded, DEFAULT_TERMINAL_SIZE);
+        send(&mut app, key('6'));
+
+        assert_eq!(app.handle_key(press(KeyCode::Enter)), Effect::None);
+        assert!(app.modal.is_none());
+        assert!(app.status.contains("no environment selected"));
+    }
+
+    #[test]
+    fn sync_keys_emit_push_pull_and_sync_effects() {
+        let mut app = sample_app();
+        send(&mut app, key('7'));
+
+        assert_eq!(app.handle_key(key('u')), Effect::Push);
+        assert_eq!(app.handle_key(key('d')), Effect::Pull);
+        assert_eq!(app.handle_key(key('s')), Effect::SyncAll);
+    }
+
+    #[test]
+    fn shrinking_reload_clamps_promotion_and_sync_selections() {
+        let mut app = sample_app();
+        send(&mut app, key('6'));
+        send(&mut app, press(KeyCode::Tab));
+        send(&mut app, press(KeyCode::Down)); // env -> production
+        send(&mut app, press(KeyCode::Tab));
+        send(&mut app, press(KeyCode::Down)); // ref -> main
+        send(&mut app, key('7'));
+        assert_eq!(app.sync_selected, 0);
+
+        // Shrink every backing list below the stale indices.
+        let mut shrunk = sample_loaded();
+        shrunk.branches.truncate(1);
+        shrunk.snapshot.envs.truncate(1);
+        shrunk.sync.remotes.clear();
+        app.swap_loaded(shrunk);
+
+        assert_eq!(app.promote_ref_selected, 0);
+        assert_eq!(app.promote_env_selected, 0);
+        assert_eq!(app.sync_selected, 0);
+    }
+
+    #[test]
+    fn sync_result_lines_summarize_transfers_policies_and_conflicts() {
+        use vaultx_types::CommitId;
+
+        let clean = sync_result_lines(
+            "push",
+            &vaultx_sync_client::SyncResult {
+                uploaded: 3,
+                downloaded: 1,
+                conflicts: Vec::new(),
+                policies_applied: 2,
+            },
+        );
+        assert_eq!(
+            clean,
+            vec![
+                "push: uploaded 3 object(s), downloaded 1 object(s)".to_owned(),
+                "policies applied: 2".to_owned(),
+                "refs: converged (no conflicts)".to_owned(),
+            ]
+        );
+
+        let diverged = vaultx_sync_client::RefConflict {
+            namespace: vaultx_sync_client::RefNamespace::Heads,
+            name: "main".to_owned(),
+            local_commit: Some(CommitId::parse("cmt_000001").unwrap()),
+            remote_commit: None,
+            reason: vaultx_sync_client::ConflictReason::Diverged,
+        };
+        let conflicted = sync_result_lines(
+            "sync",
+            &vaultx_sync_client::SyncResult {
+                uploaded: 0,
+                downloaded: 0,
+                conflicts: vec![diverged],
+                policies_applied: 0,
+            },
+        );
+        assert!(conflicted[2].contains("refs: 1 conflict(s)"));
+        assert!(conflicted[3].contains("heads/main"));
+        assert!(conflicted[3].contains("(diverged)"));
     }
 
     #[test]

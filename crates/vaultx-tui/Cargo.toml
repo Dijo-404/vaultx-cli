@@ -18,6 +18,7 @@ vaultx-broker-client = { path = "../vaultx-broker-client" }
 vaultx-core = { path = "../vaultx-core" }
 vaultx-policy = { path = "../vaultx-policy" }
 vaultx-policy-packs = { path = "../vaultx-policy-packs" }
+vaultx-sync-client = { path = "../vaultx-sync-client", features = ["reqwest"] }
 vaultx-types = { path = "../vaultx-types" }
 
 [dev-dependencies]
