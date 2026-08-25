@@ -2253,9 +2253,9 @@ The codebase is considered complete only when all workstreams below are implemen
 ## Agent integrations
 
 - [x] `vaultx agent create` works.
-- [ ] `vaultx agent run` works.
-- [ ] managed secret variables are stripped from agent environment.
-- [ ] public config exposure is policy-controlled.
+- [x] `vaultx agent run` works.
+- [x] managed secret variables are stripped from agent environment.
+- [x] public config exposure is policy-controlled.
 - [x] session revocation works.
 - [x] MCP server works.
 - [x] generic HTTP MCP tool works.
@@ -2281,8 +2281,8 @@ The codebase is considered complete only when all workstreams below are implemen
 - [x] agent view works.
 - [x] policy editor works.
 - [x] audit view works.
-- [ ] environment promotion view works.
-- [ ] sync view works.
+- [x] environment promotion view works.
+- [x] sync view works.
 - [x] keyboard navigation is complete.
 - [x] resize behavior is robust.
 
@@ -2295,9 +2295,9 @@ The codebase is considered complete only when all workstreams below are implemen
 - [x] encrypted object transfer works.
 - [x] remote refs work.
 - [x] signature verification works.
-- [ ] policy sync works.
-- [ ] agent identity sync works.
-- [ ] audit ingestion/query works.
+- [x] policy sync works.
+- [x] agent identity sync works.
+- [x] audit ingestion/query works.
 - [x] client-controlled encryption mode works.
 - [x] conflict handling works.
 
@@ -2316,8 +2316,8 @@ The codebase is considered complete only when all workstreams below are implemen
 
 - [x] unit test matrix passes.
 - [x] integration test matrix passes.
-- [ ] property tests pass.
-- [ ] fuzz targets have seed corpora.
+- [x] property tests pass.
+- [x] fuzz targets have seed corpora.
 - [x] canary-secret leak tests pass.
 - [x] SSRF test suite passes.
 - [x] redirect leakage tests pass.
@@ -2325,7 +2325,7 @@ The codebase is considered complete only when all workstreams below are implemen
 - [x] cargo-deny passes.
 - [x] cargo-audit passes.
 - [x] threat model matches implemented behavior.
-- [ ] security claims distinguish local developer mode from isolated broker mode.
+- [x] security claims distinguish local developer mode from isolated broker mode.
 
 ---
 
