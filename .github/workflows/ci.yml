@@ -119,7 +119,10 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: vaultx-linux-aarch64
             cross: true
-          - os: macos-13
+          # macos-13 (intel) runners were retired by GitHub; the x86_64
+          # slice cross-compiles on an arm64 host instead (same Xcode
+          # toolchain, rustup target does the rest).
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: vaultx-darwin-x86_64
           - os: macos-latest
