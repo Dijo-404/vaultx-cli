@@ -5,7 +5,7 @@
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vaultx-cli/vaultx-cli.git"
+    "url": "git+https://github.com/Dijo-404/vaultx-cli.git"
   },
   "bin": {
     "vaultx": "bin/vaultx.js"

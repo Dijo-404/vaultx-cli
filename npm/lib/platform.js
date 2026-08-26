@@ -23,7 +23,7 @@ const SUPPORTED_ARTIFACTS = Object.freeze({
  * Canonical GitHub repository ("owner/name") releases are downloaded from.
  * Forks override this with the VAULTX_CLI_REPOSITORY environment variable.
  */
-const DEFAULT_REPOSITORY = 'vaultx-cli/vaultx-cli';
+const DEFAULT_REPOSITORY = 'Dijo-404/vaultx-cli';
 
 /** Error thrown when the running OS/arch combination has no release asset. */
 class UnsupportedPlatformError extends Error {
