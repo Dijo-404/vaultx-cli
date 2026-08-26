@@ -23,6 +23,21 @@ The installer contains no secret-management implementation and collects
 no telemetry. Forks and mirrors can redirect downloads with
 `VAULTX_CLI_REPOSITORY=owner/name` and `VAULTX_CACHE_DIR=/path`.
 
+## If your npm blocks install scripts
+
+Recent npm versions skip `postinstall` scripts unless a package is
+allow-listed (`npm warn install-scripts ...`). This is fine: the
+`vaultx` launcher detects a missing binary and downloads **and verifies**
+it on demand at first run, so the security posture is identical either
+way — the SHA-256 check always happens before anything executable runs.
+
+Nothing to configure; just use `vaultx`. To opt into the eager download
+instead, allow the script once:
+
+```sh
+npm install -g --allow-scripts=vaultx-cli vaultx-cli
+```
+
 ## Maintainers: publishing a release
 
 After the tag build attaches artifacts + `SHA256SUMS` to the GitHub
