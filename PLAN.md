@@ -2226,18 +2226,18 @@ The codebase is considered complete only when all workstreams below are implemen
 - [x] body constraints work.
 - [x] response sanitization works.
 - [x] audit events are emitted.
-- [ ] isolated/remote broker transport works.
+- [x] isolated/remote broker transport works.
 
 ## Authorization
 
 - [x] internal authorizer trait exists.
-- [ ] Cedar integration works.
+- [x] Cedar integration works.
 - [x] default-deny behavior is enforced.
 - [x] human-readable policy format works.
 - [x] validation works.
 - [x] policy test fixtures work.
 - [x] policy explanation works.
-- [ ] child-agent attenuation works.
+- [x] child-agent attenuation works.
 
 ## Semantic policy packs
 

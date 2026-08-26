@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-audit"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "getrandom 0.2.17",
  "hex",
@@ -3655,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-broker"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
@@ -3684,7 +3684,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-broker-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rcgen",
  "rustls",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "axum",
  "base64",
@@ -3736,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-control-plane"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "axum",
  "getrandom 0.2.17",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hex",
  "rand_core 0.6.4",
@@ -3776,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-crypto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
@@ -3794,7 +3794,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-http"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "serde_json",
@@ -3805,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-keyring"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hex",
  "rand_core 0.6.4",
@@ -3815,7 +3815,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-mcp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "serde",
@@ -3833,7 +3833,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-policy"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cedar-policy",
  "proptest",
@@ -3847,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-policy-packs"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -3860,7 +3860,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-repository"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hex",
  "proptest",
@@ -3875,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-sync-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "axum",
  "getrandom 0.2.17",
@@ -3899,11 +3899,11 @@ dependencies = [
 
 [[package]]
 name = "vaultx-testkit"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "vaultx-tui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -3924,7 +3924,7 @@ dependencies = [
 
 [[package]]
 name = "vaultx-types"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
