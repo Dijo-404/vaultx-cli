@@ -40,7 +40,6 @@
 pub mod credential;
 pub mod engine;
 pub mod error;
-#[cfg(unix)]
 pub mod http_transport;
 pub mod inject;
 pub mod ipc;
