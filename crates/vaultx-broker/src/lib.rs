@@ -53,7 +53,6 @@ pub use engine::{
     MAX_RESPONSE_BODY_BYTES, REPLAY_CACHE_MAX_ENTRIES, REPLAY_DETECTED_REASON, REPLAY_TTL,
 };
 pub use error::BrokerError;
-#[cfg(unix)]
 pub use http_transport::HttpTransport;
 pub use inject::{
     ApiKeyHeaderInjector, AwsSigv4Injector, BasicPasswordInjector, BearerInjector,
@@ -61,7 +60,6 @@ pub use inject::{
     GithubBearerInjector, InjectionTemplateId, InjectorRegistry, OutboundRequest,
     QueryParameterInjector,
 };
-#[cfg(unix)]
 pub use ipc::BrokerServer;
 pub use ipc::{
     BrokerEndpoint, ClientLine, EngineHandle, ServerConfig, ServerLine, DEFAULT_MAX_CONNECTIONS,
