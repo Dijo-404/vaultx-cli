@@ -45,7 +45,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(unix)]
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
@@ -473,7 +472,7 @@ impl<E: EngineHandle> BrokerServer<E> {
         }
         #[cfg(windows)]
         {
-            let _ = (bind, cert_pem, key_pem, project_endpoint_id);
+            let _ = (bind, cert_pem, key_pem);
             Err(BrokerError::TransportFailure(
                 "remote TLS endpoints are not implemented yet".to_owned(),
             ))
@@ -731,7 +730,10 @@ impl Drop for ConnectionSlot {
 /// (so our reply is not destroyed by an RST), answer, and close — all off
 /// the accept path, all under a short timeout so silent peers cost
 /// nothing.
-async fn refuse_connection(mut stream: tokio::net::UnixStream) {
+async fn refuse_connection<S>(mut stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // One drained line only; persistence is irrelevant here, but the
     // buffered type is required by [`read_line_capped`].
     let mut buffered = tokio::io::BufReader::with_capacity(1024, &mut stream);
@@ -830,7 +832,6 @@ fn restrict_path_permissions(path: &Path) -> Result<(), BrokerError> {
 ///
 /// Returns `Ok(None)` on clean EOF before any byte of a new line; EOF
 /// mid-line stays an error.
-#[cfg(unix)]
 async fn read_line_capped(
     reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
 ) -> Result<Option<Vec<u8>>, BrokerError> {

@@ -1711,7 +1711,7 @@ impl FileSessionStore {
         {
             // Non-unix platforms are single-user in v1; documented rather
             // than faked coherence.
-            Ok(FileLock { fd: 0 })
+            Ok(FileLock {})
         }
     }
 
