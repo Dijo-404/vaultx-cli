@@ -43,6 +43,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::net::SocketAddr;
@@ -64,6 +65,21 @@ pub const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default maximum concurrently served connections.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
+
+/// Upper bound on one TLS handshake (plan §30): a silent or
+/// handshake-happy peer cannot pin an accept slot indefinitely. Timed-out
+/// handshakes are dropped without any protocol byte being processed.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-read idle bound inside a served connection: a peer that sends
+/// nothing for this long has its connection — and its concurrency slot —
+/// released. Idle closes are silent (no violation line): silence is a
+/// liveness failure, not a protocol violation.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on draining in-flight exchanges after shutdown; anything still
+/// running when it expires is aborted by the task set's drop.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Wire envelopes
@@ -375,7 +391,10 @@ impl<E: EngineHandle> BrokerServer<E> {
             }
             let _ = std::fs::remove_file(&path);
             let listener = UnixListener::bind(&path).map_err(|err| {
-                BrokerError::TransportFailure(format!("cannot bind broker endpoint: {err}"))
+                BrokerError::TransportFailure(format!(
+                    "cannot bind broker endpoint {}: {err}",
+                    path.display()
+                ))
             })?;
             restrict_path_permissions(&path)?;
             Ok(Self {
@@ -435,10 +454,12 @@ impl<E: EngineHandle> BrokerServer<E> {
                 build_tls_server_config(&cert_pem, &key_pem, client_ca_pem.as_deref())?;
             let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)));
             let listener = tokio::net::TcpListener::bind(bind).await.map_err(|err| {
-                BrokerError::TransportFailure(format!("cannot bind gateway address: {err}"))
+                BrokerError::TransportFailure(format!("cannot bind gateway address {bind}: {err}"))
             })?;
             let shown = listener.local_addr().map_err(|err| {
-                BrokerError::TransportFailure(format!("cannot inspect gateway address: {err}"))
+                BrokerError::TransportFailure(format!(
+                    "cannot inspect bound gateway address {bind}: {err}"
+                ))
             })?;
             Ok(Self {
                 engine,
@@ -475,8 +496,11 @@ impl<E: EngineHandle> BrokerServer<E> {
             .and_then(|(listener, _)| listener.local_addr().ok())
     }
 
-    /// Signals graceful shutdown; the accept loop exits promptly while
-    /// in-flight connection tasks complete naturally.
+    /// Signals graceful shutdown; the accept loop exits promptly and
+    /// then **drains** in-flight connection tasks for up to
+    /// [`DRAIN_TIMEOUT`] (5 s) before returning — an exchange already
+    /// inside the engine pipeline gets to finish; anything still pending
+    /// is aborted with the drain's expiry.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
     }
@@ -495,8 +519,9 @@ impl<E: EngineHandle> BrokerServer<E> {
     /// are removed on exit; TCP listeners simply close.
     ///
     /// # Errors
-    /// Fatal accept failures surface as [`BrokerError::TransportFailure`];
-    /// per-connection errors are contained to their own task.
+    /// Fatal accept failures surface as [`BrokerError::TransportFailure`]
+    /// (transient per-connection errors — resets/aborts — are tolerated);
+    /// everything else is contained to its own task.
     #[cfg(unix)]
     pub async fn serve(mut self) -> Result<(), BrokerError> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -507,9 +532,16 @@ impl<E: EngineHandle> BrokerServer<E> {
             return self.cleanup_on_exit();
         }
         let live = Arc::new(LiveConnections::default());
+        let mut connections = tokio::task::JoinSet::new();
         if let Some((tcp_listener, acceptor)) = self.tls_listener.take() {
             return self
-                .serve_remote(tcp_listener, acceptor, live, &mut shutdown_rx)
+                .serve_remote(
+                    tcp_listener,
+                    acceptor,
+                    live,
+                    &mut shutdown_rx,
+                    &mut connections,
+                )
                 .await;
         }
         let Some(listener) = self.listener.take() else {
@@ -523,6 +555,7 @@ impl<E: EngineHandle> BrokerServer<E> {
                 accepted = listener.accept() => {
                     let (stream, _addr) = match accepted {
                         Ok(pair) => pair,
+                        Err(err) if is_transient_accept_error(err.kind()) => continue,
                         Err(err) => {
                             return Err(BrokerError::TransportFailure(
                                 format!("accept failed: {err}")
@@ -534,9 +567,8 @@ impl<E: EngineHandle> BrokerServer<E> {
                         // Refuse off the accept path: an inline drain
                         // would let a silent peer wedge both accepts and
                         // shutdown. The spawned task bounds its wait.
-                        let mut conn_shutdown = shutdown_rx.clone();
-                        tokio::spawn(async move {
-                            refuse_connection(stream, &mut conn_shutdown).await;
+                        connections.spawn(async move {
+                            refuse_connection(stream).await;
                         });
                         continue;
                     };
@@ -551,7 +583,7 @@ impl<E: EngineHandle> BrokerServer<E> {
                     }
                     // `slot` is an RAII guard: its Drop releases the
                     // count even when the connection task panics.
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         serve_connection(stream, engine, &mut conn_shutdown).await;
                         drop(slot);
                     });
@@ -559,15 +591,16 @@ impl<E: EngineHandle> BrokerServer<E> {
             }
         }
         drop(listener);
+        drain_connections(connections).await;
         self.cleanup_on_exit()
     }
 
     /// Remote gateway accept loop (plan §30). Same slot accounting and
     /// shutdown semantics as the local loop; each accepted TCP stream is
-    /// wrapped in TLS first. Handshake failures — including a missing or
-    /// untrusted client certificate when `client_ca_pem` enforces mutual
-    /// auth — are contained to their own task and never deliver a
-    /// protocol byte.
+    /// wrapped in TLS first, bounded by [`HANDSHAKE_TIMEOUT`].
+    /// Handshake failures — including a missing or untrusted client
+    /// certificate when `client_ca_pem` enforces mutual auth — are
+    /// contained to their own task and never deliver a protocol byte.
     #[cfg(unix)]
     async fn serve_remote(
         self,
@@ -575,6 +608,7 @@ impl<E: EngineHandle> BrokerServer<E> {
         acceptor: Arc<tokio_rustls::TlsAcceptor>,
         live: Arc<LiveConnections>,
         shutdown_rx: &mut watch::Receiver<bool>,
+        connections: &mut tokio::task::JoinSet<()>,
     ) -> Result<(), BrokerError> {
         loop {
             tokio::select! {
@@ -582,6 +616,7 @@ impl<E: EngineHandle> BrokerServer<E> {
                 accepted = listener.accept() => {
                     let (stream, _peer) = match accepted {
                         Ok(pair) => pair,
+                        Err(err) if is_transient_accept_error(err.kind()) => continue,
                         Err(err) => {
                             return Err(BrokerError::TransportFailure(
                                 format!("accept failed: {err}")
@@ -604,11 +639,15 @@ impl<E: EngineHandle> BrokerServer<E> {
                         continue;
                     }
                     let acceptor = Arc::clone(&acceptor);
-                    tokio::spawn(async move {
-                        // A refused handshake (bad/absent client cert,
-                        // hostile hello) is contained here: no protocol
-                        // request was ever seen, nothing to audit.
-                        if let Ok(tls_stream) = acceptor.accept(stream).await {
+                    connections.spawn(async move {
+                        // A refused or stalled handshake (bad/absent
+                        // client cert, hostile hello, silent peer) is
+                        // contained here: no protocol request was ever
+                        // seen, nothing to audit.
+                        if let Ok(Ok(tls_stream)) =
+                            tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                                .await
+                        {
                             serve_connection(tls_stream, engine, &mut conn_shutdown).await;
                         }
                         drop(slot);
@@ -617,6 +656,7 @@ impl<E: EngineHandle> BrokerServer<E> {
             }
         }
         drop(listener);
+        drain_connections(std::mem::take(connections)).await;
         self.cleanup_on_exit()
     }
 
@@ -691,10 +731,7 @@ impl Drop for ConnectionSlot {
 /// (so our reply is not destroyed by an RST), answer, and close — all off
 /// the accept path, all under a short timeout so silent peers cost
 /// nothing.
-async fn refuse_connection(
-    mut stream: tokio::net::UnixStream,
-    shutdown: &mut watch::Receiver<bool>,
-) {
+async fn refuse_connection(mut stream: tokio::net::UnixStream) {
     let drain = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         read_line_capped(&mut stream),
@@ -708,9 +745,39 @@ async fn refuse_connection(
         write_line(&mut stream, &line),
     );
     let _ = reply.await;
-    // Keep the receiver alive to end of scope: a dropped clone that never
-    // observed a send would be harmless, but holding it documents intent.
-    let _ = shutdown.borrow();
+}
+
+/// True for accept-loop errors that describe the *dying peer* rather than
+/// the listener: resets/aborts during connection setup, interrupted
+/// syscalls, and timeouts. The loop logs nothing and keeps serving;
+/// anything else is fatal and surfaces to the caller.
+fn is_transient_accept_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Drains in-flight connection tasks after the accept loop stops:
+/// bounded by [`DRAIN_TIMEOUT`], after which remaining tasks are aborted
+/// (a [`tokio::task::JoinSet`] aborts everything left on drop).
+#[cfg(unix)]
+async fn drain_connections(mut tasks: tokio::task::JoinSet<()>) {
+    let deadline = tokio::time::sleep(DRAIN_TIMEOUT);
+    tokio::pin!(deadline);
+    while !tasks.is_empty() {
+        tokio::select! {
+            _ = &mut deadline => break,
+            joined = tasks.join_next() => {
+                if joined.is_none() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Creates `path` and every missing parent with `0700`.
@@ -748,40 +815,44 @@ fn restrict_path_permissions(path: &Path) -> Result<(), BrokerError> {
 
 /// Reads one newline-terminated JSON line with the hard length cap.
 ///
+/// Buffered (`read_until(b'\n')` bounded by `.take()`), so framing costs
+/// one poll per chunk rather than one per byte. Cap semantics match the
+/// original byte loop exactly: content up to [`MAX_LINE_BYTES`] is fine
+/// (a terminating `\n` may exceed it by one), anything longer is a
+/// protocol violation, and EOF mid-line stays an error.
+///
 /// Returns `Ok(None)` on clean EOF before any byte of a new line.
 #[cfg(unix)]
 async fn read_line_capped(
-    reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> Result<Option<Vec<u8>>, BrokerError> {
-    let mut buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    loop {
-        let read = reader
-            .read(&mut byte)
-            .await
-            .map_err(|err| BrokerError::TransportFailure(format!("read failure: {err}")))?;
-        if read == 0 {
-            return if buf.is_empty() {
-                Ok(None)
-            } else {
-                Err(BrokerError::TransportFailure(
-                    "connection closed mid-line".to_owned(),
-                ))
-            };
-        }
-        match byte[0] {
-            b'\n' => return Ok(Some(std::mem::take(&mut buf))),
-            b'\r' => {}
-            other => {
-                buf.push(other);
-                if buf.len() > MAX_LINE_BYTES {
-                    return Err(BrokerError::TransportFailure(
-                        "line exceeds maximum permitted size".to_owned(),
-                    ));
-                }
-            }
-        }
+    use tokio::io::AsyncBufReadExt as _;
+
+    // One spare byte so a full-cap line with its terminator still fits.
+    let mut limited = tokio::io::AsyncReadExt::take(&mut *reader, (MAX_LINE_BYTES + 1) as u64);
+    let mut buffered = tokio::io::BufReader::with_capacity(1024, &mut limited);
+    let mut raw = Vec::with_capacity(512);
+    let read = buffered
+        .read_until(b'\n', &mut raw)
+        .await
+        .map_err(|err| BrokerError::TransportFailure(format!("read failure: {err}")))?;
+    if read == 0 {
+        return Ok(None);
     }
+    if raw.last() != Some(&b'\n') {
+        return if read > MAX_LINE_BYTES {
+            Err(BrokerError::TransportFailure(
+                "line exceeds maximum permitted size".to_owned(),
+            ))
+        } else {
+            Err(BrokerError::TransportFailure(
+                "connection closed mid-line".to_owned(),
+            ))
+        };
+    }
+    raw.pop();
+    raw.retain(|byte| *byte != b'\r');
+    Ok(Some(raw))
 }
 
 /// Serializes and writes one response line followed by `\n`.
@@ -878,10 +949,11 @@ fn build_tls_server_config(
         .map_err(|err| BrokerError::TransportFailure(format!("tls configuration rejected: {err}")))
 }
 
-/// Serves one connection: request/response pairs until EOF, shutdown, or
-/// fatal framing violation. Engine execution runs on the blocking pool so
-/// the synchronous pipeline never stalls the async reactor. Generic over
-/// the byte stream so Unix sockets and TLS-wrapped TCP share one handler.
+/// Serves one connection: request/response pairs until EOF, shutdown, a
+/// fatal framing violation, or the [`IDLE_TIMEOUT`] read bound. Engine
+/// execution runs on the blocking pool so the synchronous pipeline never
+/// stalls the async reactor. Generic over the byte stream so Unix sockets
+/// and TLS-wrapped TCP share one handler.
 #[cfg(unix)]
 async fn serve_connection<E: EngineHandle, S>(
     stream: S,
@@ -890,26 +962,28 @@ async fn serve_connection<E: EngineHandle, S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = reader;
+    let (mut reader, mut writer) = tokio::io::split(stream);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
-            line = read_line_capped(&mut reader) => {
+            line = tokio::time::timeout(IDLE_TIMEOUT, read_line_capped(&mut reader)) => {
                 match line {
-                    Ok(Some(bytes)) => {
+                    Ok(Ok(Some(bytes))) => {
                         if !handle_line_bytes(&engine, bytes, &mut writer).await {
                             break;
                         }
                     }
-                    Ok(None) => break,
-                    Err(err) => {
+                    // Idle close is silent by design: a silent peer will
+                    // never read a diagnostic anyway.
+                    Ok(Ok(None)) => break,
+                    Ok(Err(err)) => {
                         let violation = ServerLine::ProtocolViolation {
                             error: err.to_string(),
                         };
                         let _ = write_line(&mut writer, &violation).await;
                         break;
                     }
+                    Err(_elapsed) => break,
                 }
             }
         }

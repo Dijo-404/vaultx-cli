@@ -16,6 +16,8 @@ tokio-rustls = { workspace = true }
 vaultx-broker = { path = "../vaultx-broker" }
 
 [dev-dependencies]
+# Loopback TLS for IPv6 endpoint tests (plan §30 client surface).
+rcgen = "0.13"
 tempfile = { workspace = true }
 vaultx-policy = { path = "../vaultx-policy" }
 vaultx-types = { path = "../vaultx-types" }

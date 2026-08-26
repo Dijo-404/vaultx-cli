@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use vaultx_broker::request::PROTOCOL_VERSION;
 use vaultx_broker::{BrokerRequest, BrokerResponse, ClientLine, ServerLine, MAX_LINE_BYTES};
 
@@ -32,6 +32,15 @@ pub enum ClientError {
     /// There is deliberately no insecure-retry mode.
     #[error("broker TLS handshake failed: {0}")]
     TlsHandshakeFailed(String),
+    /// The endpoint string is malformed: missing port, invalid port, or
+    /// a bracketed IPv6 literal that is not exactly `[HOST]:PORT`.
+    #[error("invalid broker endpoint `{endpoint}`: {reason}")]
+    InvalidEndpoint {
+        /// The offending endpoint string.
+        endpoint: String,
+        /// What was wrong with it.
+        reason: String,
+    },
     /// The exchange did not complete inside the timeout.
     #[error("broker request timed out")]
     Timeout,
@@ -48,7 +57,8 @@ pub enum ClientError {
 /// operator-supplied roots — no certificate-validation bypass exists.
 #[derive(Clone, Debug)]
 pub struct RemoteEndpoint {
-    /// `HOST:PORT` of the gateway.
+    /// `HOST:PORT` of the gateway. IPv6 literals use bracket form,
+    /// `[::1]:8443`.
     pub addr: String,
     /// PEM bundle of trusted CA certificates for the gateway's chain.
     pub ca_pem: PathBuf,
@@ -57,6 +67,73 @@ pub struct RemoteEndpoint {
     pub cert_pem: Option<PathBuf>,
     /// Private key matching [`Self::cert_pem`] (PEM).
     pub key_pem: Option<PathBuf>,
+}
+
+/// A parsed remote endpoint: either a fully-formed socket address (IP
+/// literal with port, including bracketed IPv6) or a host/port pair
+/// needing resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DialTarget {
+    Literal(std::net::SocketAddr),
+    HostPort { host: String, port: u16 },
+}
+
+impl DialTarget {
+    /// The TLS server name to verify the gateway certificate against.
+    fn server_name(
+        &self,
+    ) -> Result<tokio_rustls::rustls::pki_types::ServerName<'static>, ClientError> {
+        match self {
+            // IP literals stay literals: webpki matches them against IP
+            // SANs without any DNS involvement.
+            Self::Literal(addr) => Ok(tokio_rustls::rustls::pki_types::ServerName::IpAddress(
+                addr.ip().into(),
+            )),
+            Self::HostPort { host, .. } => {
+                tokio_rustls::rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| {
+                    ClientError::InvalidEndpoint {
+                        endpoint: host.clone(),
+                        reason: "not a valid DNS hostname".to_owned(),
+                    }
+                })
+            }
+        }
+    }
+}
+
+fn invalid_endpoint(raw: &str, reason: &str) -> ClientError {
+    ClientError::InvalidEndpoint {
+        endpoint: raw.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+/// Parses `HOST:PORT` (or a full socket address) into a [`DialTarget`].
+fn parse_endpoint(raw: &str) -> Result<DialTarget, ClientError> {
+    if let Ok(addr) = raw.parse::<std::net::SocketAddr>() {
+        return Ok(DialTarget::Literal(addr));
+    }
+    let Some((host, port_raw)) = raw.rsplit_once(':') else {
+        return Err(invalid_endpoint(raw, "a port is required (HOST:PORT)"));
+    };
+    if host.contains(':') || host.contains('[') || host.contains(']') {
+        // Bare IPv6 literals ("::1", "fe80::1") land here too: their tail
+        // after the final colon is not a port either.
+        return Err(invalid_endpoint(
+            raw,
+            "IPv6 literals need bracket form [HOST]:PORT",
+        ));
+    }
+    if host.is_empty() {
+        return Err(invalid_endpoint(raw, "empty host"));
+    }
+    let Ok(port) = port_raw.parse::<u16>() else {
+        return Err(invalid_endpoint(raw, "port must be a number in 0..=65535"));
+    };
+    Ok(DialTarget::HostPort {
+        host: host.to_owned(),
+        port,
+    })
 }
 
 /// Connection to one broker IPC endpoint.
@@ -216,19 +293,25 @@ impl BrokerClient {
             };
 
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-        let tcp = tokio::net::TcpStream::connect(endpoint.addr.as_str())
-            .await
-            .map_err(|err| ClientError::ConnectionFailed {
-                path: endpoint.addr.clone(),
-                source: err,
-            })?;
-        // Server-name selection: IP literals stay literal; anything else
-        // is treated as a DNS name for certificate matching.
-        let host = endpoint.addr.split(':').next().unwrap_or(&endpoint.addr);
-        let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
-            .map_err(|_| {
-                ClientError::TlsHandshakeFailed(format!("invalid server name `{host}`"))
-            })?;
+        // Endpoint parsing: full `SocketAddr` syntax first (this is what
+        // makes `[::1]:8443` work), then an explicit `HOST:PORT` split
+        // that rejects bare IPv6 literals and missing/invalid ports
+        // instead of guessing.
+        let target = parse_endpoint(&endpoint.addr)?;
+        let tcp = match &target {
+            DialTarget::Literal(addr) => tokio::net::TcpStream::connect(addr).await,
+            DialTarget::HostPort { host, port } => {
+                tokio::net::TcpStream::connect((host.as_str(), *port)).await
+            }
+        }
+        .map_err(|err| ClientError::ConnectionFailed {
+            path: endpoint.addr.clone(),
+            source: err,
+        })?;
+        // Server-name selection: IP literals become [`ServerName::IpAddress`]
+        // (no reverse-DNS guessing); anything else must be a valid DNS
+        // name for certificate matching.
+        let server_name = target.server_name()?;
         let tls = connector
             .connect(server_name, tcp)
             .await
@@ -280,6 +363,8 @@ impl BrokerClient {
     }
 
     async fn raw_exchange(&mut self, line: &ClientLine) -> Result<ServerLine, ClientError> {
+        use tokio::io::AsyncBufReadExt as _;
+
         let mut encoded = serde_json::to_vec(line)
             .map_err(|err| ClientError::Io(format!("encode failure: {err}")))?;
         encoded.push(b'\n');
@@ -292,33 +377,32 @@ impl BrokerClient {
             .await
             .map_err(|err| ClientError::Io(format!("send failure: {err}")))?;
 
-        let mut buf = Vec::with_capacity(512);
-        let mut byte = [0u8; 1];
-        loop {
-            let read = self
-                .stream
-                .read(&mut byte)
-                .await
-                .map_err(|err| ClientError::Io(format!("receive failure: {err}")))?;
-            if read == 0 {
-                return Err(ClientError::Io(
-                    "connection closed before response".to_owned(),
-                ));
-            }
-            match byte[0] {
-                b'\n' => break,
-                b'\r' => {}
-                other => {
-                    buf.push(other);
-                    if buf.len() > MAX_LINE_BYTES {
-                        return Err(ClientError::ProtocolViolation(
-                            "response exceeds maximum permitted size".to_owned(),
-                        ));
-                    }
-                }
-            }
+        // Buffered read bounded exactly like the server side: one spare
+        // byte for the terminator; a longer line is a protocol violation,
+        // EOF before a newline is a connection failure.
+        let mut limited =
+            tokio::io::AsyncReadExt::take(&mut self.stream, (MAX_LINE_BYTES + 1) as u64);
+        let mut buffered = tokio::io::BufReader::with_capacity(1024, &mut limited);
+        let mut raw = Vec::with_capacity(512);
+        let read = buffered
+            .read_until(b'\n', &mut raw)
+            .await
+            .map_err(|err| ClientError::Io(format!("receive failure: {err}")))?;
+        if read == 0 {
+            return Err(ClientError::Io(
+                "connection closed before response".to_owned(),
+            ));
         }
-        serde_json::from_slice::<ServerLine>(&buf)
+        if raw.last() != Some(&b'\n') {
+            return Err(if read > MAX_LINE_BYTES {
+                ClientError::ProtocolViolation("response exceeds maximum permitted size".to_owned())
+            } else {
+                ClientError::Io("connection closed mid-response".to_owned())
+            });
+        }
+        raw.pop();
+        raw.retain(|byte| *byte != b'\r');
+        serde_json::from_slice::<ServerLine>(&raw)
             .map_err(|err| ClientError::ProtocolViolation(err.to_string()))
     }
 }
@@ -488,5 +572,126 @@ mod tests {
     fn protocol_version_is_one() {
         assert_eq!(protocol_version(), 1);
         assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    // -- endpoint parsing (plan §30 client surface) --------------------------
+
+    #[test]
+    fn endpoint_parsing_covers_ipv6_literals_hosts_and_errors() {
+        use std::net::Ipv6Addr;
+
+        let bracketed = parse_endpoint("[::1]:8443").expect("bracketed ipv6");
+        assert_eq!(
+            bracketed,
+            DialTarget::Literal(std::net::SocketAddr::from((Ipv6Addr::LOCALHOST, 8443)))
+        );
+        // IP literals map to ServerName::IpAddress, not DNS.
+        assert!(matches!(
+            bracketed.server_name(),
+            Ok(tokio_rustls::rustls::pki_types::ServerName::IpAddress(_))
+        ));
+
+        let host = parse_endpoint("gateway.example.com:443").expect("dns host");
+        assert_eq!(
+            host,
+            DialTarget::HostPort {
+                host: "gateway.example.com".to_owned(),
+                port: 443
+            }
+        );
+        assert!(matches!(
+            host.server_name(),
+            Ok(tokio_rustls::rustls::pki_types::ServerName::DnsName(_))
+        ));
+
+        for (raw, reason_fragment) in [
+            ("127.0.0.1", "a port is required"),
+            ("::1", "IPv6 literals need bracket form"),
+            ("[::1]", "IPv6 literals need bracket form"),
+            ("host:notaport", "port must be a number"),
+            ("host:99999", "port must be a number"),
+            (":8443", "empty host"),
+        ] {
+            let err = parse_endpoint(raw).expect_err(raw);
+            match &err {
+                ClientError::InvalidEndpoint { endpoint, reason } => {
+                    assert_eq!(endpoint, raw);
+                    assert!(reason.contains(reason_fragment), "{reason}");
+                }
+                other => panic!("expected InvalidEndpoint for {raw}, got {other:?}"),
+            }
+            // The Display message carries both facts.
+            let rendered = err.to_string();
+            assert!(rendered.contains(raw), "{rendered}");
+            assert!(rendered.contains(reason_fragment), "{rendered}");
+        }
+    }
+
+    /// Connects over TLS to an `[::1]:port` gateway when the host has
+    /// IPv6 loopback; skips silently otherwise.
+    #[tokio::test]
+    async fn ipv6_loopback_endpoint_connects_when_available() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+
+        // Mini-PKI: a real CA plus a signed server leaf (webpki rejects a
+        // CA-constrained certificate presented as an end entity).
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+
+        let key = rcgen::KeyPair::generate().expect("server key");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_owned(), "::1".to_owned()])
+            .expect("params");
+        let cert = params.signed_by(&key, &ca_cert, &ca_key).expect("cert");
+
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let mut server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().to_owned()],
+                tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .expect("server config");
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+            server_config,
+        )));
+
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(mut tls) = acceptor.accept(stream).await {
+                    use tokio::io::AsyncWriteExt as _;
+                    // One canned pong line, then close.
+                    let pong = format!(
+                        "{{\"ok\":true,\"version\":\"{}\"}}\n",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    let _ = tls.write_all(pong.as_bytes()).await;
+                    let _ = tls.flush().await;
+                    let _ = tls.shutdown().await;
+                }
+            }
+        });
+
+        // Write the CA + leaf to a temp file so connect_remote can load it.
+        let dir = tempfile::tempdir().expect("tmp");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, ca_cert.pem()).expect("ca pem");
+
+        let endpoint = RemoteEndpoint {
+            addr: format!("[::1]:{port}"),
+            ca_pem: ca_path,
+            cert_pem: None,
+            key_pem: None,
+        };
+        let mut client = BrokerClient::connect_remote(&endpoint)
+            .await
+            .expect("connect via bracketed ipv6 literal");
+        let version = client.ping().await.expect("pong");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
     }
 }

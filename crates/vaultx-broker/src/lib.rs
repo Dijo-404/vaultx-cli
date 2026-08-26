@@ -66,7 +66,7 @@ pub use inject::{
 pub use ipc::BrokerServer;
 pub use ipc::{
     BrokerEndpoint, ClientLine, EngineHandle, ServerConfig, ServerLine, DEFAULT_MAX_CONNECTIONS,
-    MAX_LINE_BYTES,
+    DRAIN_TIMEOUT, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_LINE_BYTES,
 };
 pub use request::{
     BrokerBody, BrokerRequest, BrokerResponse, Decision, RequestId, PROTOCOL_VERSION,

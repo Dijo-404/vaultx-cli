@@ -199,9 +199,12 @@ pub struct BrokerRequest {
     /// protection). When present it must match the request-id grammar and
     /// becomes both the echoed response id and the replay-cache key: any
     /// repeat of the same (session, id) pair inside the cache window is
-    /// denied `replay_detected`. When absent the broker mints a fresh
-    /// random id per execution, which is unique by construction and
-    /// therefore not replay-trackable.
+    /// denied `replay_detected`. Retries that reuse an id within the
+    /// window are refused even if policies changed between attempts —
+    /// standard idempotency-key semantics; mint a fresh id per logical
+    /// attempt. When absent the broker mints a fresh random id per
+    /// execution, which is unique by construction and therefore not
+    /// replay-trackable.
     #[serde(default)]
     pub request_id: Option<RequestId>,
 }

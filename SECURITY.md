@@ -71,9 +71,15 @@ agents on other hosts reach a broker whose host holds the keys. Clients use
 | Explicit egress policy | Unchanged from local mode: the policy engine authorizes canonical destinations; SSRF guards still apply (referenced, not rebuilt). |
 | No secret-returning broker API | INV-002 by construction: the protocol surface has no reveal/decrypt/admin route in either direction, pinned by serialization-scan regression tests over every response variant. |
 | Administrative reveal separate from agent API | Plaintext reveal exists only in the local CLI secret command (`--reveal-secrets`), which shares no code path with the wire protocol. |
+| Certificate/key rotation | Operator action: restart the gateway process. TLS material is loaded once at bind time; there is no hot reload. |
 
 Client-side TLS verification is unconditional: the gateway identity must
 validate against the operator-supplied `--tls-ca` bundle; no bypass exists.
+
+Two operational notes: certificate or key rotation requires a gateway
+restart (material is loaded at bind time, never hot-reloaded), and the
+replay cache lives inside the gateway process — a restart clears its
+window, so request-id uniqueness should not be relied on across restarts.
 
 ## Explicit non-goals
 

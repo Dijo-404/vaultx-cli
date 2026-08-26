@@ -3686,6 +3686,7 @@ dependencies = [
 name = "vaultx-broker-client"
 version = "0.1.0"
 dependencies = [
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "serde",

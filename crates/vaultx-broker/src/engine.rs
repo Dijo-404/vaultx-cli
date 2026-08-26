@@ -4,8 +4,8 @@
 //!
 //! ```text
 //!  1. parse protocol version        → deny "protocol_unsupported"
-//! 1b. replay guard (caller-supplied request id) → deny "replay_detected"
 //!  2. authenticate session          → deny "invalid_session"/"session_revoked"
+//! 2b. replay guard (caller-supplied request id) → deny "replay_detected"
 //!  3. canonicalize URL              → deny "invalid_destination"
 //!  4. DNS/network policy (literal)  → deny "destination_denied"
 //!  5. authorization                 → policy Deny { reason, policy }
@@ -52,7 +52,7 @@
 //! for this stage; the async wrapper arrives with the IPC layer together
 //! with the real transport implementation.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -97,13 +97,29 @@ pub const REPLAY_DETECTED_REASON: &str = "replay_detected";
 ///
 /// The session side of the key is the SHA-256 hash of the presented
 /// bearer token — never the raw value — so a memory read of the cache
-/// yields nothing usable as a credential. Entries are pruned by TTL on
-// every insert and the map is hard-capped with oldest-first eviction.
-#[derive(Default)]
+/// yields nothing usable as a credential.
+///
+/// Maintenance is amortized: expiry is checked lazily on lookup, a full
+/// sweep runs only when the map has grown past twice the live count
+/// recorded at the previous sweep, and cap eviction pops from a
+/// [`BTreeSet`] ordered by `(timestamp, key)` for O(log n) oldest-first
+/// removal.
 struct ReplayCache {
     ttl: Duration,
     capacity: usize,
-    seen: Mutex<HashMap<([u8; 32], String), Instant>>,
+    state: Mutex<ReplayState>,
+}
+
+#[derive(Default)]
+struct ReplayState {
+    /// Live observations: cache key → registration instant.
+    entries: HashMap<([u8; 32], String), Instant>,
+    /// Same observations ordered by `(instant, key)` so the oldest entry
+    /// is always `pop_first()`.
+    order: BTreeSet<(Instant, ([u8; 32], String))>,
+    /// Live-entry count as of the last full sweep; a new sweep triggers
+    /// only once the map exceeds twice this figure.
+    live_at_last_sweep: usize,
 }
 
 impl ReplayCache {
@@ -111,38 +127,41 @@ impl ReplayCache {
         Self {
             ttl: REPLAY_TTL,
             capacity: REPLAY_CACHE_MAX_ENTRIES,
-            seen: Mutex::new(HashMap::new()),
+            state: Mutex::new(ReplayState::default()),
         }
     }
 
     /// Registers a fresh observation. Returns `false` when the pair was
-    /// already registered inside the TTL window (a replay).
+    /// already registered inside the TTL window (a replay). A stale
+    /// duplicate is refreshed in place and counts as fresh.
     fn register(&self, token_hash: [u8; 32], request_id: &str) -> bool {
         let now = Instant::now();
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        seen.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-        if seen.len() >= self.capacity {
-            // Evict oldest entries until one slot is free. The scan is
-            // linear but only runs at the cap, amortizing to O(1) per
-            // insert across steady state.
-            while seen.len() >= self.capacity {
-                let oldest = seen
-                    .iter()
-                    .min_by_key(|(_, at)| **at)
-                    .map(|(key, _)| key.clone());
-                match oldest {
-                    Some(key) => drop(seen.remove(&key)),
-                    None => break,
-                }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = (token_hash, request_id.to_owned());
+
+        if let Some(&registered_at) = state.entries.get(&key) {
+            if now.duration_since(registered_at) < self.ttl {
+                return false;
             }
+            // Lazy expiry: refresh the observation instead of waiting for
+            // the next sweep to retire it.
+            state.order.remove(&(registered_at, key.clone()));
+            state.entries.insert(key.clone(), now);
+            state.order.insert((now, key));
+            return true;
         }
-        match seen.entry((token_hash, request_id.to_owned())) {
-            std::collections::hash_map::Entry::Occupied(_) => false,
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(now);
-                true
-            }
+
+        // Amortized sweep: only once the map has doubled since the last.
+        if state.entries.len() > 2 * state.live_at_last_sweep {
+            sweep_expired(now, self.ttl, &mut state);
         }
+        // Hard cap: evict oldest entries until one slot is free.
+        while state.entries.len() >= self.capacity {
+            evict_oldest(&mut state);
+        }
+        state.entries.insert(key.clone(), now);
+        state.order.insert((now, key));
+        true
     }
 
     #[cfg(test)]
@@ -150,16 +169,37 @@ impl ReplayCache {
         Self {
             ttl,
             capacity,
-            seen: Mutex::new(HashMap::new()),
+            state: Mutex::new(ReplayState::default()),
         }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.seen
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .entries
             .len()
+    }
+}
+
+/// Retires every expired entry in one pass and rebases the sweep
+/// threshold on the surviving (all-live) count.
+fn sweep_expired(now: Instant, ttl: Duration, state: &mut ReplayState) {
+    state.entries.retain(|key, at| {
+        let expired = now.duration_since(*at) >= ttl;
+        if expired {
+            state.order.remove(&(*at, key.clone()));
+        }
+        !expired
+    });
+    state.live_at_last_sweep = state.entries.len();
+}
+
+/// Removes the single oldest observation (O(log n)).
+fn evict_oldest(state: &mut ReplayState) {
+    if let Some((_, key)) = state.order.pop_first() {
+        state.entries.remove(&key);
     }
 }
 
@@ -567,31 +607,6 @@ impl BrokerEngine {
             );
         }
 
-        // Stage 1b — replay guard on caller-supplied correlation ids
-        // (plan §30). The cache keys the SHA-256 verifier of the presented
-        // token (never the raw bearer value) plus the id; any repeat
-        // inside the TTL window is refused before any pipeline side
-        // effect (budget decrement, credential resolution, egress). It
-        // applies uniformly to every transport: local IPC and the remote
-        // TLS gateway share this engine.
-        if req.request_id.is_some() {
-            let token_hash = crate::session::hash_token(&req.session_token);
-            if !self.replay.register(token_hash, request_id.as_str()) {
-                return self.deny(
-                    request_id,
-                    &correlation_id,
-                    Self::unauthenticated_actor(&req),
-                    None,
-                    Some(req.credential),
-                    None,
-                    capability,
-                    req.method.as_str(),
-                    REPLAY_DETECTED_REASON,
-                    None,
-                );
-            }
-        }
-
         // Stage 2 — session authentication (verifier hash compare).
         let record: AgentSessionRecord = match self.sessions.validate(&req.session_token) {
             Ok(record) => record,
@@ -638,6 +653,34 @@ impl BrokerEngine {
         let actor = Principal::parse(&format!("agent:{bare_agent}"))
             .expect("agent principals always parse");
         let environment = record.environment;
+
+        // Stage 2b — replay guard on caller-supplied correlation ids
+        // (plan §30). Runs after session validation so only authenticated
+        // traffic registers (invalid sessions cannot pollute the cache)
+        // and replay denials attribute the true agent principal in audit.
+        // The cache keys the SHA-256 verifier of the presented token
+        // (never the raw bearer value) plus the id; any repeat inside the
+        // TTL window is refused before any pipeline side effect
+        // (canonicalization, authorization, budget decrement, credential
+        // resolution, egress). It applies uniformly to every transport:
+        // local IPC and the remote TLS gateway share this engine.
+        if req.request_id.is_some() {
+            let token_hash = crate::session::hash_token(&req.session_token);
+            if !self.replay.register(token_hash, request_id.as_str()) {
+                return self.deny(
+                    request_id,
+                    &correlation_id,
+                    actor,
+                    Some(environment),
+                    Some(req.credential),
+                    None,
+                    capability,
+                    req.method.as_str(),
+                    REPLAY_DETECTED_REASON,
+                    None,
+                );
+            }
+        }
 
         // Stage 3 — canonicalization (scheme/host/port/path normalization;
         // http:// and friends already die here).
@@ -2341,8 +2384,41 @@ mod tests {
             &events[1].decision,
             AuditDecision::Deny { reason } if reason == REPLAY_DETECTED_REASON
         ));
+        // Post-auth placement: the deny attributes the real agent
+        // principal, not the unauthenticated placeholder.
+        assert_eq!(
+            events[1].actor.as_str(),
+            format!(
+                "agent:{}",
+                FIXTURE_AGENT_ID
+                    .strip_prefix("agent_")
+                    .unwrap_or(FIXTURE_AGENT_ID)
+            )
+        );
         // The transport ran exactly once (the original allow).
         assert_eq!(fixture.captured_len(), 1);
+    }
+
+    #[test]
+    fn invalid_session_replays_never_register_cache_entries() {
+        // Post-auth gating: an invalid session is denied before the guard,
+        // so failed attempts cannot poison a legitimate id for later.
+        let fixture = standard_fixture(happy_transport(), false);
+        let id = RequestId::generate().unwrap();
+
+        let mut bad = broker_request(&fixture);
+        bad.session_token = "definitely-not-a-token".to_owned();
+        bad.request_id = Some(id.clone());
+        let (reason, _) = deny_reason(&fixture.engine.execute_broker_request(bad));
+        assert_eq!(reason, "invalid_session");
+
+        // The same id still works for the genuine session afterwards.
+        let mut good = broker_request(&fixture);
+        good.request_id = Some(id);
+        assert_eq!(
+            fixture.engine.execute_broker_request(good).decision,
+            Decision::Allow
+        );
     }
 
     #[test]
