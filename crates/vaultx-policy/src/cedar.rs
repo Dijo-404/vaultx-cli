@@ -1182,7 +1182,10 @@ mod differential {
             "/repos/zeta/list",
         ];
         let environments = [None, Some("env_development"), Some("env_prod")];
-        let bodies = [0u64, 100u64, 262_145u64];
+        // Body-limit parity is covered exhaustively by the targeted
+        // body-limit test below; keep this matrix to a single body size
+        // so the cross-product stays fast (Cedar calls dominate).
+        let bodies = [0u64];
 
         let mut checks = 0usize;
         let mut allows = 0usize;
@@ -1224,7 +1227,7 @@ mod differential {
                 }
             }
         }
-        assert_eq!(checks, 6 * 5 * 4 * 7 * 12 * 3 * 3);
+        assert_eq!(checks, 6 * 5 * 4 * 7 * 12 * 3);
         assert!(allows > 0, "matrix must exercise the allow direction");
         assert!(explicit_denies > 0, "matrix must exercise explicit denials");
     }

@@ -2,11 +2,10 @@
 //!
 //! [`RuleEngine`] evaluates compiled policy documents with a strict,
 //! documented evaluation order and a **default-deny** posture. The trait is
-//! the integration seam for the broker: in production this crate is meant
-//! to be backed by Cedar as the policy evaluator, but Cedar is *not*
-//! integrated yet — the trait exists so callers can be wired against the
-//! final authorization surface today and swap evaluators later without
-//! touching call sites.
+//! the integration seam for the broker: production may back it with
+//! [`crate::CedarAuthorizer`] (select via `VAULTX_POLICY_ENGINE=cedar`),
+//! while [`RuleEngine`] remains the deterministic reference/default so
+//! callers can swap evaluators without touching call sites.
 //!
 //! Broker mapping: `principal` is the agent/session identity, `action` is
 //! always [`Action::HttpRequest`], `resource` is the credential logical ID,
