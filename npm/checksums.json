@@ -1,4 +1,10 @@
 {
   "schema": 1,
-  "artifacts": {}
+  "artifacts": {
+    "vaultx-darwin-aarch64": "24c42b2e98fea21887198e2a12070d3f59e80ba724a61d6df4aa9850039941d3",
+    "vaultx-darwin-x86_64": "4d6ed1db5a909dd0ed9cb982584a95665f2facffe2c8fa69f0b5df589cc57afc",
+    "vaultx-linux-aarch64": "37881b7137f0fe6d4f83770dd45f51eba58f0248d9834de3fb942139a1efb6d1",
+    "vaultx-linux-x86_64": "051a87206bd067ac8a0ccebbc8bd2d2a4e182a4395e5bfa626253448ff63fd96",
+    "vaultx-windows-x86_64.exe": "47789629bcdbbab7ebdcfd0e0173ef62503882410ba1a4a77753d2a7fd476af9"
+  }
 }
