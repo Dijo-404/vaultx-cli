@@ -2,3 +2,6 @@
 node_modules/
 *.log
 .DS_Store
+
+# downloaded release artifacts (fetched from GitHub Releases to embed checksums)
+/dist/
