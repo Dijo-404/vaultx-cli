@@ -1,12 +1,14 @@
-//! Typed client for the vaultx broker IPC endpoint (plan §18/§19).
+//! Typed client for the vaultx broker IPC endpoint (plan §18/§19) and
+//! its remote TLS gateway (plan §30).
 //!
 //! One JSON line out, one JSON line in, with a hard timeout so agents
-//! never hang on a wedged broker. Errors are secret-blind: connection and
-//! protocol failures carry only failure classes.
+//! never hang on a wedged broker. Errors are secret-blind: connection,
+//! TLS, and protocol failures carry only failure classes.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use vaultx_broker::request::PROTOCOL_VERSION;
 use vaultx_broker::{BrokerRequest, BrokerResponse, ClientLine, ServerLine, MAX_LINE_BYTES};
 
@@ -25,6 +27,11 @@ pub enum ClientError {
         #[source]
         source: std::io::Error,
     },
+    /// The remote gateway's TLS handshake failed: untrusted server
+    /// certificate, rejected client identity, or protocol mismatch.
+    /// There is deliberately no insecure-retry mode.
+    #[error("broker TLS handshake failed: {0}")]
+    TlsHandshakeFailed(String),
     /// The exchange did not complete inside the timeout.
     #[error("broker request timed out")]
     Timeout,
@@ -36,17 +43,84 @@ pub enum ClientError {
     Io(String),
 }
 
+/// Dial parameters for a remote broker gateway (plan §30). The CA bundle
+/// is **required**: the gateway identity is always verified against
+/// operator-supplied roots — no certificate-validation bypass exists.
+#[derive(Clone, Debug)]
+pub struct RemoteEndpoint {
+    /// `HOST:PORT` of the gateway.
+    pub addr: String,
+    /// PEM bundle of trusted CA certificates for the gateway's chain.
+    pub ca_pem: PathBuf,
+    /// Optional client certificate (PEM) for gateways requiring mutual
+    /// TLS workload identity.
+    pub cert_pem: Option<PathBuf>,
+    /// Private key matching [`Self::cert_pem`] (PEM).
+    pub key_pem: Option<PathBuf>,
+}
+
 /// Connection to one broker IPC endpoint.
 pub struct BrokerClient {
     stream: IpcStream,
 }
 
-#[cfg(unix)]
-type IpcStream = tokio::net::UnixStream;
-
-#[cfg(windows)]
+/// The byte stream under one connection: a local Unix socket or a
+/// TLS-protected TCP session to the remote gateway. Boxed so the enum
+/// stays small across await points.
 enum IpcStream {
-    Placeholder,
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl AsyncRead for IpcStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            Self::Unix(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for IpcStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            #[cfg(unix)]
+            Self::Unix(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            Self::Unix(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            #[cfg(unix)]
+            Self::Unix(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
 }
 
 impl BrokerClient {
@@ -64,7 +138,9 @@ impl BrokerClient {
                     path: path.as_ref().display().to_string(),
                     source: err,
                 })?;
-            Ok(Self { stream })
+            Ok(Self {
+                stream: IpcStream::Unix(stream),
+            })
         }
         #[cfg(windows)]
         {
@@ -73,6 +149,93 @@ impl BrokerClient {
                 "windows named-pipe endpoints are not supported yet".to_owned(),
             ))
         }
+    }
+
+    /// Connects to a remote TLS gateway (plan §30): rustls with the
+    /// caller-supplied root store, optional client-certificate identity
+    /// for mutually authenticated deployments. Certificate validation is
+    /// unconditional — an unverifiable gateway is refused, never
+    /// downgraded.
+    ///
+    /// # Errors
+    /// [`ClientError::ConnectionFailed`] on TCP failure,
+    /// [`ClientError::TlsHandshakeFailed`] when the handshake or any
+    /// certificate check fails, and typed violations elsewhere.
+    pub async fn connect_remote(endpoint: &RemoteEndpoint) -> Result<Self, ClientError> {
+        // rustls 0.23 requires an explicit process-level crypto provider;
+        // installing is idempotent (same pattern as the broker crate).
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
+        let ca_file = std::fs::File::open(&endpoint.ca_pem).map_err(|err| {
+            ClientError::Io(format!(
+                "cannot open CA bundle {}: {err}",
+                endpoint.ca_pem.display()
+            ))
+        })?;
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        let ca_certs = rustls_pemfile::certs(&mut std::io::BufReader::new(ca_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| ClientError::Io(format!("cannot parse CA bundle: {err}")))?;
+        if ca_certs.is_empty() {
+            return Err(ClientError::Io(
+                "CA bundle contains no certificates".to_owned(),
+            ));
+        }
+        for cert in ca_certs {
+            roots.add(cert).map_err(|err| {
+                ClientError::Io(format!("CA bundle rejected by trust store: {err}"))
+            })?;
+        }
+
+        let builder = tokio_rustls::rustls::ClientConfig::builder();
+        let config =
+            if let (Some(cert_pem), Some(key_pem)) = (&endpoint.cert_pem, &endpoint.key_pem) {
+                let cert_file = std::fs::File::open(cert_pem)
+                    .map_err(|err| ClientError::Io(format!("cannot open client cert: {err}")))?;
+                let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|err| ClientError::Io(format!("cannot parse client cert: {err}")))?;
+                if certs.is_empty() {
+                    return Err(ClientError::Io(
+                        "client cert file contains no certificates".to_owned(),
+                    ));
+                }
+                let key_file = std::fs::File::open(key_pem)
+                    .map_err(|err| ClientError::Io(format!("cannot open client key: {err}")))?;
+                let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+                    .map_err(|err| ClientError::Io(format!("cannot parse client key: {err}")))?
+                    .ok_or_else(|| {
+                        ClientError::Io("client key file contains no private key".to_owned())
+                    })?;
+                builder
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|err| ClientError::Io(format!("client identity rejected: {err}")))?
+            } else {
+                builder.with_root_certificates(roots).with_no_client_auth()
+            };
+
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(endpoint.addr.as_str())
+            .await
+            .map_err(|err| ClientError::ConnectionFailed {
+                path: endpoint.addr.clone(),
+                source: err,
+            })?;
+        // Server-name selection: IP literals stay literal; anything else
+        // is treated as a DNS name for certificate matching.
+        let host = endpoint.addr.split(':').next().unwrap_or(&endpoint.addr);
+        let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
+            .map_err(|_| {
+                ClientError::TlsHandshakeFailed(format!("invalid server name `{host}`"))
+            })?;
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|err| ClientError::TlsHandshakeFailed(err.to_string()))?;
+        Ok(Self {
+            stream: IpcStream::Tls(Box::new(tls)),
+        })
     }
 
     /// Sends the control ping and waits for the pong.
@@ -228,6 +391,7 @@ mod tests {
             headers: Vec::new(),
             body: BrokerBody::None,
             capability_hint: None,
+            request_id: None,
         }
     }
 
@@ -240,6 +404,7 @@ mod tests {
             ServerConfig {
                 socket_path: Some(path.clone()),
                 max_connections: 0,
+                endpoint: None,
             },
         )
         .expect("bind");

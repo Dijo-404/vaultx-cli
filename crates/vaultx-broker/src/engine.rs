@@ -4,6 +4,7 @@
 //!
 //! ```text
 //!  1. parse protocol version        → deny "protocol_unsupported"
+//! 1b. replay guard (caller-supplied request id) → deny "replay_detected"
 //!  2. authenticate session          → deny "invalid_session"/"session_revoked"
 //!  3. canonicalize URL              → deny "invalid_destination"
 //!  4. DNS/network policy (literal)  → deny "destination_denied"
@@ -51,8 +52,9 @@
 //! for this stage; the async wrapper arrives with the IPC layer together
 //! with the real transport implementation.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use vaultx_audit::{
     AppendStore, AuditAction, AuditDecision, CapabilityName, CorrelationId, NewAuditEvent,
@@ -78,6 +80,88 @@ use crate::transport::TransportExecutor;
 /// truncated, so an agent can never mistake a partial body for complete
 /// data.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+
+/// Replay-cache window (plan §30): a repeated (session, caller-supplied
+/// request id) pair inside this window is denied `replay_detected`.
+pub const REPLAY_TTL: Duration = Duration::from_secs(600);
+
+/// Hard cap on live replay-cache entries. At the cap the oldest entry is
+/// evicted per insert, bounding memory against id-flooding while keeping
+/// the window meaningful for legitimate traffic.
+pub const REPLAY_CACHE_MAX_ENTRIES: usize = 100_000;
+
+/// Denial reason for repeated (session, request-id) pairs.
+pub const REPLAY_DETECTED_REASON: &str = "replay_detected";
+
+/// One-shot registry keyed on `(token verifier, caller request id)`.
+///
+/// The session side of the key is the SHA-256 hash of the presented
+/// bearer token — never the raw value — so a memory read of the cache
+/// yields nothing usable as a credential. Entries are pruned by TTL on
+// every insert and the map is hard-capped with oldest-first eviction.
+#[derive(Default)]
+struct ReplayCache {
+    ttl: Duration,
+    capacity: usize,
+    seen: Mutex<HashMap<([u8; 32], String), Instant>>,
+}
+
+impl ReplayCache {
+    fn new() -> Self {
+        Self {
+            ttl: REPLAY_TTL,
+            capacity: REPLAY_CACHE_MAX_ENTRIES,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Registers a fresh observation. Returns `false` when the pair was
+    /// already registered inside the TTL window (a replay).
+    fn register(&self, token_hash: [u8; 32], request_id: &str) -> bool {
+        let now = Instant::now();
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if seen.len() >= self.capacity {
+            // Evict oldest entries until one slot is free. The scan is
+            // linear but only runs at the cap, amortizing to O(1) per
+            // insert across steady state.
+            while seen.len() >= self.capacity {
+                let oldest = seen
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(key, _)| key.clone());
+                match oldest {
+                    Some(key) => drop(seen.remove(&key)),
+                    None => break,
+                }
+            }
+        }
+        match seen.entry((token_hash, request_id.to_owned())) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(now);
+                true
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limits(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            ttl,
+            capacity,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
 
 /// Response header redacted unconditionally from every proxied response:
 /// upstream cookies are session state of the *upstream*, not something a
@@ -285,6 +369,7 @@ pub struct BrokerEngine {
     audit: Arc<dyn AppendStore>,
     project: ProjectId,
     egress_guard: EgressGuard,
+    replay: Arc<ReplayCache>,
 }
 
 impl BrokerEngine {
@@ -300,6 +385,7 @@ impl BrokerEngine {
             audit: deps.audit,
             project: deps.project,
             egress_guard: EgressGuard::new(deps.egress_allow_private),
+            replay: Arc::new(ReplayCache::new()),
         }
     }
 
@@ -446,11 +532,15 @@ impl BrokerEngine {
     /// Runs the §20 pipeline end-to-end. See the module documentation
     /// for the exact stage order and their denial reasons.
     fn execute_pipeline(&self, req: BrokerRequest) -> BrokerResponse {
-        // Identity/correlation bootstrap. Both fallbacks exist solely to
-        // keep the service signature infallible under entropy failure;
-        // they are deterministic, non-secret, and flagged in tests.
-        let request_id =
-            RequestId::generate().unwrap_or_else(|_| RequestId::deterministic_fallback());
+        // Identity/correlation bootstrap. The response id echoes a
+        // well-formed caller-supplied id when present (it is also the
+        // replay-cache key); otherwise a fresh random id is minted. Both
+        // fallbacks exist solely to keep the service signature infallible
+        // under entropy failure; they are deterministic, non-secret, and
+        // never replay-tracked.
+        let request_id = req.request_id.clone().unwrap_or_else(|| {
+            RequestId::generate().unwrap_or_else(|_| RequestId::deterministic_fallback())
+        });
         let correlation_id = CorrelationId::generate().unwrap_or_else(|_| {
             CorrelationId::parse(request_id.as_str()).expect("request id satisfies grammar")
         });
@@ -475,6 +565,31 @@ impl BrokerEngine {
                 "protocol_unsupported",
                 None,
             );
+        }
+
+        // Stage 1b — replay guard on caller-supplied correlation ids
+        // (plan §30). The cache keys the SHA-256 verifier of the presented
+        // token (never the raw bearer value) plus the id; any repeat
+        // inside the TTL window is refused before any pipeline side
+        // effect (budget decrement, credential resolution, egress). It
+        // applies uniformly to every transport: local IPC and the remote
+        // TLS gateway share this engine.
+        if req.request_id.is_some() {
+            let token_hash = crate::session::hash_token(&req.session_token);
+            if !self.replay.register(token_hash, request_id.as_str()) {
+                return self.deny(
+                    request_id,
+                    &correlation_id,
+                    Self::unauthenticated_actor(&req),
+                    None,
+                    Some(req.credential),
+                    None,
+                    capability,
+                    req.method.as_str(),
+                    REPLAY_DETECTED_REASON,
+                    None,
+                );
+            }
         }
 
         // Stage 2 — session authentication (verifier hash compare).
@@ -821,6 +936,7 @@ mod tests {
     use super::*;
     use crate::credential::InMemoryCredentialSource;
     use crate::inject::{CredentialMetadata, InjectionTemplateId};
+    use crate::ipc::ServerLine;
     use crate::request::BrokerBody;
     use crate::session::InMemorySessionStore;
     use crate::transport::ExecutedResponse;
@@ -1056,6 +1172,7 @@ mod tests {
             headers: Vec::new(),
             body: BrokerBody::None,
             capability_hint: None,
+            request_id: None,
         }
     }
 
@@ -1619,6 +1736,7 @@ mod tests {
             headers: Vec::new(),
             body: BrokerBody::None,
             capability_hint: None,
+            request_id: None,
         };
 
         // Matching principal: allowed end-to-end. Session records carry the
@@ -1885,7 +2003,9 @@ mod tests {
             headers: Vec::new(),
             body: BrokerBody::None,
             capability_hint: None,
+            request_id: None,
         };
+
         let response = engine.execute_broker_request(request);
 
         assert_eq!(response.status, 500);
@@ -1961,7 +2081,9 @@ mod tests {
             headers: Vec::new(),
             body: BrokerBody::None,
             capability_hint: None,
+            request_id: None,
         };
+
         let response = engine.execute_broker_request(request);
         assert_eq!(response.status, 500);
         assert_eq!(
@@ -2126,5 +2248,170 @@ mod tests {
             .list_for_agent(&AgentId::parse(FIXTURE_AGENT_ID).unwrap())
             .unwrap();
         assert!(records[0].constraints.is_none());
+    }
+
+    // -- plan §30 replay protection -------------------------------------------
+
+    #[test]
+    fn repeated_caller_request_id_is_denied_replay_detected() {
+        let fixture = standard_fixture(happy_transport(), false);
+
+        let first = broker_request(&fixture);
+        let request_id = RequestId::generate().unwrap();
+        let mut first = first;
+        first.request_id = Some(request_id.clone());
+        let response = fixture.engine.execute_broker_request(first);
+        assert_eq!(response.decision, Decision::Allow);
+        assert_eq!(response.request_id, request_id, "echoes caller id");
+
+        // Identical (session_token, request_id) ⇒ denied before any side
+        // effect: no second budget decrement, no second transport call.
+        let mut replay = broker_request(&fixture);
+        replay.request_id = Some(request_id.clone());
+        let response = fixture.engine.execute_broker_request(replay);
+        let (reason, _) = deny_reason(&response);
+        assert_eq!(reason, "replay_detected");
+
+        // A different request id proceeds normally.
+        let mut fresh = broker_request(&fixture);
+        fresh.request_id = Some(RequestId::generate().unwrap());
+        let response = fixture.engine.execute_broker_request(fresh);
+        assert_eq!(response.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn same_request_id_under_a_different_session_is_not_a_replay() {
+        // Two live sessions minted for the same agent (both authorized by
+        // the fixture policy) key independently in the cache.
+        let fixture = standard_fixture(happy_transport(), false);
+        let (_, other_token) = fixture
+            .sessions
+            .create(
+                &AgentId::parse(FIXTURE_AGENT_ID).unwrap(),
+                &EnvironmentId::parse("env_development").unwrap(),
+            )
+            .expect("second session");
+        let shared_id = RequestId::generate().unwrap();
+
+        let mut first = broker_request(&fixture);
+        first.request_id = Some(shared_id.clone());
+        assert_eq!(
+            fixture.engine.execute_broker_request(first).decision,
+            Decision::Allow
+        );
+
+        let mut second = broker_request(&fixture);
+        second.session_token = other_token;
+        second.request_id = Some(shared_id);
+        assert_eq!(
+            fixture.engine.execute_broker_request(second).decision,
+            Decision::Allow,
+            "the cache keys sessions independently"
+        );
+    }
+
+    #[test]
+    fn server_minted_ids_are_not_replay_tracked() {
+        // Without a caller-supplied id every execution mints a fresh id;
+        // identical wire requests must keep succeeding.
+        let fixture = standard_fixture(happy_transport(), false);
+        for _ in 0..3 {
+            let response = fixture
+                .engine
+                .execute_broker_request(broker_request(&fixture));
+            assert_eq!(response.decision, Decision::Allow);
+        }
+    }
+
+    #[test]
+    fn replay_deny_writes_an_audit_event_before_the_response() {
+        let fixture = standard_fixture(happy_transport(), false);
+        let id = RequestId::generate().unwrap();
+        let mut first = broker_request(&fixture);
+        first.request_id = Some(id.clone());
+        fixture.engine.execute_broker_request(first);
+
+        let mut replay = broker_request(&fixture);
+        replay.request_id = Some(id);
+        fixture.engine.execute_broker_request(replay);
+
+        let events = audit_events(&fixture);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[1].decision,
+            AuditDecision::Deny { reason } if reason == REPLAY_DETECTED_REASON
+        ));
+        // The transport ran exactly once (the original allow).
+        assert_eq!(fixture.captured_len(), 1);
+    }
+
+    #[test]
+    fn replay_cache_prunes_expired_entries() {
+        let cache = ReplayCache::with_limits(Duration::from_millis(20), 4);
+        let key = [7u8; 32];
+        assert!(cache.register(key, "req_00000000000000000000000000000001"));
+        std::thread::sleep(Duration::from_millis(40));
+        // TTL expiry frees the pair for re-registration.
+        assert!(cache.register(key, "req_00000000000000000000000000000001"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn replay_cache_evicts_oldest_at_capacity() {
+        let cache = ReplayCache::with_limits(REPLAY_TTL, 4);
+        let key = [9u8; 32];
+        for index in 0usize..4 {
+            assert!(cache.register(key, &format!("req_{index:032x}")));
+        }
+        assert_eq!(cache.len(), 4);
+        // At the cap the oldest entry (index 0) is evicted to make room;
+        // the insert itself still registers as fresh.
+        assert!(cache.register(key, &format!("req_{:032x}", 4usize)));
+        assert_eq!(cache.len(), 4);
+        // A surviving id remains a replay inside the window.
+        assert!(!cache.register(key, &format!("req_{:032x}", 2usize)));
+    }
+
+    #[test]
+    fn serialized_responses_never_carry_credential_plaintext() {
+        // INV-002 regression (plan §30): every response the pipeline can
+        // emit is scanned over its full serialization for the credential
+        // canary. There is no reveal/admin variant in the protocol enums
+        // by construction — this pins that no *value* path (headers,
+        // body, decision reason, request id) smuggles plaintext either.
+        let fixture = standard_fixture(happy_transport(), false);
+
+        // Allow path: upstream echoed a token-shaped value; the engine
+        // must have scrubbed it, and the canary never crosses the wire.
+        let allow = fixture
+            .engine
+            .execute_broker_request(broker_request(&fixture));
+        assert_eq!(allow.decision, Decision::Allow);
+
+        // Deny paths: policy denial and replay denial.
+        let mut denied = broker_request(&fixture);
+        denied.url = "https://evil.example.com/x".to_owned();
+        let deny = fixture.engine.execute_broker_request(denied);
+        let replay_id = RequestId::generate().unwrap();
+        let mut first = broker_request(&fixture);
+        first.request_id = Some(replay_id.clone());
+        let _ = fixture.engine.execute_broker_request(first);
+        let mut replay = broker_request(&fixture);
+        replay.request_id = Some(replay_id);
+        let replayed = fixture.engine.execute_broker_request(replay);
+
+        for response in [allow, deny, replayed] {
+            for wire in [
+                serde_json::to_string(&response).expect("serialize"),
+                // Decoded-and-re-encoded round trip through the wire
+                // envelope shape the IPC/TLS layers actually write.
+                serde_json::to_string(&ServerLine::Response(response.clone()))
+                    .expect("envelope serialize"),
+            ] {
+                assert!(!wire.contains(SECRET_CANARY), "{wire}");
+            }
+            let debugged = format!("{response:?}");
+            assert!(!debugged.contains(SECRET_CANARY));
+        }
     }
 }

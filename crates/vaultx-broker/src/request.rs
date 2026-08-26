@@ -195,6 +195,15 @@ pub struct BrokerRequest {
     pub body: BrokerBody,
     /// Informational capability name. Never consulted for authorization.
     pub capability_hint: Option<String>,
+    /// Caller-supplied correlation identifier (plan §30 replay
+    /// protection). When present it must match the request-id grammar and
+    /// becomes both the echoed response id and the replay-cache key: any
+    /// repeat of the same (session, id) pair inside the cache window is
+    /// denied `replay_detected`. When absent the broker mints a fresh
+    /// random id per execution, which is unique by construction and
+    /// therefore not replay-trackable.
+    #[serde(default)]
+    pub request_id: Option<RequestId>,
 }
 
 impl std::fmt::Debug for BrokerRequest {
@@ -211,6 +220,10 @@ impl std::fmt::Debug for BrokerRequest {
             .field("headers", &self.headers)
             .field("body_wire_len_bytes", &self.body.wire_len_bytes())
             .field("capability_hint", &self.capability_hint)
+            .field(
+                "request_id",
+                &self.request_id.as_ref().map(RequestId::as_str),
+            )
             .finish()
     }
 }
@@ -285,6 +298,7 @@ mod tests {
                 value: serde_json::json!({"title": "Fix auth bug"}),
             },
             capability_hint: Some("github.pull_request.create".to_owned()),
+            request_id: Some(RequestId::generate().unwrap()),
         }
     }
 
@@ -297,6 +311,46 @@ mod tests {
 
         // The tagged body keeps its variant across the boundary.
         assert!(matches!(decoded.body, BrokerBody::Json { .. }));
+    }
+
+    #[test]
+    fn requests_without_request_id_still_decode() {
+        // Wire compatibility: pre-§30 producers omit the field entirely.
+        let legacy = serde_json::to_string(&BrokerRequest {
+            protocol: PROTOCOL_VERSION,
+            session_token: "0123456789abcdef0123456789abcdef".to_owned(),
+            credential: CredentialRef::parse("github-work-token").unwrap(),
+            method: HttpMethod::GET,
+            url: "https://api.github.com/x".to_owned(),
+            headers: Vec::new(),
+            body: BrokerBody::None,
+            capability_hint: None,
+            request_id: None,
+        })
+        .unwrap();
+        // Strip the emitted `request_id` key to simulate a legacy line.
+        let without: serde_json::Value = serde_json::from_str(&legacy).unwrap();
+        let mut stripped = without.clone();
+        stripped
+            .as_object_mut()
+            .unwrap()
+            .remove("request_id")
+            .expect("field present");
+        let decoded: BrokerRequest = serde_json::from_value(stripped).unwrap();
+        assert_eq!(decoded.request_id, None);
+        assert_eq!(decoded.credential.as_str(), "github-work-token");
+    }
+
+    #[test]
+    fn malformed_caller_request_ids_are_rejected_at_decode() {
+        let mut value = serde_json::to_value(sample_request()).unwrap();
+        for bad in ["nope", "req_zz", "req_0123456789ABCDEF0123456789abcdef"] {
+            value["request_id"] = serde_json::Value::String(bad.to_owned());
+            assert!(
+                serde_json::from_value::<BrokerRequest>(value.clone()).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

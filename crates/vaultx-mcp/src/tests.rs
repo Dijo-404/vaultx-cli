@@ -53,6 +53,7 @@ async fn spawn_mock_broker() -> std::path::PathBuf {
         ServerConfig {
             socket_path: Some(path.clone()),
             max_connections: 0,
+            endpoint: None,
         },
     )
     .unwrap();

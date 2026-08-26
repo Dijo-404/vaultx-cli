@@ -11,12 +11,15 @@ getrandom = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 vaultx-audit = { path = "../vaultx-audit" }
 vaultx-crypto = { path = "../vaultx-crypto" }
 vaultx-http = { path = "../vaultx-http" }
@@ -24,9 +27,10 @@ vaultx-policy = { path = "../vaultx-policy" }
 vaultx-types = { path = "../vaultx-types" }
 
 [dev-dependencies]
-# Self-signed certificates let transport tests exercise the real rustls
-# handshake against a loopback TLS stub without touching the network.
+# Self-signed certificates let transport/gateway tests exercise real
+# rustls handshakes against loopback endpoints without touching the
+# network (plan §30 tests).
 rcgen = "0.13"
-tokio-rustls = "0.26"
 tempfile = { workspace = true }
 proptest = { workspace = true }
+vaultx-broker-client = { path = "../vaultx-broker-client" }

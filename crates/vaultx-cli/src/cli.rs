@@ -639,17 +639,51 @@ pub enum PolicyCommand {
 #[derive(Subcommand, Debug)]
 pub enum BrokerCommand {
     /// Bind the IPC endpoint and serve until Ctrl-C.
+    ///
+    /// Default: local socket (`$XDG_RUNTIME_DIR/vaultx/local/broker.sock`
+    /// or platform pipe). With `--remote`, serves the plan §30 TLS
+    /// gateway instead: mutually authenticated when `--client-ca` is
+    /// supplied, with the verified client certificate acting as workload
+    /// identity.
     Serve {
-        /// Endpoint override (default:
-        /// `$XDG_RUNTIME_DIR/vaultx/local/broker.sock` or platform pipe).
-        #[arg(long, value_name = "PATH")]
+        /// Local socket override (conflicts with --remote).
+        #[arg(long, value_name = "PATH", conflicts_with = "remote")]
         socket: Option<PathBuf>,
+        /// Serve the isolated remote TLS gateway (plan §30) instead of
+        /// the local socket.
+        #[arg(long, requires_all = ["bind", "tls_cert", "tls_key"])]
+        remote: bool,
+        /// Gateway bind address (`ADDR:PORT`; required with --remote).
+        #[arg(long, value_name = "ADDR:PORT", requires = "remote")]
+        bind: Option<String>,
+        /// Server certificate chain (PEM; required with --remote).
+        #[arg(long, value_name = "PEM", requires = "remote")]
+        tls_cert: Option<PathBuf>,
+        /// Server private key (PEM; required with --remote).
+        #[arg(long, value_name = "PEM", requires = "remote")]
+        tls_key: Option<PathBuf>,
+        /// CA requiring client certificates signed by it (mutual TLS
+        /// workload identity; optional, only with --remote).
+        #[arg(long, value_name = "PEM", requires = "remote")]
+        client_ca: Option<PathBuf>,
     },
     /// Probe the broker endpoint and print its version.
     Status {
-        /// Endpoint override.
-        #[arg(long, value_name = "PATH")]
+        /// Endpoint override (local socket path).
+        #[arg(long, value_name = "PATH", conflicts_with = "endpoint")]
         socket: Option<PathBuf>,
+        /// Remote gateway address `HOST:PORT` (requires --tls-ca).
+        #[arg(long, value_name = "HOST:PORT", requires = "tls_ca")]
+        endpoint: Option<String>,
+        /// Trusted CA bundle (PEM) for the remote connection.
+        #[arg(long, value_name = "PEM", requires = "endpoint")]
+        tls_ca: Option<PathBuf>,
+        /// Optional client certificate for mutual-TLS gateways.
+        #[arg(long, value_name = "PEM", requires = "endpoint")]
+        tls_cert: Option<PathBuf>,
+        /// Private key matching --tls-cert.
+        #[arg(long, value_name = "PEM", requires = "endpoint")]
+        tls_key: Option<PathBuf>,
     },
     /// Perform one brokered HTTP request through the endpoint.
     Request(Box<BrokerRequestArgs>),
@@ -689,9 +723,21 @@ pub struct BrokerRequestArgs {
     /// Informational capability name (never used for authorization).
     #[arg(long)]
     capability_hint: Option<String>,
-    /// Endpoint override.
-    #[arg(long, value_name = "PATH")]
+    /// Local socket override (conflicts with --endpoint).
+    #[arg(long, value_name = "PATH", conflicts_with = "endpoint")]
     socket: Option<PathBuf>,
+    /// Remote gateway address `HOST:PORT` (requires --tls-ca).
+    #[arg(long, value_name = "HOST:PORT", requires = "tls_ca")]
+    endpoint: Option<String>,
+    /// Trusted CA bundle (PEM) for the remote connection.
+    #[arg(long, value_name = "PEM", requires = "endpoint")]
+    tls_ca: Option<PathBuf>,
+    /// Optional client certificate for mutual-TLS gateways.
+    #[arg(long, value_name = "PEM", requires = "endpoint")]
+    tls_cert: Option<PathBuf>,
+    /// Private key matching --tls-cert.
+    #[arg(long, value_name = "PEM", requires = "endpoint")]
+    tls_key: Option<PathBuf>,
 }
 
 /// `vaultx pack <subcommand>`.
@@ -1001,14 +1047,42 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
             cmd_run(s, env.as_deref(), *allow_empty, command)
         }),
         Command::Broker { command } => match command {
-            BrokerCommand::Serve { socket } => {
+            BrokerCommand::Serve {
+                socket,
+                remote,
+                bind,
+                tls_cert,
+                tls_key,
+                client_ca,
+            } => {
                 let services = VaultxServices::open(&cli.project).map_err(|err| match err {
                     CoreError::NotARepository(path) => CliError::NotARepository(path),
                     other => other.into(),
                 })?;
-                cmd_broker_serve(services, socket.as_deref())
+                cmd_broker_serve(
+                    services,
+                    socket.as_deref(),
+                    *remote,
+                    bind.as_deref(),
+                    tls_cert.clone(),
+                    tls_key.clone(),
+                    client_ca.clone(),
+                )
             }
-            BrokerCommand::Status { socket } => cmd_broker_status(&cli.project, socket.as_deref()),
+            BrokerCommand::Status {
+                socket,
+                endpoint,
+                tls_ca,
+                tls_cert,
+                tls_key,
+            } => cmd_broker_status(
+                &cli.project,
+                socket.as_deref(),
+                endpoint.as_deref(),
+                tls_ca.clone(),
+                tls_cert.clone(),
+                tls_key.clone(),
+            ),
             BrokerCommand::Request(args) => cmd_broker_request(
                 &cli.project,
                 args.socket.as_deref(),
@@ -1021,6 +1095,10 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
                 args.data_binary.as_deref(),
                 args.data_base64.as_deref(),
                 args.capability_hint.as_deref(),
+                args.endpoint.as_deref(),
+                args.tls_ca.clone(),
+                args.tls_cert.clone(),
+                args.tls_key.clone(),
             ),
         },
         Command::Pack { command } => match command {
@@ -2134,23 +2212,69 @@ pub(crate) fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
 
 /// Consumes the facade so the engine can share one [`ProjectContext`]
 /// behind an `Arc` across threads.
-fn cmd_broker_serve(services: VaultxServices, socket: Option<&Path>) -> Result<String, CliError> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_broker_serve(
+    services: VaultxServices,
+    socket: Option<&Path>,
+    remote: bool,
+    bind: Option<&str>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    client_ca: Option<PathBuf>,
+) -> Result<String, CliError> {
     let ctx = std::sync::Arc::new(services.into_context());
     let engine = vaultx_core::broker_source::build_production_engine(&ctx)
         .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))?;
 
-    // Bind inside the runtime: tokio listener construction requires a
-    // reactor context.
+    // Remote gateways (plan §30) require the full TLS flag group; clap
+    // enforces the pairwise `requires` rules, and this re-check keeps
+    // programmatic construction honest.
+    let endpoint = if remote {
+        let bind_addr = bind
+            .and_then(|raw| raw.parse::<std::net::SocketAddr>().ok())
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--bind expects ADDR:PORT, got `{}`",
+                    bind.unwrap_or_default()
+                ))
+            })?;
+        Some(vaultx_broker::BrokerEndpoint::RemoteTls {
+            bind: bind_addr,
+            cert_pem: tls_cert.expect("clap requires --tls-cert with --remote"),
+            key_pem: tls_key.expect("clap requires --tls-key with --remote"),
+            client_ca_pem: client_ca,
+        })
+    } else {
+        None
+    };
+
+    // Bind inside the runtime: tokio listener construction (both the UDS
+    // path and the remote TCP+TLS gateway) requires a reactor context.
     let socket_path = socket.map(Path::to_path_buf);
     let outcome = run_async(async move {
-        let server = vaultx_broker::BrokerServer::bind(
-            std::sync::Arc::new(engine),
-            "local",
-            vaultx_broker::ServerConfig {
-                socket_path,
-                max_connections: 0,
-            },
-        )
+        let server = match &endpoint {
+            Some(_) => {
+                vaultx_broker::BrokerServer::bind_remote(
+                    std::sync::Arc::new(engine),
+                    "local",
+                    vaultx_broker::ServerConfig {
+                        socket_path,
+                        max_connections: 0,
+                        endpoint,
+                    },
+                )
+                .await
+            }
+            None => vaultx_broker::BrokerServer::bind(
+                std::sync::Arc::new(engine),
+                "local",
+                vaultx_broker::ServerConfig {
+                    socket_path,
+                    max_connections: 0,
+                    endpoint: None,
+                },
+            ),
+        }
         .map_err(|err| CliError::Runtime(CoreError::Io(std::io::Error::other(err.to_string()))))?;
         println!("vaultx broker listening on {}", server.path().display());
         // The trigger must outlive the server: `serve` consumes it, so
@@ -2243,19 +2367,77 @@ fn resolve_endpoint(_project: &Path, socket: Option<&Path>) -> PathBuf {
     }
 }
 
+/// How a client-facing broker command reaches the broker: the local
+/// socket or the remote TLS gateway (plan §30).
+enum BrokerDial {
+    Local(PathBuf),
+    Remote(vaultx_broker_client::RemoteEndpoint),
+}
+
+/// Builds the dial target from command flags, enforcing the pairwise
+/// cert/key rule clap cannot express and refusing half-configured
+/// remote identities instead of silently ignoring them.
+#[allow(clippy::too_many_arguments)]
+fn build_dial(
+    socket: Option<&Path>,
+    endpoint: Option<&str>,
+    tls_ca: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+) -> Result<BrokerDial, CliError> {
+    let addr = match endpoint {
+        None => return Ok(BrokerDial::Local(resolve_endpoint(Path::new("."), socket))),
+        Some(addr) => addr,
+    };
+    match (tls_cert.is_some(), tls_key.is_some()) {
+        (false, false) | (true, true) => {}
+        _ => {
+            return Err(CliError::Usage(
+                "--tls-cert and --tls-key must be supplied together".into(),
+            ))
+        }
+    }
+    Ok(BrokerDial::Remote(vaultx_broker_client::RemoteEndpoint {
+        addr: addr.to_owned(),
+        ca_pem: tls_ca.expect("clap requires --tls-ca with --endpoint"),
+        cert_pem: tls_cert,
+        key_pem: tls_key,
+    }))
+}
+
+async fn dial_client(dial: BrokerDial) -> Result<vaultx_broker_client::BrokerClient, CliError> {
+    match dial {
+        BrokerDial::Local(path) => vaultx_broker_client::BrokerClient::connect(&path)
+            .await
+            .map_err(map_client_error),
+        BrokerDial::Remote(remote) => vaultx_broker_client::BrokerClient::connect_remote(&remote)
+            .await
+            .map_err(map_client_error),
+    }
+}
+
 fn map_client_error(err: vaultx_broker_client::ClientError) -> CliError {
     let text = err.to_string();
     CliError::Runtime(CoreError::Io(std::io::Error::other(text)))
 }
 
-fn cmd_broker_status(project: &Path, socket: Option<&Path>) -> Result<String, CliError> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_broker_status(
+    project: &Path,
+    socket: Option<&Path>,
+    endpoint: Option<&str>,
+    tls_ca: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+) -> Result<String, CliError> {
     let _ = project;
-    let endpoint = resolve_endpoint(project, socket);
-    let shown = endpoint.display().to_string();
+    let dial = build_dial(socket, endpoint, tls_ca, tls_cert, tls_key)?;
+    let shown = match &dial {
+        BrokerDial::Local(path) => path.display().to_string(),
+        BrokerDial::Remote(remote) => remote.addr.clone(),
+    };
     run_async(async move {
-        let mut client = vaultx_broker_client::BrokerClient::connect(&endpoint)
-            .await
-            .map_err(map_client_error)?;
+        let mut client = dial_client(dial).await?;
         client.ping().await.map_err(map_client_error)
     })
     .map(|version| format!("broker reachable at {shown} (version {version})"))
@@ -2263,7 +2445,7 @@ fn cmd_broker_status(project: &Path, socket: Option<&Path>) -> Result<String, Cl
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_broker_request(
-    project: &Path,
+    _project: &Path,
     socket: Option<&Path>,
     session_token: &str,
     credential: &str,
@@ -2274,9 +2456,13 @@ fn cmd_broker_request(
     data_binary: Option<&str>,
     data_base64: Option<&str>,
     capability_hint: Option<&str>,
+    endpoint: Option<&str>,
+    tls_ca: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
 ) -> Result<String, CliError> {
     use base64::Engine as _;
-    let endpoint = resolve_endpoint(project, socket);
+    let dial = build_dial(socket, endpoint, tls_ca, tls_cert, tls_key)?;
 
     let session_token = match session_token {
         "-" => {
@@ -2336,12 +2522,11 @@ fn cmd_broker_request(
         headers: header_pairs,
         body,
         capability_hint: capability_hint.map(str::to_owned),
+        request_id: None,
     };
 
     let response = run_async(async move {
-        let mut client = vaultx_broker_client::BrokerClient::connect(&endpoint)
-            .await
-            .map_err(map_client_error)?;
+        let mut client = dial_client(dial).await?;
         client.request(request).await.map_err(map_client_error)
     })?;
 

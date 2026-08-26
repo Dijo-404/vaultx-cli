@@ -3993,6 +3993,7 @@ fn delegation_mints_scoped_child_enforced_by_broker_and_prints_token_once() {
         headers: Vec::new(),
         body: vaultx_broker::BrokerBody::None,
         capability_hint: None,
+        request_id: None,
     };
 
     let in_scope = request_for(&child_token, "https://api.github.com/repos/acme/ok");

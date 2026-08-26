@@ -50,7 +50,8 @@ pub mod transport;
 
 pub use credential::{CredentialSource, InMemoryCredentialSource};
 pub use engine::{
-    scrub_secret_patterns, BrokerDependencies, BrokerEngine, BrokerService, MAX_RESPONSE_BODY_BYTES,
+    scrub_secret_patterns, BrokerDependencies, BrokerEngine, BrokerService,
+    MAX_RESPONSE_BODY_BYTES, REPLAY_CACHE_MAX_ENTRIES, REPLAY_DETECTED_REASON, REPLAY_TTL,
 };
 pub use error::BrokerError;
 #[cfg(unix)]
@@ -64,7 +65,8 @@ pub use inject::{
 #[cfg(unix)]
 pub use ipc::BrokerServer;
 pub use ipc::{
-    ClientLine, EngineHandle, ServerConfig, ServerLine, DEFAULT_MAX_CONNECTIONS, MAX_LINE_BYTES,
+    BrokerEndpoint, ClientLine, EngineHandle, ServerConfig, ServerLine, DEFAULT_MAX_CONNECTIONS,
+    MAX_LINE_BYTES,
 };
 pub use request::{
     BrokerBody, BrokerRequest, BrokerResponse, Decision, RequestId, PROTOCOL_VERSION,

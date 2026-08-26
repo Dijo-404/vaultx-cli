@@ -258,6 +258,7 @@ async fn send_via_broker(
         headers,
         body,
         capability_hint: capability_hint.map(str::to_owned),
+        request_id: None,
     };
 
     let mut client = BrokerClient::connect(&ctx.endpoint)

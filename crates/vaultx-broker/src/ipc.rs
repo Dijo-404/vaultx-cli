@@ -1,9 +1,10 @@
 //! Local IPC transport for the broker process (plan §18 "Local endpoint",
-//! §19 wire protocol).
+//! §19 wire protocol) plus the remote TLS gateway (plan §30).
 //!
 //! One JSON line in → one JSON line out, over a Unix domain socket (or a
-//! Windows named pipe). The envelope types distinguish the control
-//! channel ([`ClientLine::Ping`]) from brokered requests
+//! Windows named pipe), or over mutually-authenticated TLS on a TCP
+//! listener for isolated deployments. The envelope types distinguish the
+//! control channel ([`ClientLine::Ping`]) from brokered requests
 //! ([`BrokerRequest`] reused verbatim as the request-line shape) and keep
 //! responses tagged so protocol violations are reported instead of
 //! crashing the server.
@@ -15,10 +16,36 @@
 //! performs **no** per-peer authentication beyond that file-system
 //! boundary; session bearer tokens remain the per-request proof of agent
 //! identity.
+//!
+//! # Remote/isolated gateway (plan §30 strict mode)
+//!
+//! [`BrokerEndpoint::RemoteTls`] serves the *same wire protocol* through
+//! a rustls TLS listener so agents can reach a broker whose host holds
+//! vault keys the agent machine does not:
+//!
+//! * **Workload identity** — when `client_ca_pem` is configured the
+//!   handshake *requires* a client certificate signed by that CA;
+//!   connections failing certificate verification never deliver a single
+//!   protocol byte. The verified client cert is the workload identity;
+//!   session tokens remain the per-request agent proof underneath it.
+//! * **Replay protection** — enforced inside the engine pipeline for
+//!   every transport (`replay_detected`, see `engine::REPLAY_TTL`).
+//! * **Egress policy** — unchanged: the authorizer owns destination
+//!   decisions exactly as locally (referenced, not rebuilt here).
+//! * **No secret-returning API** — INV-002 by construction: the protocol
+//!   surface is exactly [`ClientLine`] (ping | request) and [`ServerLine`]
+//!   (pong | violation | response). There is no reveal, decrypt-at-rest,
+//!   or administrative route anywhere in either enum, and no way to name
+//!   one; the administrative reveal path exists only in the local CLI
+//!   secret command, which shares no code path with this wire protocol.
+//!   A serialization-scan regression test pins the response invariant.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(unix)]
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -44,6 +71,9 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
 
 /// A single line sent by a client to the broker.
 #[derive(Clone, Debug, PartialEq)]
+// The request variant legitimately dwarfs the ping variant: boxing the
+// payload would add an allocation to every brokered line for no benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum ClientLine {
     /// Control ping (`{"protocol":1,"op":"ping"}`).
     Ping,
@@ -227,14 +257,40 @@ where
     }
 }
 
+/// Endpoint selection for a broker server (plan §18 local IPC vs §30
+/// remote TLS gateway).
+#[derive(Clone, Debug)]
+pub enum BrokerEndpoint {
+    /// Unix domain socket at `path` (or the platform pipe name).
+    LocalSocket(PathBuf),
+    /// Remote TLS gateway bound on `bind` (plan §30). `client_ca_pem`,
+    /// when present, makes client certificates **required** during the
+    /// handshake — that certificate check *is* the workload identity.
+    RemoteTls {
+        /// TCP address to bind (`127.0.0.1:0` picks an ephemeral port).
+        bind: SocketAddr,
+        /// Server certificate chain, PEM encoded.
+        cert_pem: PathBuf,
+        /// Server private key, PEM encoded (PKCS#8 or SEC1).
+        key_pem: PathBuf,
+        /// CA whose signatures client certificates must carry. `None`
+        /// serves server-only TLS (no client-auth requirement).
+        client_ca_pem: Option<PathBuf>,
+    },
+}
+
 /// Configuration knobs for [`BrokerServer`].
 #[derive(Clone, Debug, Default)]
 pub struct ServerConfig {
     /// Endpoint override; `None` uses [`default_socket_path`] (or the
-    /// platform pipe name).
+    /// platform pipe name). Ignored when [`Self::endpoint`] selects a
+    /// remote gateway.
     pub socket_path: Option<PathBuf>,
     /// Maximum concurrent connections (`0` selects the default).
     pub max_connections: usize,
+    /// Explicit endpoint selection. `None` keeps the legacy local-socket
+    /// resolution driven by [`Self::socket_path`].
+    pub endpoint: Option<BrokerEndpoint>,
 }
 
 impl ServerConfig {
@@ -245,25 +301,43 @@ impl ServerConfig {
             self.max_connections
         }
     }
+
+    /// Resolves the local socket path: an explicit endpoint wins, then
+    /// the legacy `socket_path` override, then the default resolution.
+    fn local_socket_path(&self, fallback: PathBuf) -> PathBuf {
+        match &self.endpoint {
+            Some(BrokerEndpoint::LocalSocket(path)) => path.clone(),
+            _ => self.socket_path.clone().unwrap_or(fallback),
+        }
+    }
 }
 
 /// A bound, serving broker endpoint.
 ///
-/// Unix implementation binds the plan's socket path; the Windows named
-/// pipe compiles but returns a typed failure until its serving loop
-/// lands (the rest of the workspace stays cross-platform compilable).
+/// Unix implementation binds the plan's socket path or the plan §30 TLS
+/// listener; the Windows named pipe compiles but returns a typed failure
+/// until its serving loop lands (the rest of the workspace stays
+/// cross-platform compilable).
 pub struct BrokerServer<E: EngineHandle> {
     engine: Arc<E>,
     config: ServerConfig,
     shutdown_tx: watch::Sender<bool>,
     path: PathBuf,
+    /// True for [`BrokerEndpoint::RemoteTls`] servers; controls exit
+    /// cleanup (TCP endpoints must not attempt socket unlinking).
+    remote: bool,
     #[cfg(unix)]
     listener: Option<UnixListener>,
+    /// Present only for [`BrokerEndpoint::RemoteTls`] servers: the bound
+    /// TCP listener plus its prepared TLS acceptor.
+    #[cfg(unix)]
+    tls_listener: Option<(tokio::net::TcpListener, Arc<tokio_rustls::TlsAcceptor>)>,
 }
 
 impl<E: EngineHandle> BrokerServer<E> {
-    /// Binds the endpoint and prepares the server. Call [`Self::serve`]
-    /// to run the accept loop (usually inside `tokio::spawn`).
+    /// Binds the local endpoint and prepares the server. Call
+    /// [`Self::serve`] to run the accept loop (usually inside
+    /// `tokio::spawn`).
     ///
     /// Unix: creates parent directories `0700`, refuses to displace a
     /// **live** broker (probe-connect first), removes a stale socket,
@@ -271,19 +345,22 @@ impl<E: EngineHandle> BrokerServer<E> {
     ///
     /// # Errors
     /// [`BrokerError::TransportFailure`] when the endpoint cannot be
-    /// created/bound, or when another live broker owns it.
+    /// created/bound, when another live broker owns it, or when a remote
+    /// endpoint was requested (use [`Self::bind_remote`]).
     pub fn bind(
         engine: Arc<E>,
         project_endpoint_id: &str,
         config: ServerConfig,
     ) -> Result<Self, BrokerError> {
+        if matches!(config.endpoint, Some(BrokerEndpoint::RemoteTls { .. })) {
+            return Err(BrokerError::TransportFailure(
+                "remote TLS endpoints require BrokerServer::bind_remote".to_owned(),
+            ));
+        }
         #[cfg(unix)]
         {
             let sanitized = sanitize_endpoint_segment(project_endpoint_id);
-            let path = config
-                .socket_path
-                .clone()
-                .unwrap_or_else(|| default_socket_path(&sanitized));
+            let path = config.local_socket_path(default_socket_path(&sanitized));
             if let Some(parent) = path.parent() {
                 create_private_dir(parent)?;
             }
@@ -307,6 +384,8 @@ impl<E: EngineHandle> BrokerServer<E> {
                 shutdown_tx: watch::channel(false).0,
                 path,
                 listener: Some(listener),
+                remote: false,
+                tls_listener: None,
             })
         }
         #[cfg(windows)]
@@ -318,10 +397,82 @@ impl<E: EngineHandle> BrokerServer<E> {
         }
     }
 
-    /// The bound endpoint path (socket path or pipe name).
+    /// Binds the remote TLS gateway (plan §30): loads the server
+    /// certificate/key via `rustls-pemfile` and builds a rustls
+    /// [`tokio_rustls::TlsAcceptor`]. When `client_ca_pem` is configured
+    /// the handshake requires a client certificate signed by that CA —
+    /// rejection happens before any protocol byte is processed.
+    ///
+    /// # Errors
+    /// [`BrokerError::TransportFailure`] when files cannot be read or
+    /// parsed, when rustls rejects the material, or on Windows (named
+    /// pipes and remote gateways are both pending there).
+    ///
+    /// Must run inside a tokio runtime (the TCP listener binds through
+    /// the reactor).
+    pub async fn bind_remote(
+        engine: Arc<E>,
+        _project_endpoint_id: &str,
+        config: ServerConfig,
+    ) -> Result<Self, BrokerError> {
+        let Some(BrokerEndpoint::RemoteTls {
+            bind,
+            cert_pem,
+            key_pem,
+            client_ca_pem,
+        }) = config.endpoint.clone()
+        else {
+            return Err(BrokerError::TransportFailure(
+                "bind_remote requires a RemoteTls endpoint".to_owned(),
+            ));
+        };
+        #[cfg(unix)]
+        {
+            // rustls 0.23 requires an explicit process-level crypto
+            // provider; installing is idempotent (see http_transport).
+            let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+            let tls_config =
+                build_tls_server_config(&cert_pem, &key_pem, client_ca_pem.as_deref())?;
+            let acceptor = Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)));
+            let listener = tokio::net::TcpListener::bind(bind).await.map_err(|err| {
+                BrokerError::TransportFailure(format!("cannot bind gateway address: {err}"))
+            })?;
+            let shown = listener.local_addr().map_err(|err| {
+                BrokerError::TransportFailure(format!("cannot inspect gateway address: {err}"))
+            })?;
+            Ok(Self {
+                engine,
+                config,
+                shutdown_tx: watch::channel(false).0,
+                path: PathBuf::from(format!("tcp://{shown}")),
+                listener: None,
+                remote: true,
+                tls_listener: Some((listener, acceptor)),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let _ = (bind, cert_pem, key_pem, project_endpoint_id);
+            Err(BrokerError::TransportFailure(
+                "remote TLS endpoints are not implemented yet".to_owned(),
+            ))
+        }
+    }
+
+    /// The bound endpoint path (socket path, pipe name, or the remote
+    /// gateway's `tcp://ADDR:PORT` display form).
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The concrete bound TCP address of a remote gateway.
+    #[must_use]
+    #[cfg(unix)]
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.tls_listener
+            .as_ref()
+            .and_then(|(listener, _)| listener.local_addr().ok())
     }
 
     /// Signals graceful shutdown; the accept loop exits promptly while
@@ -340,29 +491,32 @@ impl<E: EngineHandle> BrokerServer<E> {
         })
     }
 
-    /// Runs the accept loop until shutdown is signalled. On Unix the
-    /// socket file is removed on exit.
+    /// Runs the accept loop until shutdown is signalled. Local sockets
+    /// are removed on exit; TCP listeners simply close.
     ///
     /// # Errors
     /// Fatal accept failures surface as [`BrokerError::TransportFailure`];
     /// per-connection errors are contained to their own task.
     #[cfg(unix)]
     pub async fn serve(mut self) -> Result<(), BrokerError> {
-        let Some(listener) = self.listener.take() else {
-            return Err(BrokerError::TransportFailure(
-                "server already consumed".to_owned(),
-            ));
-        };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         // A trigger fired before this subscribe must still stop us:
         // borrow_and_update surfaces already-set values that `changed()`
         // alone would miss.
         if *shutdown_rx.borrow_and_update() {
-            drop(listener);
-            let _ = std::fs::remove_file(&self.path);
-            return Ok(());
+            return self.cleanup_on_exit();
         }
         let live = Arc::new(LiveConnections::default());
+        if let Some((tcp_listener, acceptor)) = self.tls_listener.take() {
+            return self
+                .serve_remote(tcp_listener, acceptor, live, &mut shutdown_rx)
+                .await;
+        }
+        let Some(listener) = self.listener.take() else {
+            return Err(BrokerError::TransportFailure(
+                "server already consumed".to_owned(),
+            ));
+        };
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
@@ -405,7 +559,74 @@ impl<E: EngineHandle> BrokerServer<E> {
             }
         }
         drop(listener);
-        let _ = std::fs::remove_file(&self.path);
+        self.cleanup_on_exit()
+    }
+
+    /// Remote gateway accept loop (plan §30). Same slot accounting and
+    /// shutdown semantics as the local loop; each accepted TCP stream is
+    /// wrapped in TLS first. Handshake failures — including a missing or
+    /// untrusted client certificate when `client_ca_pem` enforces mutual
+    /// auth — are contained to their own task and never deliver a
+    /// protocol byte.
+    #[cfg(unix)]
+    async fn serve_remote(
+        self,
+        listener: tokio::net::TcpListener,
+        acceptor: Arc<tokio_rustls::TlsAcceptor>,
+        live: Arc<LiveConnections>,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<(), BrokerError> {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let (stream, _peer) = match accepted {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            return Err(BrokerError::TransportFailure(
+                                format!("accept failed: {err}")
+                            ));
+                        }
+                    };
+                    // Over-limit peers are dropped without a drain
+                    // exchange: pre-TLS plaintext replies cannot reach a
+                    // client that has not completed a handshake.
+                    let Some(slot) = live.try_acquire(self.config.effective_connections())
+                    else {
+                        drop(stream);
+                        continue;
+                    };
+                    let engine = Arc::clone(&self.engine);
+                    let mut conn_shutdown = shutdown_rx.clone();
+                    if *conn_shutdown.borrow_and_update() {
+                        drop(slot);
+                        drop(stream);
+                        continue;
+                    }
+                    let acceptor = Arc::clone(&acceptor);
+                    tokio::spawn(async move {
+                        // A refused handshake (bad/absent client cert,
+                        // hostile hello) is contained here: no protocol
+                        // request was ever seen, nothing to audit.
+                        if let Ok(tls_stream) = acceptor.accept(stream).await {
+                            serve_connection(tls_stream, engine, &mut conn_shutdown).await;
+                        }
+                        drop(slot);
+                    });
+                }
+            }
+        }
+        drop(listener);
+        self.cleanup_on_exit()
+    }
+
+    /// Removes the local socket file on exit (TCP endpoints need no
+    /// cleanup).
+    #[cfg(unix)]
+    fn cleanup_on_exit(&self) -> Result<(), BrokerError> {
+        if !self.remote {
+            let _ = std::fs::remove_file(&self.path);
+        }
         Ok(())
     }
 
@@ -582,15 +803,93 @@ async fn write_line(
     Ok(())
 }
 
+/// Loads a rustls server configuration from PEM material. When
+/// `client_ca_pem` is set, client authentication becomes **mandatory**
+/// with the CA as sole trust anchor — that verified certificate is the
+/// remote agent's workload identity (plan §30).
+#[cfg(unix)]
+fn build_tls_server_config(
+    cert_pem: &Path,
+    key_pem: &Path,
+    client_ca_pem: Option<&Path>,
+) -> Result<rustls::ServerConfig, BrokerError> {
+    use std::io::BufReader;
+
+    fn read_certs(
+        label: &str,
+        path: &Path,
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, BrokerError> {
+        let file = std::fs::File::open(path)
+            .map_err(|err| BrokerError::TransportFailure(format!("cannot open {label}: {err}")))?;
+        rustls_pemfile::certs(&mut BufReader::new(file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| {
+                BrokerError::TransportFailure(format!(
+                    "cannot parse certificates in {label}: {err}"
+                ))
+            })
+    }
+
+    let certs = read_certs("server certificate", cert_pem)?;
+    if certs.is_empty() {
+        return Err(BrokerError::TransportFailure(
+            "server certificate file contains no certificates".to_owned(),
+        ));
+    }
+    let key_file = std::fs::File::open(key_pem)
+        .map_err(|err| BrokerError::TransportFailure(format!("cannot open server key: {err}")))?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .map_err(|err| BrokerError::TransportFailure(format!("cannot parse server key: {err}")))?
+        .ok_or_else(|| {
+            BrokerError::TransportFailure("server key file contains no private key".to_owned())
+        })?;
+
+    let builder = rustls::ServerConfig::builder();
+    let config = match client_ca_pem {
+        Some(ca_path) => {
+            let ca_certs = read_certs("client CA", ca_path)?;
+            if ca_certs.is_empty() {
+                return Err(BrokerError::TransportFailure(
+                    "client CA file contains no certificates".to_owned(),
+                ));
+            }
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in ca_certs {
+                roots.add(cert).map_err(|err| {
+                    BrokerError::TransportFailure(format!("cannot trust client CA: {err}"))
+                })?;
+            }
+            // Mandatory client authentication: handshakes without a
+            // certificate chain this CA signed are rejected outright.
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|err| {
+                    BrokerError::TransportFailure(format!(
+                        "client certificate verifier rejected: {err}"
+                    ))
+                })?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+        }
+        None => builder.with_no_client_auth().with_single_cert(certs, key),
+    };
+    config
+        .map_err(|err| BrokerError::TransportFailure(format!("tls configuration rejected: {err}")))
+}
+
 /// Serves one connection: request/response pairs until EOF, shutdown, or
 /// fatal framing violation. Engine execution runs on the blocking pool so
-/// the synchronous pipeline never stalls the async reactor.
+/// the synchronous pipeline never stalls the async reactor. Generic over
+/// the byte stream so Unix sockets and TLS-wrapped TCP share one handler.
 #[cfg(unix)]
-async fn serve_connection<E: EngineHandle>(
-    stream: tokio::net::UnixStream,
+async fn serve_connection<E: EngineHandle, S>(
+    stream: S,
     engine: Arc<E>,
     shutdown: &mut watch::Receiver<bool>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = reader;
     loop {
@@ -621,11 +920,14 @@ async fn serve_connection<E: EngineHandle>(
 /// Parses and dispatches one client line. Returns `false` when the
 /// connection must close.
 #[cfg(unix)]
-async fn handle_line_bytes<E: EngineHandle>(
+async fn handle_line_bytes<E: EngineHandle, W>(
     engine: &Arc<E>,
     bytes: Vec<u8>,
-    writer: &mut (impl tokio::io::AsyncWriteExt + Unpin),
-) -> bool {
+    writer: &mut W,
+) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let parsed: Result<ClientLine, _> = serde_json::from_slice(&bytes);
     match parsed {
         Ok(ClientLine::Ping) => {
@@ -706,6 +1008,7 @@ mod tests {
             headers: Vec::new(),
             body: BrokerBody::None,
             capability_hint: None,
+            request_id: None,
         }
     }
 
@@ -720,6 +1023,7 @@ mod tests {
             ServerConfig {
                 socket_path: Some(path.clone()),
                 max_connections,
+                endpoint: None,
             },
         )
         .expect("bind");
@@ -866,6 +1170,7 @@ mod tests {
                 ServerConfig {
                     socket_path: Some(path.clone()),
                     max_connections: 0,
+                    endpoint: None,
                 },
             )
             .expect("bind");
@@ -896,6 +1201,7 @@ mod tests {
             ServerConfig {
                 socket_path: Some(path.clone()),
                 max_connections: 0,
+                endpoint: None,
             },
         )
         .is_ok());
@@ -910,6 +1216,7 @@ mod tests {
             ServerConfig {
                 socket_path: Some(path.clone()),
                 max_connections: 0,
+                endpoint: None,
             },
         );
         drop(live);

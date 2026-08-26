@@ -39,23 +39,41 @@ In this mode vaultx provides real protection against prompt-injected agents
 reading or misusing credentials, and no protection against malware already
 running as your user.
 
-### Hardened/isolated deployment (not yet shipped)
+### Hardened/isolated deployment
 
-The following boundaries are designed for but **not provided by today's
-build**. They require future implementation work and/or operator setup:
+The following boundaries require operator setup beyond the default build:
 
 - **OS keychain or KMS root keys.** The `WrappingKeyProvider` trait seam
   exists so operators can supply such backends; no OS-keychain or KMS
   implementation ships yet.
-- **Container/service isolation of the broker** (strict mode, plan §30):
-  running the broker where the agent host has no access to key material.
-  Remote/isolated broker transport is not implemented.
+- **Key isolation is a deployment property.** Run the broker on a host
+  holding vault keys that agent machines cannot read; agents connect to it
+  over the network (below). The broker never ships key material to clients.
 - **Remote control plane over TLS with device-key attestation**: sync clients
   independently verify object hashes and signatures, but there is no hosted
   remote broker service.
 
 Until these ship, treat local developer mode's same-user boundary as the
-actual security envelope.
+actual security envelope for everything except what is documented below.
+
+### Remote broker gateway (strict mode, plan §30)
+
+Shipped: `vaultx broker serve --remote --bind ADDR:PORT --tls-cert PEM
+--tls-key PEM [--client-ca PEM]` serves the same wire protocol over TLS so
+agents on other hosts reach a broker whose host holds the keys. Clients use
+`vaultx broker status|request --endpoint HOST:PORT --tls-ca PEM`.
+
+| Strict-mode requirement | Mechanism |
+| --- | --- |
+| Broker key access unavailable to agent host | Deployment property: run the gateway on a host holding the keys; agents connect remotely and receive only brokered responses. |
+| Mutually authenticated channel / workload identity | rustls mTLS: with `--client-ca`, client certificates signed by that CA are **required** during the handshake — connections without a valid certificate are refused before any protocol byte. The verified certificate is the workload identity; session tokens remain the per-request proof underneath it. |
+| Replay protections | The engine denies a repeated (session, caller-supplied request id) pair within a 10-minute window (`replay_detected`) before any side effect, on every transport including local IPC. Cache entries are TTL-pruned and hard-capped (oldest evicted). |
+| Explicit egress policy | Unchanged from local mode: the policy engine authorizes canonical destinations; SSRF guards still apply (referenced, not rebuilt). |
+| No secret-returning broker API | INV-002 by construction: the protocol surface has no reveal/decrypt/admin route in either direction, pinned by serialization-scan regression tests over every response variant. |
+| Administrative reveal separate from agent API | Plaintext reveal exists only in the local CLI secret command (`--reveal-secrets`), which shares no code path with the wire protocol. |
+
+Client-side TLS verification is unconditional: the gateway identity must
+validate against the operator-supplied `--tls-ca` bundle; no bypass exists.
 
 ## Explicit non-goals
 
