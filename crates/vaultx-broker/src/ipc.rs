@@ -917,15 +917,17 @@ fn build_tls_server_config(
     key_pem: &Path,
     client_ca_pem: Option<&Path>,
 ) -> Result<rustls::ServerConfig, BrokerError> {
-    use std::io::BufReader;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    fn read_certs(
-        label: &str,
-        path: &Path,
-    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, BrokerError> {
-        let file = std::fs::File::open(path)
-            .map_err(|err| BrokerError::TransportFailure(format!("cannot open {label}: {err}")))?;
-        rustls_pemfile::certs(&mut BufReader::new(file))
+    fn read_certs(label: &str, path: &Path) -> Result<Vec<CertificateDer<'static>>, BrokerError> {
+        // PemObject replaces the unmaintained rustls-pemfile crate.
+        CertificateDer::pem_file_iter(path)
+            .map_err(|err| {
+                BrokerError::TransportFailure(format!(
+                    "cannot read certificate file {label}: {err}"
+                ))
+            })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| {
                 BrokerError::TransportFailure(format!(
@@ -940,13 +942,8 @@ fn build_tls_server_config(
             "server certificate file contains no certificates".to_owned(),
         ));
     }
-    let key_file = std::fs::File::open(key_pem)
-        .map_err(|err| BrokerError::TransportFailure(format!("cannot open server key: {err}")))?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|err| BrokerError::TransportFailure(format!("cannot parse server key: {err}")))?
-        .ok_or_else(|| {
-            BrokerError::TransportFailure("server key file contains no private key".to_owned())
-        })?;
+    let key = PrivateKeyDer::from_pem_file(key_pem)
+        .map_err(|err| BrokerError::TransportFailure(format!("cannot parse server key: {err}")))?;
 
     let builder = rustls::ServerConfig::builder();
     let config = match client_ca_pem {

@@ -81,7 +81,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # server/client configs below pin the `ring` provider explicitly.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 # Cedar authorization engine backing the `cedar` policy-engine mode
 # (`VAULTX_POLICY_ENGINE=cedar`); pinned to the 4.x line.
 cedar-policy = "4"

@@ -247,16 +247,15 @@ impl BrokerClient {
         // installing is idempotent (same pattern as the broker crate).
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
-        let ca_file = std::fs::File::open(&endpoint.ca_pem).map_err(|err| {
-            ClientError::Io(format!(
-                "cannot open CA bundle {}: {err}",
-                endpoint.ca_pem.display()
-            ))
-        })?;
         let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-        let ca_certs = rustls_pemfile::certs(&mut std::io::BufReader::new(ca_file))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| ClientError::Io(format!("cannot parse CA bundle: {err}")))?;
+        // PemObject replaces the unmaintained rustls-pemfile crate.
+        let ca_certs = {
+            use tokio_rustls::rustls::pki_types::pem::PemObject;
+            tokio_rustls::rustls::pki_types::CertificateDer::pem_file_iter(&endpoint.ca_pem)
+                .map_err(|err| ClientError::Io(format!("cannot read CA bundle: {err}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| ClientError::Io(format!("cannot parse CA bundle: {err}")))?
+        };
         if ca_certs.is_empty() {
             return Err(ClientError::Io(
                 "CA bundle contains no certificates".to_owned(),
@@ -271,9 +270,10 @@ impl BrokerClient {
         let builder = tokio_rustls::rustls::ClientConfig::builder();
         let config =
             if let (Some(cert_pem), Some(key_pem)) = (&endpoint.cert_pem, &endpoint.key_pem) {
-                let cert_file = std::fs::File::open(cert_pem)
-                    .map_err(|err| ClientError::Io(format!("cannot open client cert: {err}")))?;
-                let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+                use tokio_rustls::rustls::pki_types::pem::PemObject;
+                use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+                let certs = CertificateDer::pem_file_iter(cert_pem)
+                    .map_err(|err| ClientError::Io(format!("cannot parse client cert: {err}")))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|err| ClientError::Io(format!("cannot parse client cert: {err}")))?;
                 if certs.is_empty() {
@@ -281,13 +281,8 @@ impl BrokerClient {
                         "client cert file contains no certificates".to_owned(),
                     ));
                 }
-                let key_file = std::fs::File::open(key_pem)
-                    .map_err(|err| ClientError::Io(format!("cannot open client key: {err}")))?;
-                let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
-                    .map_err(|err| ClientError::Io(format!("cannot parse client key: {err}")))?
-                    .ok_or_else(|| {
-                        ClientError::Io("client key file contains no private key".to_owned())
-                    })?;
+                let key = PrivateKeyDer::from_pem_file(key_pem)
+                    .map_err(|err| ClientError::Io(format!("cannot parse client key: {err}")))?;
                 builder
                     .with_root_certificates(roots)
                     .with_client_auth_cert(certs, key)

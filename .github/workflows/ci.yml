@@ -49,6 +49,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # rust-toolchain.toml pins the channel, so components must be added
+      # to THAT toolchain (the dtolnay action installs them on `stable`,
+      # which cargo does not resolve to when a toolchain file is present).
+      - name: install rustfmt + clippy on the pinned toolchain
+        run: rustup component add rustfmt clippy
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
