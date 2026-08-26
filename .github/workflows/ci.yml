@@ -152,6 +152,13 @@ jobs:
         with:
           tool: cross
 
+      # rust-toolchain.toml pins the channel; `rustup target add` must
+      # address THAT toolchain (the action's `targets:` lands on
+      # `stable`, which cargo does not resolve to here).
+      - name: install cross-compile target
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: rustup target add x86_64-apple-darwin
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
