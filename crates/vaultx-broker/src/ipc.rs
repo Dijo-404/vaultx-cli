@@ -732,9 +732,12 @@ impl Drop for ConnectionSlot {
 /// the accept path, all under a short timeout so silent peers cost
 /// nothing.
 async fn refuse_connection(mut stream: tokio::net::UnixStream) {
+    // One drained line only; persistence is irrelevant here, but the
+    // buffered type is required by [`read_line_capped`].
+    let mut buffered = tokio::io::BufReader::with_capacity(1024, &mut stream);
     let drain = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        read_line_capped(&mut stream),
+        read_line_capped(&mut buffered),
     );
     let _ = drain.await;
     let line = ServerLine::ProtocolViolation {
@@ -815,44 +818,74 @@ fn restrict_path_permissions(path: &Path) -> Result<(), BrokerError> {
 
 /// Reads one newline-terminated JSON line with the hard length cap.
 ///
-/// Buffered (`read_until(b'\n')` bounded by `.take()`), so framing costs
-/// one poll per chunk rather than one per byte. Cap semantics match the
-/// original byte loop exactly: content up to [`MAX_LINE_BYTES`] is fine
-/// (a terminating `\n` may exceed it by one), anything longer is a
-/// protocol violation, and EOF mid-line stays an error.
+/// `reader` must be a **persistent** [`tokio::io::BufReader`] owned by
+/// the connection loop: bytes buffered past this line's `\n` (pipelined
+/// frames arriving in one segment) stay in its internal buffer and are
+/// served by the next call. A per-call reader would silently drop them.
 ///
-/// Returns `Ok(None)` on clean EOF before any byte of a new line.
+/// The cap is enforced during accumulation against CR-stripped content —
+/// identical to the original byte loop: a line whose content exceeds
+/// [`MAX_LINE_BYTES`] is a violation as soon as it happens, terminator
+/// or not, so a hostile peer cannot park unbounded data in memory.
+///
+/// Returns `Ok(None)` on clean EOF before any byte of a new line; EOF
+/// mid-line stays an error.
 #[cfg(unix)]
 async fn read_line_capped(
-    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
 ) -> Result<Option<Vec<u8>>, BrokerError> {
     use tokio::io::AsyncBufReadExt as _;
 
-    // One spare byte so a full-cap line with its terminator still fits.
-    let mut limited = tokio::io::AsyncReadExt::take(&mut *reader, (MAX_LINE_BYTES + 1) as u64);
-    let mut buffered = tokio::io::BufReader::with_capacity(1024, &mut limited);
     let mut raw = Vec::with_capacity(512);
-    let read = buffered
-        .read_until(b'\n', &mut raw)
-        .await
-        .map_err(|err| BrokerError::TransportFailure(format!("read failure: {err}")))?;
-    if read == 0 {
-        return Ok(None);
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|err| BrokerError::TransportFailure(format!("read failure: {err}")))?;
+        if available.is_empty() {
+            return if raw.is_empty() {
+                Ok(None)
+            } else {
+                Err(BrokerError::TransportFailure(
+                    "connection closed mid-line".to_owned(),
+                ))
+            };
+        }
+        let chunk_len = available.len();
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(end) => {
+                append_non_cr(&mut raw, &available[..end]);
+                // Bytes after `\n` remain buffered for the next call.
+                reader.consume(end + 1);
+                if raw.len() > MAX_LINE_BYTES {
+                    return Err(BrokerError::TransportFailure(
+                        "line exceeds maximum permitted size".to_owned(),
+                    ));
+                }
+                return Ok(Some(raw));
+            }
+            None => {
+                append_non_cr(&mut raw, available);
+                reader.consume(chunk_len);
+                if raw.len() > MAX_LINE_BYTES {
+                    return Err(BrokerError::TransportFailure(
+                        "line exceeds maximum permitted size".to_owned(),
+                    ));
+                }
+            }
+        }
     }
-    if raw.last() != Some(&b'\n') {
-        return if read > MAX_LINE_BYTES {
-            Err(BrokerError::TransportFailure(
-                "line exceeds maximum permitted size".to_owned(),
-            ))
-        } else {
-            Err(BrokerError::TransportFailure(
-                "connection closed mid-line".to_owned(),
-            ))
-        };
+}
+
+/// Appends `bytes` minus carriage returns — matching the original byte
+/// loop, which dropped `\r` wherever it appeared.
+fn append_non_cr(raw: &mut Vec<u8>, bytes: &[u8]) {
+    raw.reserve(bytes.len());
+    for &byte in bytes {
+        if byte != b'\r' {
+            raw.push(byte);
+        }
     }
-    raw.pop();
-    raw.retain(|byte| *byte != b'\r');
-    Ok(Some(raw))
 }
 
 /// Serializes and writes one response line followed by `\n`.
@@ -962,7 +995,11 @@ async fn serve_connection<E: EngineHandle, S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader_half, mut writer) = tokio::io::split(stream);
+    // ONE persistent reader for the whole connection: frames buffered
+    // past the current line's `\n` survive across loop iterations, so
+    // pipelined lines arriving in a single segment are all served.
+    let mut reader = tokio::io::BufReader::with_capacity(8192, reader_half);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -1178,6 +1215,43 @@ mod tests {
         let (_handle, bound) = spawn_server(dir.path(), 16).await;
         let reply = exchange_line(&bound, b"{\"protocol\":1,\"op\":\"ping\"}\n").await;
         assert!(reply.contains("\"ok\":true"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn two_pipelined_lines_in_a_single_write_are_both_served() {
+        // Legal under the line-framed protocol: one TCP/UDS segment
+        // carrying two complete frames. The persistent per-connection
+        // reader must serve both — a per-call reader loses the bytes
+        // buffered past the first `\n` and the second line vanishes.
+        let dir = tempfile::tempdir().expect("tmp");
+        let (_handle, bound) = spawn_server(dir.path(), 16).await;
+        let mut stream = tokio::net::UnixStream::connect(&bound).await.unwrap();
+
+        let mut segment =
+            serde_json::to_string(&broker_request("https://api.github.com/x")).unwrap();
+        segment.push('\n');
+        segment.push_str("{\"protocol\":1,\"op\":\"ping\"}\n");
+        stream.write_all(segment.as_bytes()).await.unwrap();
+
+        let first = read_framed_reply(&mut stream).await;
+        assert!(first.contains("\"decision\":\"allow\""), "{first}");
+        let second = read_framed_reply(&mut stream).await;
+        assert!(second.contains("\"ok\":true"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn three_pipelined_pings_all_answered() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let (_handle, bound) = spawn_server(dir.path(), 16).await;
+        let mut stream = tokio::net::UnixStream::connect(&bound).await.unwrap();
+        let segment: &[u8] = b"{\"protocol\":1,\"op\":\"ping\"}\n\
+             {\"protocol\":1,\"op\":\"ping\"}\n\
+             {\"protocol\":1,\"op\":\"ping\"}\n";
+        stream.write_all(segment).await.unwrap();
+        for _ in 0..3 {
+            let reply = read_framed_reply(&mut stream).await;
+            assert!(reply.contains("\"ok\":true"), "{reply}");
+        }
     }
 
     #[tokio::test]

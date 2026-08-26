@@ -137,8 +137,14 @@ fn parse_endpoint(raw: &str) -> Result<DialTarget, ClientError> {
 }
 
 /// Connection to one broker IPC endpoint.
+///
+/// The stream is split once into persistent halves: the read half sits
+/// behind a [`tokio::io::BufReader`] for the connection's lifetime, so
+/// response bytes buffered past the current line's `\n` survive between
+/// exchanges instead of being dropped with a per-call reader.
 pub struct BrokerClient {
-    stream: IpcStream,
+    writer: tokio::io::WriteHalf<IpcStream>,
+    reader: tokio::io::BufReader<tokio::io::ReadHalf<IpcStream>>,
 }
 
 /// The byte stream under one connection: a local Unix socket or a
@@ -215,9 +221,7 @@ impl BrokerClient {
                     path: path.as_ref().display().to_string(),
                     source: err,
                 })?;
-            Ok(Self {
-                stream: IpcStream::Unix(stream),
-            })
+            Ok(Self::new(IpcStream::Unix(stream)))
         }
         #[cfg(windows)]
         {
@@ -316,9 +320,17 @@ impl BrokerClient {
             .connect(server_name, tcp)
             .await
             .map_err(|err| ClientError::TlsHandshakeFailed(err.to_string()))?;
-        Ok(Self {
-            stream: IpcStream::Tls(Box::new(tls)),
-        })
+        Ok(Self::new(IpcStream::Tls(Box::new(tls))))
+    }
+
+    /// Splits the transport into persistent read/write halves with one
+    /// long-lived buffered reader (see [`Self`]'s type docs).
+    fn new(stream: IpcStream) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        Self {
+            writer,
+            reader: tokio::io::BufReader::with_capacity(8192, reader),
+        }
     }
 
     /// Sends the control ping and waits for the pong.
@@ -368,42 +380,70 @@ impl BrokerClient {
         let mut encoded = serde_json::to_vec(line)
             .map_err(|err| ClientError::Io(format!("encode failure: {err}")))?;
         encoded.push(b'\n');
-        self.stream
+        self.writer
             .write_all(&encoded)
             .await
             .map_err(|err| ClientError::Io(format!("send failure: {err}")))?;
-        self.stream
+        self.writer
             .flush()
             .await
             .map_err(|err| ClientError::Io(format!("send failure: {err}")))?;
 
-        // Buffered read bounded exactly like the server side: one spare
-        // byte for the terminator; a longer line is a protocol violation,
-        // EOF before a newline is a connection failure.
-        let mut limited =
-            tokio::io::AsyncReadExt::take(&mut self.stream, (MAX_LINE_BYTES + 1) as u64);
-        let mut buffered = tokio::io::BufReader::with_capacity(1024, &mut limited);
+        // Bounded buffered read off the persistent reader, mirroring the
+        // server's [`read_line_capped`]: the cap counts CR-stripped
+        // content and trips as soon as it is exceeded; EOF before a
+        // newline is a connection failure.
         let mut raw = Vec::with_capacity(512);
-        let read = buffered
-            .read_until(b'\n', &mut raw)
-            .await
-            .map_err(|err| ClientError::Io(format!("receive failure: {err}")))?;
-        if read == 0 {
-            return Err(ClientError::Io(
-                "connection closed before response".to_owned(),
+        loop {
+            let available = self
+                .reader
+                .fill_buf()
+                .await
+                .map_err(|err| ClientError::Io(format!("receive failure: {err}")))?;
+            if available.is_empty() {
+                return Err(if raw.is_empty() {
+                    ClientError::Io("connection closed before response".to_owned())
+                } else {
+                    ClientError::Io("connection closed mid-response".to_owned())
+                });
+            }
+            let chunk_len = available.len();
+            match available.iter().position(|byte| *byte == b'\n') {
+                Some(end) => {
+                    append_non_cr(&mut raw, &available[..end]);
+                    // Bytes after `\n` stay buffered for the next exchange.
+                    self.reader.consume(end + 1);
+                    break;
+                }
+                None => {
+                    append_non_cr(&mut raw, available);
+                    self.reader.consume(chunk_len);
+                }
+            }
+            if raw.len() > MAX_LINE_BYTES {
+                return Err(ClientError::ProtocolViolation(
+                    "response exceeds maximum permitted size".to_owned(),
+                ));
+            }
+        }
+        if raw.len() > MAX_LINE_BYTES {
+            return Err(ClientError::ProtocolViolation(
+                "response exceeds maximum permitted size".to_owned(),
             ));
         }
-        if raw.last() != Some(&b'\n') {
-            return Err(if read > MAX_LINE_BYTES {
-                ClientError::ProtocolViolation("response exceeds maximum permitted size".to_owned())
-            } else {
-                ClientError::Io("connection closed mid-response".to_owned())
-            });
-        }
-        raw.pop();
-        raw.retain(|byte| *byte != b'\r');
         serde_json::from_slice::<ServerLine>(&raw)
             .map_err(|err| ClientError::ProtocolViolation(err.to_string()))
+    }
+}
+
+/// Appends `bytes` minus carriage returns, matching the broker's line
+/// reader so both ends agree on framing.
+fn append_non_cr(raw: &mut Vec<u8>, bytes: &[u8]) {
+    raw.reserve(bytes.len());
+    for &byte in bytes {
+        if byte != b'\r' {
+            raw.push(byte);
+        }
     }
 }
 
