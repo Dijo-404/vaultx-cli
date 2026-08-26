@@ -555,7 +555,7 @@ mod proptests {
     use std::collections::BTreeMap;
     use vaultx_policy::{
         parse_policy_yaml, Action, AuthorizationContext, AuthorizationDecision, Authorizer,
-        HttpMethod, RuleEngine,
+        CedarAuthorizer, HttpMethod, RuleEngine,
     };
 
     /// DNS-style hosts: 1–3 labels of `[a-z][a-z0-9]{1,7}` — valid under
@@ -656,7 +656,7 @@ mod proptests {
         }
     }
 
-    fn authorize_all(engine: &RuleEngine, urls: &[CanonicalUrl]) -> Vec<AuthorizationDecision> {
+    fn authorize_all(engine: &dyn Authorizer, urls: &[CanonicalUrl]) -> Vec<AuthorizationDecision> {
         urls.iter()
             .map(|url| {
                 engine.authorize(&vaultx_policy::AuthorizationRequest {
@@ -667,6 +667,16 @@ mod proptests {
                 })
             })
             .collect()
+    }
+
+    /// Builds both engines from the same YAML so spelling properties can
+    /// assert invariance for the Cedar backend alongside the native one.
+    fn engines_from_yaml(yaml: &str) -> (RuleEngine, CedarAuthorizer) {
+        let document = parse_policy_yaml(yaml).unwrap();
+        (
+            RuleEngine::from_documents([document.clone()]).unwrap(),
+            CedarAuthorizer::from_documents([document]).unwrap(),
+        )
     }
 
     fn engine_from_yaml(yaml: &str) -> RuleEngine {
@@ -725,16 +735,20 @@ mod proptests {
             with_query in prop::bool::ANY,
         ) {
             let empty = RuleEngine::new();
-            let wrong_host = engine_from_yaml(
-                "name: prop-wrong-host\n\
+            const WRONG_HOST_YAML: &str = "name: prop-wrong-host\n\
                  principal: agent:prop-agent\n\
                  credential: prop-token\n\
                  http:\n\
                  \x20 hosts: [denied.example]\n\
                  \x20 allow:\n\
                  \x20   - methods: [GET]\n\
-                 \x20     paths: [\"/**\"]\n",
-            );
+                 \x20     paths: [\"/**\"]\n";
+            let wrong_host = engine_from_yaml(WRONG_HOST_YAML);
+            let cedar_wrong_host = CedarAuthorizer::from_documents([parse_policy_yaml(
+                WRONG_HOST_YAML,
+            )
+            .unwrap()])
+            .unwrap();
 
             let raws =
                 spellings(&host, &segments, &query_key, &query_value, escape_uppercase, with_query);
@@ -746,6 +760,9 @@ mod proptests {
             for decisions in [
                 authorize_all(&empty, &urls),
                 authorize_all(&wrong_host, &urls),
+                // The §43 property must hold for the Cedar backend too:
+                // alternate spellings never flip its decisions.
+                authorize_all(&cedar_wrong_host, &urls),
             ] {
                 let first = decisions.first().cloned().unwrap();
                 assert!(matches!(first, AuthorizationDecision::Deny { .. }));
@@ -757,7 +774,10 @@ mod proptests {
 
         /// Allow direction: when policy allows the canonical request,
         /// every spelling produces the identical allow — normalization
-        /// never silently turns an allow into a deny either.
+        /// never silently turns an allow into a deny either. The same
+        /// invariance is asserted for the Cedar backend, which must also
+        /// agree with the native engine on the allow/deny class of every
+        /// spelling.
         #[test]
         fn allowed_request_stays_allowed_under_every_spelling(
             host in hosts(),
@@ -767,7 +787,7 @@ mod proptests {
             escape_uppercase in prop::bool::ANY,
             with_query in prop::bool::ANY,
         ) {
-            let engine = engine_from_yaml(&allowing_yaml(&host));
+            let (engine, cedar_engine) = engines_from_yaml(&allowing_yaml(&host));
 
             let raws =
                 spellings(&host, &segments, &query_key, &query_value, escape_uppercase, with_query);
@@ -786,9 +806,28 @@ mod proptests {
                 prop_assert_eq!(decision, &first, "decision drifted for spelling {}", raw);
             }
 
+            // Cedar backend: identical spelling-invariance plus native
+            // parity on every spelling.
+            let cedar_decisions = authorize_all(&cedar_engine, urls.as_slice());
+            let cedar_first = cedar_decisions.first().cloned().unwrap();
+            assert!(matches!(cedar_first, AuthorizationDecision::Allow { .. }));
+            for (raw, decision) in raws.iter().zip(&cedar_decisions) {
+                prop_assert_eq!(decision, &cedar_first, "cedar drifted for spelling {}", raw);
+            }
+            for (raw, (native_decision, cedar_decision)) in
+                raws.iter().zip(decisions.iter().zip(&cedar_decisions))
+            {
+                prop_assert_eq!(
+                    matches!(native_decision, AuthorizationDecision::Allow { .. }),
+                    matches!(cedar_decision, AuthorizationDecision::Allow { .. }),
+                    "engine drift for spelling {}",
+                    raw
+                );
+            }
+
             // Explicit-deny policies also bind on the canonical form only:
             // a GET deny rule denies all spellings identically even while
-            // an allow rule exists in the same document.
+            // an allow rule exists in the same document — on both engines.
             let denying_yaml = format!(
                 "name: prop-deny\n\
                  principal: agent:prop-agent\n\
@@ -802,15 +841,22 @@ mod proptests {
                  \x20   - methods: [GET]\n\
                  \x20     paths: [\"/**\"]\n"
             );
-            let denier = engine_from_yaml(&denying_yaml);
-            let decisions = authorize_all(&denier, &urls);
-            let first = decisions.first().cloned().unwrap();
-            assert!(matches!(
-                first,
-                AuthorizationDecision::Deny { reason: vaultx_policy::DenyReason::ExplicitDeny, .. }
-            ));
-            for (raw, decision) in raws.iter().zip(&decisions) {
-                prop_assert_eq!(decision, &first, "deny drifted for spelling {}", raw);
+            let (denier, cedar_denier) = engines_from_yaml(&denying_yaml);
+            for engine_decisions in [
+                authorize_all(&denier, &urls),
+                authorize_all(&cedar_denier, &urls),
+            ] {
+                let first = engine_decisions.first().cloned().unwrap();
+                assert!(matches!(
+                    first,
+                    AuthorizationDecision::Deny {
+                        reason: vaultx_policy::DenyReason::ExplicitDeny,
+                        ..
+                    }
+                ));
+                for (raw, decision) in raws.iter().zip(&engine_decisions) {
+                    prop_assert_eq!(decision, &first, "deny drifted for spelling {}", raw);
+                }
             }
         }
 

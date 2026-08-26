@@ -4064,3 +4064,95 @@ fn delegation_mints_scoped_child_enforced_by_broker_and_prints_token_once() {
         "{err:?}"
     );
 }
+
+/// `vaultx policy cedar` prints the exact Cedar translation of every
+/// stored document, and the fail-closed compilation error (naming the
+/// offending pattern) for documents with untranslatable globs.
+#[test]
+fn policy_cedar_prints_compilation_and_refuses_unsupported_globs() {
+    const COMPILABLE: &str = r#"
+name: cedar-ready
+principal: agent:coding-agent
+credential: github-work-token
+environment:
+  allow: [env_development]
+http:
+  hosts: [api.github.com]
+  allow:
+    - methods: [GET]
+      paths: [/repos/acme/backend/**]
+"#;
+    const WILDCARD: &str = r#"
+name: mid-wildcard
+principal: agent:wild
+credential: wild-token
+http:
+  hosts: [api.wild.com]
+  allow:
+    - methods: [GET]
+      paths: [/repos/*/issues]
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_in(root);
+
+    // Empty store prints a notice like validate/list do.
+    let out = dispatch(&cli(
+        root,
+        Command::Policy {
+            command: PolicyCommand::Cedar,
+        },
+    ))
+    .unwrap();
+    assert_eq!(out, "no policies found");
+
+    // Compilable document prints real Cedar text.
+    std::fs::write(
+        root.join(".vaultx")
+            .join("policies")
+            .join("cedar-ready.yaml"),
+        COMPILABLE,
+    )
+    .unwrap();
+
+    let out = dispatch(&cli(
+        root,
+        Command::Policy {
+            command: PolicyCommand::Cedar,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("// policy: cedar-ready"), "{out}");
+    assert!(
+        out.contains(r#"permit(principal == Agent::"agent:coding-agent""#),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            r#"context.path == "/repos/acme/backend" || context.path like "/repos/acme/backend/*""#
+        ),
+        "{out}"
+    );
+
+    // Mid-pattern wildcard document prints the named-pattern refusal
+    // instead of approximated Cedar.
+    std::fs::write(
+        root.join(".vaultx")
+            .join("policies")
+            .join("mid-wildcard.yaml"),
+        WILDCARD,
+    )
+    .unwrap();
+
+    let out = dispatch(&cli(
+        root,
+        Command::Policy {
+            command: PolicyCommand::Cedar,
+        },
+    ))
+    .unwrap();
+    assert!(out.contains("error:"), "{out}");
+    assert!(out.contains("/repos/*/issues"), "{out}");
+    assert!(out.contains("mid-wildcard"), "{out}");
+}

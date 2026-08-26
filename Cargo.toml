@@ -77,6 +77,9 @@ crossterm = "0.29"
 # Hardened outbound HTTP client for the broker transport (rustls only;
 # default features pull the native-tls stack and are deliberately off).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Cedar authorization engine backing the `cedar` policy-engine mode
+# (`VAULTX_POLICY_ENGINE=cedar`); pinned to the 4.x line.
+cedar-policy = "4"
 # Unix-only: flock-based session-store coherence and uid-scoped endpoints.
 libc = "0.2"
 # Control-plane REST surface (plan §39). Default features are trimmed to

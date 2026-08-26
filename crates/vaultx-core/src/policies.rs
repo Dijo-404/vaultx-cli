@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use vaultx_policy::{
     load_policy_file, parse_policy_yaml, Action, AuthorizationContext, AuthorizationDecision,
-    AuthorizationRequest, Authorizer, HttpMethod, Principal, RuleEngine,
+    AuthorizationRequest, Authorizer, CedarAuthorizer, HttpMethod, Principal, RuleEngine,
 };
 use vaultx_types::{CredentialRef, EnvironmentId, PolicyName};
 
@@ -127,6 +127,20 @@ impl<'a> PolicyOpsService<'a> {
     pub fn build_engine(&self) -> CoreResult<RuleEngine> {
         let documents = self.load_policies()?;
         RuleEngine::from_documents(documents)
+            .map_err(|err| CoreError::PolicyLoadFailed(err.to_string()))
+    }
+
+    /// Builds a [`CedarAuthorizer`] from all stored policies.
+    ///
+    /// Documents whose path globs have no exact Cedar encoding refuse
+    /// compilation (fail-closed; see `vaultx_policy::cedar`).
+    ///
+    /// # Errors
+    /// * [`CoreError::PolicyLoadFailed`] for load failures, invalid
+    ///   documents, duplicate names, or Cedar compilation refusals.
+    pub fn build_cedar_engine(&self) -> CoreResult<CedarAuthorizer> {
+        let documents = self.load_policies()?;
+        CedarAuthorizer::from_documents(documents)
             .map_err(|err| CoreError::PolicyLoadFailed(err.to_string()))
     }
 

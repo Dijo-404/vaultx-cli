@@ -30,6 +30,25 @@ pub enum PolicyError {
     /// must be unique so decisions and explanations stay attributable.
     #[error("duplicate policy name `{0}`")]
     DuplicatePolicyName(PolicyName),
+    /// A policy document uses a path pattern that cannot be represented in
+    /// Cedar without approximation (a `*` wildcard outside the trailing
+    /// `/**` position). Cedar-mode compilation is fail-closed: nothing is
+    /// approximated, and the offending pattern is always named.
+    #[error(
+        "policy `{policy}` cannot be compiled to Cedar exactly: \
+         path pattern `{pattern}` uses a wildcard that has no exact Cedar encoding"
+    )]
+    CedarUnsupportedPattern {
+        /// Name of the document that refused compilation.
+        policy: String,
+        /// The offending pattern, verbatim.
+        pattern: String,
+    },
+    /// Cedar rejected a generated policy during compilation. This is an
+    /// internal translation bug by construction (generated text is derived,
+    /// not user input) and must fail closed.
+    #[error("policy `{0}` failed to compile into Cedar: {1}")]
+    CedarCompile(String, String),
     /// Filesystem failure while reading a policy file.
     #[error(transparent)]
     Io(#[from] std::io::Error),

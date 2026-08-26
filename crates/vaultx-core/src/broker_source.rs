@@ -181,9 +181,35 @@ impl RedirectAuthorizer for SameOriginRedirectAuthorizer {
     }
 }
 
+/// Environment variable selecting the authorization backend for
+/// [`build_production_engine`]: `native` (default, the deterministic rule
+/// engine) or `cedar` (the Cedar-compiled policy set). Any other value —
+/// including garbage or typos — fails closed at startup.
+pub const POLICY_ENGINE_ENV: &str = "VAULTX_POLICY_ENGINE";
+
+/// Selects the authorizer backend from an already-read mode string.
+///
+/// `None` and the empty string both mean the default (`native`), matching
+/// [`std::env::var`]'s absent/unset distinction being irrelevant here.
+fn authorizer_from_mode(
+    ops: &crate::PolicyOpsService<'_>,
+    mode: Option<&str>,
+) -> CoreResult<StdArc<dyn vaultx_policy::Authorizer>> {
+    match mode {
+        None | Some("") | Some("native") => Ok(StdArc::new(ops.build_engine()?)),
+        Some("cedar") => Ok(StdArc::new(ops.build_cedar_engine()?)),
+        Some(other) => Err(CoreError::PolicyLoadFailed(format!(
+            "unknown {POLICY_ENGINE_ENV} value `{other}`; \
+             expected \"native\" or \"cedar\" (refusing to start fail-closed)"
+        ))),
+    }
+}
+
 /// Assembles a fully wired [`BrokerEngine`] over an opened project:
 ///
-/// * authorizer — project policies via [`crate::PolicyOpsService::build_engine`];
+/// * authorizer — project policies via [`crate::PolicyOpsService`],
+///   backend chosen by [`POLICY_ENGINE_ENV`] (`native` default, `cedar`
+///   opt-in; unknown values refuse startup);
 /// * sessions — persistent verifier-hash store at
 ///   `<project>/.vaultx/sessions.json` (`0600`);
 /// * credentials — [`VaultCredentialSource`] decrypting brokered
@@ -196,7 +222,8 @@ impl RedirectAuthorizer for SameOriginRedirectAuthorizer {
 /// # Errors
 /// Propagates policy compilation and session-store open failures.
 pub fn build_production_engine(ctx: &StdArc<ProjectContext>) -> CoreResult<BrokerEngine> {
-    let rule_engine = crate::PolicyOpsService::new(ctx.as_ref()).build_engine()?;
+    let ops = crate::PolicyOpsService::new(ctx.as_ref());
+    let authorizer = authorizer_from_mode(&ops, std::env::var(POLICY_ENGINE_ENV).ok().as_deref())?;
     let sessions = FileSessionStore::open(ctx.vault_dir().join("sessions.json"))
         .map_err(|err| CoreError::Io(std::io::Error::other(err.to_string())))?;
     let transport = HttpTransport::new(
@@ -209,7 +236,7 @@ pub fn build_production_engine(ctx: &StdArc<ProjectContext>) -> CoreResult<Broke
     .map_err(|err| CoreError::Io(std::io::Error::other(err.to_string())))?;
 
     Ok(BrokerEngine::new(BrokerDependencies {
-        authorizer: StdArc::new(rule_engine),
+        authorizer,
         sessions: StdArc::new(sessions),
         credentials: StdArc::new(VaultCredentialSource::new(StdArc::clone(ctx))),
         injectors: StdArc::new(vaultx_broker::InjectorRegistry::new()),
@@ -267,5 +294,92 @@ mod tests {
 
         let resolved = source.resolve(&credential, &environment).unwrap();
         assert_eq!(resolved.expose(|b| b.to_vec()), b"cli-flow-canary");
+    }
+
+    /// A valid document whose glob (`/a/*/b`) has no exact Cedar encoding:
+    /// the native engine accepts it, Cedar mode refuses startup.
+    const WILDCARD_YAML: &str = r#"
+name: mid-wildcard
+principal: agent:wild
+credential: wild-token
+http:
+  hosts: [api.wild.com]
+  allow:
+    - methods: [GET]
+      paths: [/a/*/b]
+"#;
+
+    fn temp_ctx_with_wildcard_policy() -> (tempfile::TempDir, Arc<ProjectContext>) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ProjectContext::init(dir.path()).unwrap());
+        crate::PolicyOpsService::new(ctx.as_ref())
+            .save_policy_yaml("mid-wildcard", WILDCARD_YAML)
+            .unwrap();
+        (dir, ctx)
+    }
+
+    #[test]
+    fn engine_mode_default_and_native_accept_wildcard_documents() {
+        let (_guard, ctx) = temp_ctx_with_wildcard_policy();
+        let ops = crate::PolicyOpsService::new(ctx.as_ref());
+        for mode in [None, Some(""), Some("native")] {
+            assert!(
+                authorizer_from_mode(&ops, mode).is_ok(),
+                "mode {mode:?} must accept the native-only document"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_mode_cedar_refuses_untranslatable_glob_at_startup() {
+        let (_guard, ctx) = temp_ctx_with_wildcard_policy();
+        let ops = crate::PolicyOpsService::new(ctx.as_ref());
+        let msg = match authorizer_from_mode(&ops, Some("cedar")) {
+            Err(CoreError::PolicyLoadFailed(msg)) => msg,
+            Ok(_) => panic!("cedar mode must refuse the wildcard document"),
+            Err(other) => panic!("unexpected error: {other}"),
+        };
+        assert!(
+            msg.contains("/a/*/b") && msg.contains("mid-wildcard"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn engine_mode_unknown_value_fails_closed() {
+        let (_guard, ctx) = temp_ctx_with_wildcard_policy();
+        let ops = crate::PolicyOpsService::new(ctx.as_ref());
+        for mode in ["CEDAR", "Native", "bogus", "cedar "] {
+            match authorizer_from_mode(&ops, Some(mode)) {
+                Err(CoreError::PolicyLoadFailed(msg)) => {
+                    assert!(msg.contains(POLICY_ENGINE_ENV), "{mode}: {msg}");
+                }
+                Ok(_) => panic!("{mode} must fail closed"),
+                Err(other) => panic!("{mode}: unexpected error {other}"),
+            }
+        }
+    }
+
+    /// The real startup path reads the env var; serialized behind a mutex
+    /// because env-var mutations are process-global.
+    #[test]
+    fn build_production_engine_honors_env_selection() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (_guard_dir, ctx) = temp_ctx_with_wildcard_policy();
+
+        std::env::remove_var(POLICY_ENGINE_ENV);
+        assert!(build_production_engine(&ctx).is_ok(), "default is native");
+
+        std::env::set_var(POLICY_ENGINE_ENV, "cedar");
+        assert!(
+            build_production_engine(&ctx).is_err(),
+            "cedar mode must refuse the wildcard document"
+        );
+
+        std::env::set_var(POLICY_ENGINE_ENV, "bogus");
+        assert!(build_production_engine(&ctx).is_err());
+
+        std::env::remove_var(POLICY_ENGINE_ENV);
     }
 }

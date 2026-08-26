@@ -623,6 +623,9 @@ pub enum PolicyCommand {
     Validate,
     /// List policies as NAME / PRINCIPAL / CREDENTIAL columns.
     List,
+    /// Print the Cedar compilation of every stored policy document
+    /// (or the compilation error for documents with untranslatable globs).
+    Cedar,
 }
 
 /// `vaultx broker <subcommand>`.
@@ -923,6 +926,7 @@ pub fn dispatch(cli: &Cli) -> Result<String, CliError> {
         Command::Policy { command } => match command {
             PolicyCommand::Validate => with_open(&cli.project, cmd_policy_validate),
             PolicyCommand::List => with_open(&cli.project, cmd_policy_list),
+            PolicyCommand::Cedar => with_open(&cli.project, cmd_policy_cedar),
         },
 
         Command::Secret { command } => match command {
@@ -2397,6 +2401,36 @@ fn cmd_policy_list(services: &VaultxServices) -> Result<String, CliError> {
         &["NAME", "PRINCIPAL", "CREDENTIAL"],
         &rows,
     ))
+}
+
+/// `vaultx policy cedar`: prints the exact Cedar translation of every
+/// stored document, reusing the engine compiler. Documents with globs that
+/// have no exact Cedar encoding print the fail-closed compilation error
+/// instead of approximated text.
+fn cmd_policy_cedar(services: &VaultxServices) -> Result<String, CliError> {
+    let documents = services.policies().load_policies()?;
+    if documents.is_empty() {
+        return Ok("no policies found".to_owned());
+    }
+    let mut out = String::new();
+    for doc in &documents {
+        out.push_str("// policy: ");
+        out.push_str(doc.name.as_str());
+        out.push('\n');
+        match vaultx_policy::compile_document_to_cedar(doc) {
+            Ok(text) => {
+                out.push_str(&text);
+                out.push('\n');
+            }
+            Err(err) => {
+                out.push_str("error: ");
+                out.push_str(&err.to_string());
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+    Ok(out.trim_end().to_owned())
 }
 
 fn cmd_secret_set(

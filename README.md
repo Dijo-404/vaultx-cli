@@ -1125,6 +1125,8 @@ Default result is deny.
 
 Cedar policies can represent the decision model while the broker additionally enforces non-policy transport invariants such as DNS, redirect, TLS, and header safety.
 
+**Authorization engine backends.** The broker selects its evaluator with the `VAULTX_POLICY_ENGINE` environment variable: `native` (the default) runs the deterministic rule engine, `cedar` compiles every stored policy document into an equivalent Cedar policy set behind the same internal `Authorizer` trait, and any other value refuses to start (fail closed). Path globs translate exactly into Cedar predicates only for literal paths and trailing `/**` prefixes; a document containing a mid-pattern wildcard (`*` anywhere but the final segment) cannot be represented without approximation, so Cedar mode rejects that document's compilation outright and names the offending pattern — nothing is ever approximated. `vaultx policy cedar` prints the compiled Cedar text (or that error) for each stored document.
+
 ---
 
 # Security invariants

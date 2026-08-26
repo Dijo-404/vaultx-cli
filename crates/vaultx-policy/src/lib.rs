@@ -4,11 +4,12 @@
 //! # The `Authorizer` seam
 //!
 //! [`Authorizer`] is the single authorization boundary consumed by the
-//! broker. **Cedar is the production policy evaluator behind this trait**;
-//! this task ships only the seam plus a deterministic reference
-//! implementation ([`RuleEngine`]) — Cedar itself is intentionally *not*
-//! integrated yet. Callers wire against the trait so the evaluator can be
-//! swapped without touching call sites.
+//! broker. **Cedar is the production policy evaluator behind this trait**:
+//! [`CedarAuthorizer`] compiles every [`PolicyDocument`] into an exact
+//! Cedar policy set (see the `cedar` module for the glob-translation
+//! policy), while [`RuleEngine`] remains the deterministic reference
+//! implementation and default backend. Callers wire against the trait so
+//! the evaluator can be swapped without touching call sites.
 //!
 //! The model is deny-by-default: an engine with no policies denies every
 //! request with [`DenyReason::NoMatchingPolicy`].
@@ -32,11 +33,14 @@
 //! [`DenyReason::InvalidContext`]) rather than normalized, so upstream
 //! normalization drift can never become a deny-evasion.
 
+mod cedar;
 mod engine;
 mod error;
 mod loader;
 mod matcher;
 mod model;
+
+pub use cedar::{compile_document_to_cedar, CedarAuthorizer};
 
 pub use engine::{
     AuthorizationDecision, AuthorizationRequest, Authorizer, CandidateEvaluation, CandidateOutcome,
