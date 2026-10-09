@@ -8,3 +8,6 @@ node_modules/
 
 # accidental artifacts from running npm inside the package dir
 npm/package-lock.json
+
+# local promo video project (HyperFrames sources, renders, audio)
+/videos/
