@@ -136,6 +136,12 @@ npm install -g vaultx-cli
 
 The npm package installs the correct native Rust binary for the platform.
 
+The same release is mirrored to GitHub Packages as `@dijo-404/vaultx-cli`, linked to this repository. GitHub's npm registry requires authentication even for public packages, so use a token with `read:packages`:
+
+```bash
+npm install -g @dijo-404/vaultx-cli --registry=https://npm.pkg.github.com
+```
+
 Native distribution can also expose the same binary through supported Rust/system package channels.
 
 The executable name is:
