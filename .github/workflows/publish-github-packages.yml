@@ -107,12 +107,17 @@ jobs:
           diff -r "$RUNNER_TEMP/src/package" "$RUNNER_TEMP/readback/package"
 
           # --ignore-scripts skips postinstall, so the launcher's on-demand
-          # path downloads the release binary and verifies its SHA-256.
+          # path downloads the release binary and verifies its SHA-256. That
+          # first run also prints an "installed at" line to stdout, so the
+          # exact version check runs against the cached binary afterwards.
           npm install --prefix "$RUNNER_TEMP/consumer" \
             --ignore-scripts --no-audit --no-fund --package-lock=false --engine-strict \
             --registry="$REGISTRY" "$GPR_NAME@$VERSION"
-          out="$(VAULTX_CACHE_DIR="$RUNNER_TEMP/vaultx-cache" \
-            "$RUNNER_TEMP/consumer/node_modules/.bin/vaultx" --version)"
+          export VAULTX_CACHE_DIR="$RUNNER_TEMP/vaultx-cache"
+          vaultx="$RUNNER_TEMP/consumer/node_modules/.bin/vaultx"
+          "$vaultx" --version
+          test -x "$VAULTX_CACHE_DIR/vaultx-$VERSION"
+          out="$("$vaultx" --version)"
           echo "$out"
           test "$out" = "vaultx $VERSION"
 
