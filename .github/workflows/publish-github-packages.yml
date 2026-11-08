@@ -1,0 +1,128 @@
+# Mirror the audited vaultx-cli npm release to GitHub Packages.
+#
+# GitHub Packages' npm registry only accepts packages scoped to the owning
+# account, so the unscoped npmjs package `vaultx-cli` is published here as
+# `@dijo-404/vaultx-cli`. The job:
+#
+#   1. downloads the exact npmjs 1.0.0 tarball and checks a pinned SHA-256;
+#   2. rewrites ONLY the `name` field (asserted) and repacks;
+#   3. publishes with the workflow token, which links the package to this
+#      repository (package.json `repository` points here as well);
+#   4. reads the package back and diffs it against what was published;
+#   5. installs it into a fresh prefix and runs `vaultx --version`, which
+#      exercises the on-demand GitHub Release download + SHA-256 check;
+#   6. asserts the package is associated with Dijo-404/vaultx-cli.
+#
+# Re-running is safe: an existing version is verified, not republished.
+# To mirror a new release, bump VERSION and NPMJS_SHA256 (sha256sum of
+# https://registry.npmjs.org/vaultx-cli/-/vaultx-cli-<version>.tgz).
+
+name: publish-github-packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Mirror vaultx-cli to GitHub Packages
+    if: ${{ github.repository == 'Dijo-404/vaultx-cli' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: github-packages-vaultx-cli-1.0.0
+      cancel-in-progress: false
+    env:
+      VERSION: 1.0.0
+      NPMJS_SHA256: 62943b15bb269d88d18025a2ce94fbc99b11e82d193cdeceaac15d935dbb1a70
+      GPR_NAME: '@dijo-404/vaultx-cli'
+      REGISTRY: https://npm.pkg.github.com
+      NPM_CONFIG_LOGS_MAX: '0'
+      NPM_CONFIG_UPDATE_NOTIFIER: 'false'
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.2
+          registry-url: https://npm.pkg.github.com
+          scope: '@dijo-404'
+
+      - name: Download and verify the npmjs release tarball
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://registry.npmjs.org/vaultx-cli/-/vaultx-cli-$VERSION.tgz" \
+            --output "$RUNNER_TEMP/vaultx-cli-$VERSION.tgz"
+          echo "$NPMJS_SHA256  $RUNNER_TEMP/vaultx-cli-$VERSION.tgz" | sha256sum --check
+
+      - name: Rescope to the account namespace (name field only)
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/src" "$RUNNER_TEMP/out"
+          tar -xzf "$RUNNER_TEMP/vaultx-cli-$VERSION.tgz" -C "$RUNNER_TEMP/src"
+          cd "$RUNNER_TEMP/src/package"
+          npm pkg set name="$GPR_NAME"
+          ORIG_PKG="$(tar -xOzf "$RUNNER_TEMP/vaultx-cli-$VERSION.tgz" package/package.json)" \
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import { readFileSync } from "node:fs";
+            const orig = JSON.parse(process.env.ORIG_PKG);
+            const next = JSON.parse(readFileSync("package.json", "utf8"));
+            assert.equal(orig.name, "vaultx-cli");
+            assert.equal(next.name, process.env.GPR_NAME);
+            assert.equal(next.version, process.env.VERSION);
+            assert.equal(next.repository.url, "git+https://github.com/Dijo-404/vaultx-cli.git");
+            delete orig.name;
+            delete next.name;
+            assert.deepEqual(next, orig);
+            console.log("package.json differs from the npmjs release only in name");
+          '
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/out"
+
+      - name: Publish to this repository's registry
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if npm view "$GPR_NAME@$VERSION" version --registry="$REGISTRY" > /dev/null 2>&1; then
+            echo "$GPR_NAME@$VERSION already exists; verifying it below."
+          else
+            npm publish "$RUNNER_TEMP/out/dijo-404-vaultx-cli-$VERSION.tgz" \
+              --ignore-scripts --registry="$REGISTRY"
+          fi
+
+      - name: Verify registry contents and a fresh installed executable
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/readback" "$RUNNER_TEMP/consumer"
+          npm pack "$GPR_NAME@$VERSION" --ignore-scripts --registry="$REGISTRY" \
+            --pack-destination "$RUNNER_TEMP/readback"
+          tar -xzf "$RUNNER_TEMP/readback/dijo-404-vaultx-cli-$VERSION.tgz" -C "$RUNNER_TEMP/readback"
+          diff -r "$RUNNER_TEMP/src/package" "$RUNNER_TEMP/readback/package"
+
+          # --ignore-scripts skips postinstall, so the launcher's on-demand
+          # path downloads the release binary and verifies its SHA-256.
+          npm install --prefix "$RUNNER_TEMP/consumer" \
+            --ignore-scripts --no-audit --no-fund --package-lock=false --engine-strict \
+            --registry="$REGISTRY" "$GPR_NAME@$VERSION"
+          out="$(VAULTX_CACHE_DIR="$RUNNER_TEMP/vaultx-cache" \
+            "$RUNNER_TEMP/consumer/node_modules/.bin/vaultx" --version)"
+          echo "$out"
+          test "$out" = "vaultx $VERSION"
+
+      - name: Verify and report the repository association
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh api --paginate --slurp 'users/Dijo-404/packages?package_type=npm&per_page=100' \
+            | jq 'add | map(select(.name == "vaultx-cli" or .name == "@dijo-404/vaultx-cli")) | if length == 1 then .[0] | {name, package_type, visibility, html_url, repository: .repository.full_name} else error("expected exactly one vaultx-cli package") end' \
+            > "$RUNNER_TEMP/package-metadata.json"
+          cat "$RUNNER_TEMP/package-metadata.json"
+          test "$(jq -r .repository "$RUNNER_TEMP/package-metadata.json")" = 'Dijo-404/vaultx-cli'
